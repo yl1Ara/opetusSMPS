@@ -1,4 +1,4 @@
-# [Interactive BOM](./ibom.html?raw=1)
+# [Interactive BOM](https://yl1ara.github.io/opetusSMPS/)
 
 
 # Shopping lists and sites
