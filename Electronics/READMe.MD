@@ -1,6 +1,6 @@
 # Lists and sites
-components: https://www.digikey.fi/en/mylists/list/RQZPBNJORH
+components per pcn: https://www.digikey.fi/en/mylists/list/RQZPBNJORH
 
-cables and extra: https://www.digikey.fi/en/mylists/list/IEEER25KGX
+cables and extras: https://www.digikey.fi/en/mylists/list/IEEER25KGX
 
 ACDC 24V 150W: https://www.mouser.fi/ProductDetail/XP-Power/AHM150PS24?qs=w%2Fv1CP2dgqrkrRjfQac7fA%3D%3D
