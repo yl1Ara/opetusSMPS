@@ -1,4 +1,4 @@
-# [Interactive BOM](./ibom.html)
+# [Interactive BOM](./ibom.html?raw=1)
 
 
 # Shopping lists and sites
