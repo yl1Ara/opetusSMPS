@@ -1,4 +1,9 @@
-# Lists and sites
+# Interactive BOM
+
+[Open Interactive BOM](./bom.html)
+
+
+# Shopping lists and sites
 components per pcn: https://www.digikey.fi/en/mylists/list/RQZPBNJORH
 
 cables and extras: https://www.digikey.fi/en/mylists/list/IEEER25KGX
