@@ -1,6 +1,4 @@
-# Interactive BOM
-
-[Open Interactive BOM](./bom.html)
+# [Interactive BOM](./ibom.html)
 
 
 # Shopping lists and sites
