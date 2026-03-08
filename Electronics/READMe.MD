@@ -2,7 +2,7 @@
 
 
 # Shopping lists and sites
-components per pcn: https://www.digikey.fi/en/mylists/list/RQZPBNJORH
+components per pcb: https://www.digikey.fi/en/mylists/list/RQZPBNJORH
 
 cables and extras: https://www.digikey.fi/en/mylists/list/IEEER25KGX
 
