@@ -1,6 +1,7 @@
 from datetime import date
 import copy
 import json
+from statistics import LinearRegression
 import sys
 import time
 import traceback
@@ -43,6 +44,7 @@ DEFAULT_SETTINGS = {
     "scan_start_time": "00:00",
     "scan_end_date": None,
     "scan_end_time": "23:59",
+    "loaded_time_window_min": [0, 1440],
     "auto_interval_min": 30,
     "auto_file_age_sec": 120,
     "daily_overwrite": True,
@@ -104,6 +106,7 @@ shared_state = pn.state.cache.setdefault(
         "raw_fig": None,
         "inversion_fig": None,
         "residual_fig": None,
+        "smps_timing_fig": None,
         "difference_fig": None,
         "difference_diagnostics": None,
         "latest_inversion": None,
@@ -111,12 +114,14 @@ shared_state = pn.state.cache.setdefault(
     },
 )
 shared_state.setdefault("residual_fig", None)
+shared_state.setdefault("smps_timing_fig", None)
 with shared_state["lock"]:
     local_shared_version = (
         shared_state["version"]
         if shared_state["raw_fig"] is None
         and shared_state["inversion_fig"] is None
         and shared_state["residual_fig"] is None
+        and shared_state["smps_timing_fig"] is None
         and shared_state["difference_fig"] is None
         and shared_state["latest_inversion"] is None
         else -1
@@ -153,6 +158,7 @@ def save_settings():
         "scan_start_time": scan_start_time.value,
         "scan_end_date": as_date(scan_end_date.value).isoformat() if as_date(scan_end_date.value) else None,
         "scan_end_time": scan_end_time.value,
+        "loaded_time_window_min": [int(x) for x in loaded_time_window_min.value],
         "auto_interval_min": int(auto_interval_min.value),
         "auto_file_age_sec": int(auto_file_age_sec.value),
         "daily_overwrite": bool(daily_overwrite_checkbox.value),
@@ -925,29 +931,10 @@ def scan_date_bounds():
 def scan_file_time_range(path):
     path = Path(path)
     try:
-        stat = path.stat()
-    except FileNotFoundError:
-        return pd.NaT, pd.NaT
-
-    key = (str(path), stat.st_mtime_ns, stat.st_size)
-    cached = scan_time_cache.get(key)
-    if cached is not None:
-        return cached
-
-    try:
-        times = pd.read_csv(path, usecols=["time"])
-        parsed = pd.to_datetime(times["time"], errors="coerce").dropna()
-        if parsed.empty:
-            value = (pd.NaT, pd.NaT)
-        else:
-            value = (parsed.min(), parsed.max())
+        stamp = pd.to_datetime(path.stem, format="%Y%m%d_%H%M%S", errors="raise")
+        return stamp, stamp
     except Exception:
-        value = (pd.NaT, pd.NaT)
-
-    if len(scan_time_cache) > 2000:
-        scan_time_cache.clear()
-    scan_time_cache[key] = value
-    return value
+        return pd.NaT, pd.NaT
 
 
 def filter_scan_files_by_date(files):
@@ -968,8 +955,8 @@ def filter_scan_files_by_date(files):
     return selected
 
 
-def files_for_selection(min_age_sec=0):
-    files = list_scan_files(min_age_sec=min_age_sec)
+def files_for_selection(min_age_sec=0, files=None):
+    files = list_scan_files(min_age_sec=min_age_sec) if files is None else list(files)
     mode = scan_selection_mode.value
     if mode in {"Date range", "Date range + newest N"}:
         files = filter_scan_files_by_date(files)
@@ -1005,7 +992,28 @@ def selected_files_signature():
             parts.append(str(p))
 
     return "|".join(parts)
-    
+
+
+def apply_loaded_time_window(df):
+    if df.empty or "time" not in df.columns:
+        return df
+
+    start_min, end_min = loaded_time_window_min.value
+    start_min = max(0, int(start_min))
+    end_min = max(start_min, int(end_min))
+    if start_min == 0 and end_min >= int(loaded_time_window_min.end):
+        return df
+
+    times = pd.to_datetime(df["time"], errors="coerce")
+    t0 = times.min()
+    if pd.isna(t0):
+        return df
+
+    start = t0 + pd.Timedelta(minutes=start_min)
+    end = t0 + pd.Timedelta(minutes=end_min)
+    return df[(times >= start) & (times <= end)].copy()
+
+
 def load_selected_scans():
     dfs = []
 
@@ -1024,6 +1032,7 @@ def load_selected_scans():
 
     df = pd.concat(dfs, ignore_index=True)
     df["time"] = pd.to_datetime(df["time"], errors="coerce")
+    df = apply_loaded_time_window(df)
     df["cpc_float"] = pd.to_numeric(df["cpc_count"], errors="coerce")
     df["abs_size_nm"] = pd.to_numeric(df["size_nm"], errors="coerce").abs()
     df["polarity"] = np.where(df["size_nm"] > 0, "positive", "negative")
@@ -1101,6 +1110,18 @@ scan_files = pn.widgets.MultiChoice(
     name="Select scan CSVs",
     options=[],
     value=[],
+    width=900,
+)
+saved_loaded_window = settings.get(
+    "loaded_time_window_min",
+    DEFAULT_SETTINGS["loaded_time_window_min"],
+)
+loaded_time_window_min = pn.widgets.IntRangeSlider(
+    name="Loaded time window (min from first row)",
+    start=0,
+    end=24 * 60,
+    value=(int(saved_loaded_window[0]), int(saved_loaded_window[1])),
+    step=1,
     width=900,
 )
 
@@ -1318,6 +1339,7 @@ def publish_shared_state(
     raw_fig=None,
     inversion_fig=None,
     residual_fig=None,
+    smps_timing_fig=None,
     difference_fig=None,
     difference_diagnostics=None,
     inversion_result=None,
@@ -1330,6 +1352,8 @@ def publish_shared_state(
             shared_state["inversion_fig"] = inversion_fig
         if residual_fig is not None:
             shared_state["residual_fig"] = residual_fig
+        if smps_timing_fig is not None:
+            shared_state["smps_timing_fig"] = smps_timing_fig
         if difference_fig is not None:
             shared_state["difference_fig"] = difference_fig
         if difference_diagnostics is not None:
@@ -1351,6 +1375,7 @@ def sync_shared_state():
         raw_fig = shared_state["raw_fig"]
         inversion_fig = shared_state["inversion_fig"]
         residual_fig = shared_state["residual_fig"]
+        smps_timing_fig = shared_state["smps_timing_fig"]
         difference_fig = shared_state["difference_fig"]
         difference_diagnostics = shared_state["difference_diagnostics"]
         inversion_result = shared_state["latest_inversion"]
@@ -1362,6 +1387,8 @@ def sync_shared_state():
         inversion_plot.object = copy.deepcopy(inversion_fig)
     if residual_fig is not None:
         residual_plot.object = copy.deepcopy(residual_fig)
+    if smps_timing_fig is not None:
+        smps_timing_plot.object = copy.deepcopy(smps_timing_fig)
     if difference_fig is not None:
         difference_plot.object = copy.deepcopy(difference_fig)
     if difference_diagnostics is not None:
@@ -1381,7 +1408,7 @@ def sync_shared_state():
 def refresh_scan_files(event=None):
     root = app_path(scan_root.value)
     all_files = list_scan_files()
-    files = files_for_selection()
+    files = files_for_selection(files=all_files)
 
     print("cwd:", Path.cwd(), flush=True)
     print("scan root:", root.resolve(), flush=True)
@@ -1399,7 +1426,7 @@ def refresh_scan_files(event=None):
 
 def select_last_n(event=None):
     all_files = list_scan_files()
-    files = files_for_selection()
+    files = files_for_selection(files=all_files)
     scan_files.options = [str(p) for p in all_files]
     scan_files.value = [str(p) for p in files]
     status.object = f"Selected **{len(scan_files.value)}** scan files by `{scan_selection_mode.value}`."
@@ -2046,6 +2073,22 @@ def run_inversion_calculation(df):
 
     return output
 
+def fitLinearFit(x, y):
+    if len(x) < 2 or len(y) < 2:
+        return np.nan, np.nan, np.nan
+
+    A = np.vstack([x, np.ones(len(x))]).T
+    m, c = np.linalg.lstsq(A, y, rcond=None)[0]
+    y_fit = m * x + c
+    residuals = y - y_fit
+    ss_res = np.sum(residuals ** 2)
+    ss_tot = np.sum((y - np.mean(y)) ** 2)
+    r_squared = 1 - (ss_res / ss_tot) if ss_tot != 0 else np.nan
+
+    return m, c, r_squared
+
+def linear(x, m, c):
+    return m * x + c
 
 def plot_inversion_result(result):
     heatmaps = [tr for tr in result if tr["kind"] == "heatmap"]
@@ -2245,13 +2288,19 @@ def plot_inversion_result(result):
                             y=matched["SMEARIII_CPC"],
                             mode="markers",
                             name="Our CPC vs SMEAR III CPC",
-                            customdata=diag.plotly_customdata(matched["time"], matched["ratio"], matched["delta"]),
+                            customdata=diag.plotly_customdata(
+                                matched["time"],
+                                matched["ratio"],
+                                matched["delta"],
+                                [f"{method_label(method)} {tr['polarity']}"] * len(matched),
+                            ),
                             hovertemplate=(
                                 "time=%{customdata[0]|%Y-%m-%d %H:%M}<br>"
                                 "our CPC=%{x:.2f}<br>"
                                 "SMEAR III CPC=%{y:.2f}<br>"
                                 "our/SMEAR=%{customdata[1]:.3f}<br>"
-                                "delta=%{customdata[2]:.2f}<extra></extra>"
+                                "delta=%{customdata[2]:.2f}<br>"
+                                "inversion method=%{customdata[3]}<extra></extra>"
                             ),
                             row=cpc_scatter_row,
                             col=1,
@@ -2265,22 +2314,50 @@ def plot_inversion_result(result):
                     inversion_scatter_max,
                     float(matched[["value", "SMEARIII_CPC"]].max().max()),
                 )
+
                 fig.add_scatter(
                     x=matched["value"],
                     y=matched["SMEARIII_CPC"],
                     mode="markers",
                     name=f"{method_label(method)} {tr['polarity']} vs SMEAR III CPC",
-                    customdata=diag.plotly_customdata(matched["time"], matched["ratio"], matched["delta"]),
+                    customdata=diag.plotly_customdata(
+                        matched["time"],
+                        matched["ratio"],
+                        matched["delta"],
+                        [f"{method_label(method)} {tr['polarity']}"] * len(matched),
+
+                    ),
                     hovertemplate=(
                         "time=%{customdata[0]|%Y-%m-%d %H:%M}<br>"
                         "inverted Ntot=%{x:.2f}<br>"
                         "SMEAR III CPC=%{y:.2f}<br>"
                         "inverted/SMEAR=%{customdata[1]:.3f}<br>"
-                        "delta=%{customdata[2]:.2f}<extra></extra>"
+                        "delta=%{customdata[2]:.2f}<br>"
+                        "inversion method=%{customdata[3]}<extra></extra>"
+
                     ),
                     row=inversion_scatter_row,
                     col=1,
                 )
+                m, c, r2 = fitLinearFit(matched["value"], matched["SMEARIII_CPC"])
+                if np.isfinite(m) and np.isfinite(c):
+                    fit_label = f"{method_label(method)} {tr['polarity']}"
+                    x_fit = np.array([matched["value"].min(), matched["value"].max()])
+                    y_fit = linear(x_fit, m, c)
+                    fig.add_scatter(
+                        x=x_fit,
+                        y=y_fit,
+                        mode="lines",
+                        name=f"{fit_label} vs SMEAR III CPC fit (m={m:.3g}, R2={r2:.3f})",
+                        hovertemplate=(
+                            f"fitted inversion method={fit_label}<br>"
+                            f"m={m:.3g}<br>"
+                            "inverted Ntot=%{x:.2f}<br>"
+                            "fit SMEAR III CPC=%{y:.2f}<extra></extra>"
+                        ),
+                        row=inversion_scatter_row,
+                        col=1,
+                    )
 
         elif tr["kind"] == "ion_ratio":
             if len(tr["x"]) == 0:
@@ -3126,7 +3203,7 @@ def run_inversion(event=None):
                 fig = plot_inversion_result(result)
                 residual_fig = plot_residual_diagnostics(result)
                 diff_fig = plot_difference_diagnostics(result)
-                plot_smps_timing_diagnostics(result)
+                smps_timing_fig = plot_smps_timing_diagnostics(result)
 
                 if auto_checkbox.value:
                     save_data()
@@ -3141,6 +3218,7 @@ def run_inversion(event=None):
                 publish_shared_state(
                     inversion_fig=fig,
                     residual_fig=residual_fig,
+                    smps_timing_fig=smps_timing_fig,
                     difference_fig=diff_fig,
                     difference_diagnostics=latest_difference_diagnostics,
                     inversion_result=result,
@@ -3234,12 +3312,13 @@ def run_auto_worker():
                 fig = plot_inversion_result(result)
                 residual_fig = plot_residual_diagnostics(result)
                 diff_fig = plot_difference_diagnostics(result)
-                plot_smps_timing_diagnostics(result)
+                smps_timing_fig = plot_smps_timing_diagnostics(result)
                 save_data()
                 save_auto_state({"last_saved_signature": signature})
                 publish_shared_state(
                     inversion_fig=fig,
                     residual_fig=residual_fig,
+                    smps_timing_fig=smps_timing_fig,
                     difference_fig=diff_fig,
                     difference_diagnostics=latest_difference_diagnostics,
                     inversion_result=result,
@@ -3269,6 +3348,7 @@ for w in [
     scan_start_time,
     scan_end_date,
     scan_end_time,
+    loaded_time_window_min,
     auto_interval_min,
     auto_file_age_sec,
     daily_overwrite_checkbox,
@@ -3309,6 +3389,7 @@ for w in [
 selection_controls = pn.Column(
     pn.Row(scan_root, refresh_button, select_last_button, n_scans_plot),
     pn.Row(scan_selection_mode, scan_start_date, scan_start_time, scan_end_date, scan_end_time),
+    loaded_time_window_min,
     pn.Accordion(("Selected scan CSVs", scan_files), active=[]),
 )
 
