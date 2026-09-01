@@ -76,6 +76,10 @@ DEFAULT_SETTINGS = {
     "smps_timing_offset_max_sec": 300.0,
     "smps_timing_offset_step_sec": 10.0,
     "smps_timing_match_tolerance_min": 15.0,
+    "inversion_size_bin_decimals": 1,
+    "low_value_lift_enabled": False,
+    "low_value_lift_ratio": 0.65,
+    "low_value_lift_alpha": 0.35,
     "inversion_methods": ["gunn woessner mod"],
     "tube_segments": "tubediameter,tubelength,aflow,angle\n0,1.93,qa,0\n0,2.80,8,0\n0,5.21,1.3,0",
 }
@@ -190,6 +194,10 @@ def save_settings():
         "smps_timing_offset_max_sec": float(smps_timing_offset_max_sec.value),
         "smps_timing_offset_step_sec": float(smps_timing_offset_step_sec.value),
         "smps_timing_match_tolerance_min": float(smps_timing_match_tolerance_min.value),
+        "inversion_size_bin_decimals": int(inversion_size_bin_decimals.value),
+        "low_value_lift_enabled": bool(low_value_lift_enabled.value),
+        "low_value_lift_ratio": float(low_value_lift_ratio.value),
+        "low_value_lift_alpha": float(low_value_lift_alpha.value),
         "inversion_methods": selected_inversion_methods(),
         "tube_segments": tube_segments.value,
     }
@@ -446,10 +454,60 @@ def inversion_size_column(df):
     return "size_nm"
 
 
+def inversion_size_bin_decimals_value():
+    try:
+        decimals = int(inversion_size_bin_decimals.value)
+    except Exception:
+        decimals = int(DEFAULT_SETTINGS["inversion_size_bin_decimals"])
+    return max(0, decimals)
+
+
+def merged_abs_size_nm(values):
+    sizes = pd.to_numeric(values, errors="coerce").abs()
+    return sizes.round(inversion_size_bin_decimals_value())
+
+
 def get_scan_size_axis(df):
     size_col = inversion_size_column(df)
-    sizes = sorted(pd.to_numeric(df[size_col], errors="coerce").abs().dropna().unique())
+    sizes = sorted(merged_abs_size_nm(df[size_col]).dropna().unique())
     return np.asarray(sizes, dtype=float)
+
+
+def one_sided_low_value_lift(values):
+    y = np.asarray(values, dtype=float)
+    lifted = y.copy()
+    valid = np.isfinite(y) & (y > 0)
+    if np.count_nonzero(valid) < 3:
+        return lifted
+
+    try:
+        ratio = float(low_value_lift_ratio.value)
+    except Exception:
+        ratio = float(DEFAULT_SETTINGS["low_value_lift_ratio"])
+    ratio = float(np.clip(ratio, 0.05, 1.0))
+
+    try:
+        alpha = float(low_value_lift_alpha.value)
+    except Exception:
+        alpha = float(DEFAULT_SETTINGS["low_value_lift_alpha"])
+    alpha = float(np.clip(alpha, 0.05, 0.95))
+
+    idx = np.arange(len(y), dtype=float)
+    log_valid = np.log(y[valid])
+    filled = np.interp(idx, idx[valid], log_valid)
+
+    forward = filled.copy()
+    backward = filled.copy()
+    for i in range(1, len(filled)):
+        forward[i] = alpha * filled[i] + (1.0 - alpha) * forward[i - 1]
+    for i in range(len(filled) - 2, -1, -1):
+        backward[i] = alpha * filled[i] + (1.0 - alpha) * backward[i + 1]
+
+    expected = np.exp(0.5 * (forward + backward))
+    floor = expected * ratio
+    low = np.isfinite(lifted) & (lifted < floor)
+    lifted[low] = floor[low]
+    return lifted
 
 
 def apply_smps_size_shift(df):
@@ -1249,6 +1307,40 @@ smps_timing_match_tolerance_min = pn.widgets.FloatInput(
     step=1.0,
     width=190,
 )
+inversion_size_bin_decimals = pn.widgets.IntInput(
+    name="Merge size decimals",
+    value=int(settings.get(
+        "inversion_size_bin_decimals",
+        DEFAULT_SETTINGS["inversion_size_bin_decimals"],
+    )),
+    step=1,
+    width=160,
+)
+low_value_lift_enabled = pn.widgets.Checkbox(
+    name="Lift low/zero artifacts",
+    value=bool(settings.get(
+        "low_value_lift_enabled",
+        DEFAULT_SETTINGS["low_value_lift_enabled"],
+    )),
+)
+low_value_lift_ratio = pn.widgets.FloatInput(
+    name="Lift floor ratio",
+    value=float(settings.get(
+        "low_value_lift_ratio",
+        DEFAULT_SETTINGS["low_value_lift_ratio"],
+    )),
+    step=0.05,
+    width=150,
+)
+low_value_lift_alpha = pn.widgets.FloatInput(
+    name="Lift smoothing alpha",
+    value=float(settings.get(
+        "low_value_lift_alpha",
+        DEFAULT_SETTINGS["low_value_lift_alpha"],
+    )),
+    step=0.05,
+    width=170,
+)
 ntot_plot_max = pn.widgets.FloatInput(
     name="Ntot plot max",
     value=float(settings.get("ntot_plot_max", DEFAULT_SETTINGS["ntot_plot_max"])),
@@ -1633,7 +1725,7 @@ plot_button.on_click(plot_selected_scans)
 def estimate_ion_mobility_ratio_for_scan(g_scan, temp=293.15, press=101325):
     d = g_scan.copy()
     d["cpc_float"] = pd.to_numeric(d["cpc_count"], errors="coerce")
-    d["abs_size_nm"] = d["size_nm"].abs()
+    d["abs_size_nm"] = merged_abs_size_nm(d["size_nm"])
     d["polarity"] = np.where(d["size_nm"].astype(float) > 0, "pos", "neg")
     grouped = (
         d.groupby(["abs_size_nm", "polarity"])["cpc_float"]
@@ -1810,7 +1902,7 @@ def invert_one_scan(
     d = d[d["Ntot"] == False]
     d["cpc_float"] = pd.to_numeric(d["cpc_count"], errors="coerce")
     size_col = inversion_size_column(d)
-    d["abs_size_nm"] = pd.to_numeric(d[size_col], errors="coerce").abs()
+    d["abs_size_nm"] = merged_abs_size_nm(d[size_col])
     d = d.dropna(subset=["abs_size_nm", "cpc_float"])
     d = d[d["cpc_float"] > 0]
     d = d[d["abs_size_nm"] > smallest_size.value]
@@ -2002,15 +2094,29 @@ def run_inversion_calculation(df):
                 if not scan_parts:
                     continue
 
-                full_col = np.full(len(size_axis), np.nan)
+                full_sum = np.zeros(len(size_axis), dtype=float)
+                full_count = np.zeros(len(size_axis), dtype=float)
 
                 for dp_inv, n_inv in scan_parts:
                     mask = (size_axis >= np.nanmin(dp_inv)) & (size_axis <= np.nanmax(dp_inv))
-                    full_col[mask] = np.interp(
+                    interpolated = np.interp(
                         np.log10(size_axis[mask]),
                         np.log10(dp_inv),
                         n_inv,
                     )
+                    valid_interp = np.isfinite(interpolated)
+                    mask_indices = np.flatnonzero(mask)
+                    full_sum[mask_indices[valid_interp]] += interpolated[valid_interp]
+                    full_count[mask_indices[valid_interp]] += 1
+
+                full_col = np.divide(
+                    full_sum,
+                    full_count,
+                    out=np.full(len(size_axis), np.nan),
+                    where=full_count > 0,
+                )
+                if low_value_lift_enabled.value:
+                    full_col = one_sided_low_value_lift(full_col)
 
                 measured_ntot *= dmps_loss_correction_factor_from_distribution(
                     size_axis,
@@ -2957,6 +3063,138 @@ def _integrated_heatmap_series(tr, min_size_nm):
     return pd.DataFrame(rows, columns=["time", "ntot"]).dropna(), event_sizes
 
 
+def _modal_heatmap_series(tr, min_size_nm):
+    sizes = np.asarray(tr["y"], dtype=float)
+    z = np.asarray(tr["Z"], dtype=float)
+    size_mask = np.isfinite(sizes) & (sizes >= float(min_size_nm))
+    event_sizes = sizes[size_mask]
+    rows = []
+
+    if len(event_sizes) == 0:
+        return pd.DataFrame(columns=["time", "mode_dp_nm", "mode_conc"])
+
+    for t, col in zip(pd.to_datetime(tr["x"]), z.T):
+        values = np.asarray(col, dtype=float)[size_mask]
+        valid = np.isfinite(values)
+        if not np.any(valid):
+            continue
+        valid_indices = np.flatnonzero(valid)
+        peak_idx = valid_indices[int(np.nanargmax(values[valid]))]
+        rows.append((t, event_sizes[peak_idx], values[peak_idx]))
+
+    return pd.DataFrame(rows, columns=["time", "mode_dp_nm", "mode_conc"]).dropna()
+
+
+def _representative_timing_offsets(offset_min, offset_max):
+    offsets = [float(offset_min)]
+    if offset_min <= 0 <= offset_max:
+        offsets.append(0.0)
+    else:
+        offsets.append(float(offset_min + (offset_max - offset_min) / 2.0))
+    offsets.append(float(offset_max))
+    unique = []
+    for offset in offsets:
+        rounded = round(offset, 6)
+        if rounded not in unique:
+            unique.append(rounded)
+    return unique
+
+
+def _plot_smps_timing_without_smear(heatmaps, offset_min, offset_max):
+    offsets = _representative_timing_offsets(offset_min, offset_max)
+    fig = make_subplots(
+        rows=3,
+        cols=1,
+        shared_xaxes=False,
+        vertical_spacing=0.08,
+        subplot_titles=[
+            "Inverted Ntot shifted by representative timing offsets",
+            "Modal particle diameter shifted by representative timing offsets",
+            "Median inverted particle size distribution",
+        ],
+    )
+    summaries = []
+
+    for tr in heatmaps:
+        label = f"{method_label(tr.get('method', 'gunn woessner mod'))} {tr.get('polarity', 'unknown')}"
+        our, event_sizes = _integrated_heatmap_series(tr, float(smallest_size.value))
+        modes = _modal_heatmap_series(tr, float(smallest_size.value))
+        z = np.asarray(tr["Z"], dtype=float)
+        size_mask = np.isfinite(np.asarray(tr["y"], dtype=float)) & (np.asarray(tr["y"], dtype=float) >= float(smallest_size.value))
+
+        if not our.empty:
+            summaries.append(label)
+            for offset in offsets:
+                fig.add_scatter(
+                    x=our["time"] + pd.to_timedelta(offset, unit="s"),
+                    y=our["ntot"],
+                    mode="lines+markers",
+                    name=f"{label} Ntot {offset:.0f}s",
+                    hovertemplate="shifted time=%{x|%Y-%m-%d %H:%M:%S}<br>Ntot=%{y:.2f}<extra></extra>",
+                    row=1,
+                    col=1,
+                )
+
+        if not modes.empty:
+            for offset in offsets:
+                fig.add_scatter(
+                    x=modes["time"] + pd.to_timedelta(offset, unit="s"),
+                    y=modes["mode_dp_nm"],
+                    mode="lines+markers",
+                    name=f"{label} mode {offset:.0f}s",
+                    customdata=modes["mode_conc"],
+                    hovertemplate=(
+                        "shifted time=%{x|%Y-%m-%d %H:%M:%S}<br>"
+                        "mode dp=%{y:.2f} nm<br>"
+                        "mode dN/dlog10Dp=%{customdata:.2f}<extra></extra>"
+                    ),
+                    row=2,
+                    col=1,
+                )
+
+        if z.size > 0 and np.any(size_mask):
+            stats = diag.nan_stats_by_row(z[size_mask, :])
+            fig.add_scatter(
+                x=event_sizes,
+                y=stats["median"],
+                mode="lines+markers",
+                name=f"Median {label}",
+                customdata=np.column_stack((stats["p10"], stats["p90"])),
+                hovertemplate=(
+                    "dp=%{x:.2f} nm<br>median=%{y:.2f}<br>"
+                    "p10=%{customdata[0]:.2f}<br>p90=%{customdata[1]:.2f}<extra></extra>"
+                ),
+                row=3,
+                col=1,
+            )
+
+    if not summaries:
+        smps_timing_plot.object = None
+        status.object = "No valid inverted scans available for no-SMEAR SMPS timing diagnostics."
+        return None
+
+    fig.update_yaxes(title_text="Ntot", row=1, col=1)
+    fig.update_xaxes(title_text="Shifted time", tickformat="%H:%M", row=1, col=1)
+    fig.update_yaxes(type="log", title_text="Mode Dp (nm)", row=2, col=1)
+    fig.update_xaxes(title_text="Shifted time", tickformat="%H:%M", row=2, col=1)
+    fig.update_xaxes(type="log", title_text="Dp (nm)", row=3, col=1)
+    fig.update_yaxes(title_text="dN/dlog10Dp", row=3, col=1)
+    fig.update_layout(
+        height=1200,
+        width=1300,
+        title=(
+            "SMPS timing diagnostics without SMEAR: external timing score unavailable; "
+            "offsets only shift scan timestamps"
+        ),
+        showlegend=True,
+        margin=dict(l=50, r=260, t=90, b=40),
+        legend=dict(x=1.02, y=1.0),
+    )
+    smps_timing_plot.object = fig
+    status.object = "SMPS timing diagnostics updated without SMEAR reference. Showing shifted Ntot, shifted mode diameter, and median distributions."
+    return fig
+
+
 def _smear_integrated_series(smear, event_sizes):
     rows = []
     for t, smear_scan in smear.groupby("time"):
@@ -3032,9 +3270,7 @@ def plot_smps_timing_diagnostics(result=None, event=None):
         t1 + pd.Timedelta(minutes=tolerance_min) + pd.to_timedelta(offset_max, unit="s"),
     )
     if smear.empty:
-        smps_timing_plot.object = None
-        status.object = "No SMEAR III size distribution data found for SMPS timing diagnostics."
-        return None
+        return _plot_smps_timing_without_smear(heatmaps, offset_min, offset_max)
 
     fig = make_subplots(
         rows=4,
@@ -3144,9 +3380,7 @@ def plot_smps_timing_diagnostics(result=None, event=None):
             )
 
     if not summaries:
-        smps_timing_plot.object = None
-        status.object = "No valid SMPS/SMEAR matches for timing diagnostics."
-        return None
+        return _plot_smps_timing_without_smear(heatmaps, offset_min, offset_max)
 
     fig.update_yaxes(title_text="Ntot", row=1, col=1)
     fig.update_xaxes(title_text="Time", tickformat="%H:%M", row=1, col=1)
@@ -3380,6 +3614,10 @@ for w in [
     smps_timing_offset_max_sec,
     smps_timing_offset_step_sec,
     smps_timing_match_tolerance_min,
+    inversion_size_bin_decimals,
+    low_value_lift_enabled,
+    low_value_lift_ratio,
+    low_value_lift_alpha,
     tube_segments,
     inversion_methods,
 ]:
@@ -3399,6 +3637,7 @@ inversion_controls = pn.Column(
     pn.Row(zratio_widget, zratio_min_widget, zratio_max_widget, zratio_smoothing_step),
     pn.Row(zratio_min_size_nm, zratio_estimate_offset, use_zratio_checkbox, smallest_size),
     pn.Row(scan_inversion_type, smps_settling_time_sec, inversion_methods),
+    pn.Row(inversion_size_bin_decimals, low_value_lift_enabled, low_value_lift_ratio, low_value_lift_alpha),
     tube_segments,
 )
 
