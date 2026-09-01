@@ -78,8 +78,8 @@ DEFAULT_SETTINGS = {
     "smps_timing_match_tolerance_min": 15.0,
     "inversion_size_bin_decimals": 1,
     "low_value_lift_enabled": False,
-    "low_value_lift_ratio": 0.65,
-    "low_value_lift_alpha": 0.35,
+    "low_value_lift_ratio": 0.85,
+    "low_value_lift_alpha": 1.0,
     "inversion_methods": ["gunn woessner mod"],
     "tube_segments": "tubediameter,tubelength,aflow,angle\n0,1.93,qa,0\n0,2.80,8,0\n0,5.21,1.3,0",
 }
@@ -487,26 +487,39 @@ def one_sided_low_value_lift(values):
     ratio = float(np.clip(ratio, 0.05, 1.0))
 
     try:
-        alpha = float(low_value_lift_alpha.value)
+        blend = float(low_value_lift_alpha.value)
     except Exception:
-        alpha = float(DEFAULT_SETTINGS["low_value_lift_alpha"])
-    alpha = float(np.clip(alpha, 0.05, 0.95))
+        blend = float(DEFAULT_SETTINGS["low_value_lift_alpha"])
+    blend = float(np.clip(blend, 0.05, 1.0))
 
-    idx = np.arange(len(y), dtype=float)
-    log_valid = np.log(y[valid])
-    filled = np.interp(idx, idx[valid], log_valid)
+    for _ in range(3):
+        previous = np.full(len(lifted), np.nan)
+        next_value = np.full(len(lifted), np.nan)
 
-    forward = filled.copy()
-    backward = filled.copy()
-    for i in range(1, len(filled)):
-        forward[i] = alpha * filled[i] + (1.0 - alpha) * forward[i - 1]
-    for i in range(len(filled) - 2, -1, -1):
-        backward[i] = alpha * filled[i] + (1.0 - alpha) * backward[i + 1]
+        last = np.nan
+        for i, value in enumerate(lifted):
+            previous[i] = last
+            if np.isfinite(value) and value > 0:
+                last = value
 
-    expected = np.exp(0.5 * (forward + backward))
-    floor = expected * ratio
-    low = np.isfinite(lifted) & (lifted < floor)
-    lifted[low] = floor[low]
+        last = np.nan
+        for i in range(len(lifted) - 1, -1, -1):
+            next_value[i] = last
+            value = lifted[i]
+            if np.isfinite(value) and value > 0:
+                last = value
+
+        neighbor_ok = np.isfinite(previous) & np.isfinite(next_value) & (previous > 0) & (next_value > 0)
+        expected = np.full(len(lifted), np.nan)
+        expected[neighbor_ok] = np.sqrt(previous[neighbor_ok] * next_value[neighbor_ok])
+        floor = expected * ratio
+        low = neighbor_ok & (~np.isfinite(lifted) | (lifted <= 0) | (lifted < floor))
+        if not np.any(low):
+            break
+
+        current = np.where(np.isfinite(lifted) & (lifted > 0), lifted, 0.0)
+        lifted[low] = current[low] + blend * (floor[low] - current[low])
+
     return lifted
 
 
@@ -1333,7 +1346,7 @@ low_value_lift_ratio = pn.widgets.FloatInput(
     width=150,
 )
 low_value_lift_alpha = pn.widgets.FloatInput(
-    name="Lift smoothing alpha",
+    name="Lift correction fraction",
     value=float(settings.get(
         "low_value_lift_alpha",
         DEFAULT_SETTINGS["low_value_lift_alpha"],
@@ -2072,6 +2085,8 @@ def run_inversion_calculation(df):
 
                     dp_inv = invdf["abs_size_nm"].to_numpy(dtype=float)
                     n_inv = invdf["N_GWalpha"].to_numpy(dtype=float)
+                    if low_value_lift_enabled.value:
+                        n_inv = one_sided_low_value_lift(n_inv)
 
                     for row in invdf.itertuples(index=False):
                         residual_rows.append({
