@@ -77,6 +77,7 @@ DEFAULT_SETTINGS = {
     "smps_timing_offset_step_sec": 10.0,
     "smps_timing_match_tolerance_min": 15.0,
     "inversion_size_bin_decimals": 1,
+    "cpc_gap_interpolation_enabled": True,
     "low_value_lift_enabled": False,
     "low_value_lift_ratio": 0.85,
     "low_value_lift_alpha": 1.0,
@@ -195,6 +196,7 @@ def save_settings():
         "smps_timing_offset_step_sec": float(smps_timing_offset_step_sec.value),
         "smps_timing_match_tolerance_min": float(smps_timing_match_tolerance_min.value),
         "inversion_size_bin_decimals": int(inversion_size_bin_decimals.value),
+        "cpc_gap_interpolation_enabled": bool(cpc_gap_interpolation_enabled.value),
         "low_value_lift_enabled": bool(low_value_lift_enabled.value),
         "low_value_lift_ratio": float(low_value_lift_ratio.value),
         "low_value_lift_alpha": float(low_value_lift_alpha.value),
@@ -521,6 +523,30 @@ def one_sided_low_value_lift(values):
         lifted[low] = current[low] + blend * (floor[low] - current[low])
 
     return lifted
+
+
+def interpolate_cpc_gaps_for_inversion(size_nm, cpc_values):
+    sizes = np.asarray(size_nm, dtype=float)
+    y = np.asarray(cpc_values, dtype=float)
+    repaired = y.copy()
+    valid = np.isfinite(sizes) & (sizes > 0) & np.isfinite(y) & (y > 0)
+    if np.count_nonzero(valid) < 2:
+        return sizes[valid], y[valid]
+
+    try:
+        ratio = float(low_value_lift_ratio.value)
+    except Exception:
+        ratio = float(DEFAULT_SETTINGS["low_value_lift_ratio"])
+    ratio = float(np.clip(ratio, 0.05, 1.0))
+
+    log_sizes = np.log10(sizes)
+    expected = np.exp(np.interp(log_sizes, log_sizes[valid], np.log(y[valid])))
+    floor = expected * ratio
+    low = np.isfinite(sizes) & (sizes > 0) & (~np.isfinite(repaired) | (repaired <= 0) | (repaired < floor))
+    repaired[low] = floor[low]
+
+    keep = np.isfinite(sizes) & (sizes > 0) & np.isfinite(repaired) & (repaired > 0)
+    return sizes[keep], repaired[keep]
 
 
 def apply_smps_size_shift(df):
@@ -1329,6 +1355,13 @@ inversion_size_bin_decimals = pn.widgets.IntInput(
     step=1,
     width=160,
 )
+cpc_gap_interpolation_enabled = pn.widgets.Checkbox(
+    name="Interpolate CPC gaps before inversion",
+    value=bool(settings.get(
+        "cpc_gap_interpolation_enabled",
+        DEFAULT_SETTINGS["cpc_gap_interpolation_enabled"],
+    )),
+)
 low_value_lift_enabled = pn.widgets.Checkbox(
     name="Lift low/zero artifacts",
     value=bool(settings.get(
@@ -1910,20 +1943,30 @@ def invert_one_scan(
     temp=293.15,
     press=101325,
     inversion_method="gunn woessner mod",
+    expected_size_axis=None,
 ):
     d = d.copy()
     d = d[d["Ntot"] == False]
     d["cpc_float"] = pd.to_numeric(d["cpc_count"], errors="coerce")
     size_col = inversion_size_column(d)
     d["abs_size_nm"] = merged_abs_size_nm(d[size_col])
-    d = d.dropna(subset=["abs_size_nm", "cpc_float"])
-    d = d[d["cpc_float"] > 0]
+    d = d.dropna(subset=["abs_size_nm"])
     d = d[d["abs_size_nm"] > smallest_size.value]
     d = d.sort_values("abs_size_nm")
 
     y_series = d.groupby("abs_size_nm")["cpc_float"].mean()
-    dp_meas_nm = y_series.index.to_numpy(dtype=float)
-    y = y_series.to_numpy(dtype=float)
+    if cpc_gap_interpolation_enabled.value and expected_size_axis is not None:
+        expected = np.asarray(expected_size_axis, dtype=float)
+        expected = expected[(expected >= y_series.index.min()) & (expected <= y_series.index.max())]
+        y_series = y_series.reindex(expected)
+        dp_meas_nm, y = interpolate_cpc_gaps_for_inversion(
+            y_series.index.to_numpy(dtype=float),
+            y_series.to_numpy(dtype=float),
+        )
+    else:
+        y_series = y_series[y_series > 0]
+        dp_meas_nm = y_series.index.to_numpy(dtype=float)
+        y = y_series.to_numpy(dtype=float)
 
     if len(dp_meas_nm) < 2:
         return pd.DataFrame(columns=["abs_size_nm", "N_GWalpha"])
@@ -2078,6 +2121,7 @@ def run_inversion_calculation(df):
                         temp=temp,
                         press=press,
                         inversion_method=inversion_method,
+                        expected_size_axis=size_axis,
                     )
 
                     if invdf.empty:
@@ -3630,6 +3674,7 @@ for w in [
     smps_timing_offset_step_sec,
     smps_timing_match_tolerance_min,
     inversion_size_bin_decimals,
+    cpc_gap_interpolation_enabled,
     low_value_lift_enabled,
     low_value_lift_ratio,
     low_value_lift_alpha,
@@ -3652,7 +3697,8 @@ inversion_controls = pn.Column(
     pn.Row(zratio_widget, zratio_min_widget, zratio_max_widget, zratio_smoothing_step),
     pn.Row(zratio_min_size_nm, zratio_estimate_offset, use_zratio_checkbox, smallest_size),
     pn.Row(scan_inversion_type, smps_settling_time_sec, inversion_methods),
-    pn.Row(inversion_size_bin_decimals, low_value_lift_enabled, low_value_lift_ratio, low_value_lift_alpha),
+    pn.Row(inversion_size_bin_decimals, cpc_gap_interpolation_enabled, low_value_lift_enabled),
+    pn.Row(low_value_lift_ratio, low_value_lift_alpha),
     tube_segments,
 )
 
