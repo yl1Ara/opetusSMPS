@@ -1,3 +1,0 @@
-RSYNC_PATH='C:/msys64/usr/bin/rsync.exe' \
-REMOTE_DIR='/c/Users/mittaaja/Documents/V09_BipolarProto' \
-./sync_to_windows.sh

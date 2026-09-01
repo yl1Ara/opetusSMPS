@@ -1,1 +1,0 @@
-"""DMPS inversion GUI package."""
