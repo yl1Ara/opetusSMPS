@@ -30,7 +30,7 @@ DEFAULT_SETTINGS = {
     "n_scans_plot": 5,
     "settling_time": 10,
     "final_point_extra_hold": 0,
-    "smps_plot_time_shift_sec": 0.0,
+    "smps_plot_step_shift": 0,
     "polarity_switch_time": 0,
     "Bipolar_toggle": True,
     "Ntot_time": 60,
@@ -113,10 +113,10 @@ final_point_extra_hold = pn.widgets.IntInput(
     step=1,
     width=170,
 )
-smps_plot_time_shift_sec = pn.widgets.FloatInput(
-    name="SMPS plot time shift (s)",
-    value=DEFAULT_SETTINGS["smps_plot_time_shift_sec"],
-    step=1.0,
+smps_plot_step_shift = pn.widgets.IntInput(
+    name="SMPS plot step shift",
+    value=DEFAULT_SETTINGS["smps_plot_step_shift"],
+    step=1,
     width=170,
 )
 polarity_switch_time = pn.widgets.IntInput(
@@ -194,7 +194,7 @@ def save_settings():
         "n_scans_plot": int(n_scans_plot.value),
         "settling_time": int(settling_time.value),
         "final_point_extra_hold": int(final_point_extra_hold.value),
-        "smps_plot_time_shift_sec": float(smps_plot_time_shift_sec.value),
+        "smps_plot_step_shift": int(smps_plot_step_shift.value),
         "polarity_switch_time": int(polarity_switch_time.value),
         "Bipolar_toggle": bool(Bipolar_toggle.value),
         "Ntot_time": int(Ntot_time.value),
@@ -249,9 +249,9 @@ def load_settings():
         "final_point_extra_hold",
         DEFAULT_SETTINGS["final_point_extra_hold"],
     )
-    smps_plot_time_shift_sec.value = settings.get(
-        "smps_plot_time_shift_sec",
-        DEFAULT_SETTINGS["smps_plot_time_shift_sec"],
+    smps_plot_step_shift.value = settings.get(
+        "smps_plot_step_shift",
+        int(round(settings.get("smps_plot_time_shift_sec", DEFAULT_SETTINGS["smps_plot_step_shift"]))),
     )
     polarity_switch_time.value = settings.get(
         "polarity_switch_time", DEFAULT_SETTINGS["polarity_switch_time"]
@@ -928,41 +928,29 @@ def on_start_change(event):
         status_text.object = "Status: stopped"
 
 
-def apply_smps_plot_time_shift(df):
-    df = df.copy()
-    shift = float(smps_plot_time_shift_sec.value)
+def apply_smps_plot_step_shift_to_bins(grouped):
+    grouped = grouped.copy()
+    grouped["plot_abs_size_nm"] = grouped["abs_size_nm"]
+    shift = int(smps_plot_step_shift.value)
 
-    if shift == 0 or df.empty:
-        df["shifted_size_nm"] = df["size_float"]
-        df["shifted_abs_size_nm"] = df["shifted_size_nm"].abs()
-        return df
+    if shift == 0 or grouped.empty:
+        return grouped
 
     shifted_parts = []
-    group_cols = [col for col in ["scan_id", "scan_number", "scan_range", "polarity"] if col in df.columns]
+    group_cols = [col for col in ["scan_number", "scan_range", "polarity"] if col in grouped.columns]
 
-    for _, group in df.groupby(group_cols, dropna=False) if group_cols else [(None, df)]:
-        group = group.sort_values("time").copy()
-        timeline = group[["time", "size_float"]].dropna(subset=["time", "size_float"]).copy()
-        samples = group.reset_index().copy()
-        samples["source_time"] = samples["time"] - pd.to_timedelta(shift, unit="s")
+    for _, group in grouped.groupby(group_cols, dropna=False) if group_cols else [(None, grouped)]:
+        group = group.sort_values("abs_size_nm").copy()
+        if len(group) < 2:
+            shifted_parts.append(group)
+            continue
 
-        if not timeline.empty:
-            matched = pd.merge_asof(
-                samples.sort_values("source_time"),
-                timeline.rename(columns={"time": "source_time", "size_float": "shifted_size_nm"}).sort_values("source_time"),
-                on="source_time",
-                direction="backward",
-            )
-            matched["shifted_size_nm"] = matched["shifted_size_nm"].fillna(matched["size_float"])
-            shifted_parts.append(matched.set_index("index"))
-        else:
-            shifted_parts.append(samples.set_index("index"))
+        sizes = group["abs_size_nm"].to_numpy(dtype=float)
+        source_indices = np.clip(np.arange(len(group)) - shift, 0, len(group) - 1)
+        group["plot_abs_size_nm"] = sizes[source_indices]
+        shifted_parts.append(group)
 
-    if shifted_parts:
-        df = pd.concat(shifted_parts).sort_index()
-
-    df["shifted_abs_size_nm"] = pd.to_numeric(df["shifted_size_nm"], errors="coerce").abs()
-    return df
+    return pd.concat(shifted_parts, ignore_index=True) if shifted_parts else grouped
 
 
 def make_plot(df):
@@ -1043,30 +1031,34 @@ def make_plot(df):
         else:
             df2_scan = df2.copy()
         df2_scan = df2_scan.dropna(subset=["abs_size_nm", "cpc_float"])
-        df2_scan = apply_smps_plot_time_shift(df2_scan)
 
         grouped = (
-            df2_scan.groupby(["scan_number", "shifted_abs_size_nm", "polarity"])
+            df2_scan.groupby(["scan_number", "scan_range", "abs_size_nm", "polarity"])
             .agg(
                 cpc_float=("cpc_float", "mean"),
                 time=("time", "median"),
+                n_samples=("cpc_float", "size"),
             )
             .reset_index()
-            .sort_values(["scan_number", "polarity", "shifted_abs_size_nm"])
+            .sort_values(["scan_number", "polarity", "abs_size_nm"])
         )
+        grouped = apply_smps_plot_step_shift_to_bins(grouped)
 
         latest_scan = grouped["scan_number"].max() if not grouped.empty else None
         previous = grouped[grouped["scan_number"] != latest_scan]
         if not previous.empty:
             background = (
-                previous.groupby(["polarity", "shifted_abs_size_nm"])["cpc_float"]
-                .mean()
+                previous.groupby(["polarity", "abs_size_nm"])
+                .agg(
+                    cpc_float=("cpc_float", "mean"),
+                    plot_abs_size_nm=("plot_abs_size_nm", "mean"),
+                )
                 .reset_index()
-                .sort_values(["polarity", "shifted_abs_size_nm"])
+                .sort_values(["polarity", "plot_abs_size_nm"])
             )
             for polarity, g in background.groupby("polarity"):
                 fig.add_scatter(
-                    x=g["shifted_abs_size_nm"],
+                    x=g["plot_abs_size_nm"],
                     y=g["cpc_float"],
                     mode="lines+markers",
                     name=f"Previous scans avg {polarity}",
@@ -1078,14 +1070,14 @@ def make_plot(df):
 
         peak_rows = []
         for (sn, polarity), g in grouped.groupby(["scan_number", "polarity"]):
-            g = g.sort_values("shifted_abs_size_nm")
+            g = g.sort_values("plot_abs_size_nm")
             if g.empty:
                 continue
 
             is_latest = sn == latest_scan
 
             fig.add_scatter(
-                x=g["shifted_abs_size_nm"],
+                x=g["plot_abs_size_nm"],
                 y=g["cpc_float"],
                 mode="lines+markers",
                 name=f"Latest scan {polarity}" if is_latest else f"Scan {sn} {polarity}",
@@ -1103,7 +1095,7 @@ def make_plot(df):
                     "scan_number": sn,
                     "polarity": polarity,
                     "time": pd.to_datetime(g["time"], errors="coerce").median(),
-                    "peak_dp": float(g["shifted_abs_size_nm"].iloc[idx]),
+                    "peak_dp": float(g["plot_abs_size_nm"].iloc[idx]),
                     "peak_cpc": float(values[idx]),
                 })
 
@@ -1218,7 +1210,7 @@ for widget in [
     n_scans_plot,
     settling_time,
     final_point_extra_hold,
-    smps_plot_time_shift_sec,
+    smps_plot_step_shift,
     polarity_switch_time,
     Bipolar_toggle,
     Ntot_time,
@@ -1245,7 +1237,7 @@ layout = pn.Column(
     pn.Row(range2, sheath2, steps2),
     scan_pane,
     pn.Row(meas_time, cpc_poll_interval, Ntot_time, ntot_every_n_scans, n_scans_plot),
-    pn.Row(settling_time, final_point_extra_hold, smps_plot_time_shift_sec, polarity_switch_time),
+    pn.Row(settling_time, final_point_extra_hold, smps_plot_step_shift, polarity_switch_time),
     pn.Row(current_cpc_pane, latest_ntot_pane),
     "### Live data",
     last_row_pane,
