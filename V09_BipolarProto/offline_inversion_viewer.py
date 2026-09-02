@@ -59,6 +59,15 @@ def _global_live_tab():
     smps_timing_plot = pn.pane.Plotly(width=1300, height=1100)
     difference_plot = pn.pane.Plotly(width=1300)
     refresh_button = pn.widgets.Button(name="Refresh global view", button_type="primary")
+    controls_status = pn.pane.Markdown(
+        "Global controls are loaded on demand so the live page opens quickly."
+    )
+    load_controls_button = pn.widgets.Button(
+        name="Load global controls",
+        button_type="primary",
+    )
+    controls_container = pn.Column(controls_status, load_controls_button, width=1400)
+    controls_loaded = {"value": False}
 
     local = {"version": -1}
 
@@ -66,11 +75,6 @@ def _global_live_tab():
         with global_app.shared_state["lock"]:
             version = global_app.shared_state.get("version", 0)
             status_text = global_app.shared_state.get("status", "Status: idle")
-            raw_fig = copy.deepcopy(global_app.shared_state.get("raw_fig"))
-            inversion_fig = copy.deepcopy(global_app.shared_state.get("inversion_fig"))
-            residual_fig = copy.deepcopy(global_app.shared_state.get("residual_fig"))
-            smps_timing_fig = copy.deepcopy(global_app.shared_state.get("smps_timing_fig"))
-            difference_fig = copy.deepcopy(global_app.shared_state.get("difference_fig"))
 
         status.object = str(status_text)
         metadata.object = f"Version: `{global_app.APP_VERSION}`  |  Shared update: `{version}`"
@@ -82,30 +86,53 @@ def _global_live_tab():
         if version == local["version"]:
             return
         local["version"] = version
+
+        with global_app.shared_state["lock"]:
+            raw_fig = copy.deepcopy(global_app.shared_state.get("raw_fig"))
+            inversion_fig = copy.deepcopy(global_app.shared_state.get("inversion_fig"))
+            residual_fig = copy.deepcopy(global_app.shared_state.get("residual_fig"))
+            smps_timing_fig = copy.deepcopy(global_app.shared_state.get("smps_timing_fig"))
+            difference_fig = copy.deepcopy(global_app.shared_state.get("difference_fig"))
+
         raw_plot.object = raw_fig
         inversion_plot.object = inversion_fig
         residual_plot.object = residual_fig
         smps_timing_plot.object = smps_timing_fig
         difference_plot.object = difference_fig
 
+    def load_controls(event=None):
+        if controls_loaded["value"]:
+            return
+        controls_loaded["value"] = True
+        controls_container.objects = [global_app.controls]
+
     refresh_button.on_click(refresh)
+    load_controls_button.on_click(load_controls)
     refresh()
     pn.state.add_periodic_callback(refresh, period=2000, start=True)
+
+    live_tabs = pn.Tabs(
+        ("Current Inversion", pn.Column(inversion_plot)),
+        ("Current Raw Data", pn.Column(raw_plot)),
+        ("Residuals", pn.Column(residual_plot)),
+        ("SMPS Timing", pn.Column(smps_timing_plot)),
+        ("Difference Diagnostics", pn.Column(difference_plot)),
+        ("Global Controls", controls_container),
+        ("Settings", pn.Column(settings_json)),
+        dynamic=True,
+    )
+
+    def load_controls_on_tab(event):
+        if event.new == 5:
+            load_controls()
+
+    live_tabs.param.watch(load_controls_on_tab, "active")
 
     return pn.Column(
         "# Global live inversion",
         pn.Row(refresh_button, status),
         metadata,
-        pn.Accordion(("Global controls / automation", global_app.controls), active=[]),
-        pn.Tabs(
-            ("Current Inversion", pn.Column(inversion_plot)),
-            ("Current Raw Data", pn.Column(raw_plot)),
-            ("Residuals", pn.Column(residual_plot)),
-            ("SMPS Timing", pn.Column(smps_timing_plot)),
-            ("Difference Diagnostics", pn.Column(difference_plot)),
-            ("Settings", pn.Column(settings_json)),
-            dynamic=True,
-        ),
+        live_tabs,
         width=1400,
     )
 

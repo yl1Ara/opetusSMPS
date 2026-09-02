@@ -3,12 +3,14 @@ from GP8XXX_IIC import GP8403
 import serial
 import time
 import smbus2
+import threading
 from smbus2 import i2c_msg
 from gpiozero import OutputDevice, PWMOutputDevice
 
 class CPC:
     def __init__(self, port, CPC_type="3771"):
         self.type = CPC_type
+        self.lock = threading.Lock()
         if CPC_type == "3771":
             self.ser = serial.Serial(
                 port=port,
@@ -16,7 +18,8 @@ class CPC:
                 bytesize=serial.SEVENBITS,
                 parity=serial.PARITY_EVEN,
                 stopbits=serial.STOPBITS_ONE,
-                timeout=1
+                timeout=1,
+                write_timeout=0.2,
             )
         elif CPC_type == "HY09":
             self.ser = serial.Serial(
@@ -25,15 +28,19 @@ class CPC:
                 bytesize=serial.EIGHTBITS,
                 parity=serial.PARITY_EVEN,
                 stopbits=serial.STOPBITS_ONE,
-                timeout=1
+                timeout=1,
+                write_timeout=0.2,
             )
 
     def read_instrument(self):
-        if self.type == "3771":
-            self.ser.write(b"RD\r")
-        elif self.type == "HY09":
-            self.ser.write(b"RB\r")
-        return self.ser.readline().decode("utf-8").strip()
+        with self.lock:
+            self.ser.reset_input_buffer()
+            if self.type == "3771":
+                self.ser.write(b"RD\r")
+            elif self.type == "HY09":
+                self.ser.write(b"RB\r")
+            line = self.ser.readline().decode("utf-8", errors="replace").strip()
+        return line if line else "nan"
 class HaukeDMA:
     def __init__(self):
         self.r1 = 0.025

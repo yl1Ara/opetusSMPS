@@ -188,6 +188,11 @@ def voltage_set(dp, Q_sh_lpm=10.0):
     
     write_dac8551(value)
 
+
+def dac_code_from_size(dp, Q_sh_lpm=10.0):
+    voltage = voltage_from_size(dp, Q_sh_lpm=Q_sh_lpm)
+    return DACValue(voltage)
+
     
 
 def test():
