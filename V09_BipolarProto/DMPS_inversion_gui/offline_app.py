@@ -72,6 +72,7 @@ DEFAULT_SETTINGS = {
     "smallest_size": 6.5,
     "scan_inversion_type": "DMPS",
     "smps_settling_time_sec": 30.0,
+    "smps_size_step_shift": 0,
     "smps_timing_offset_min_sec": -300.0,
     "smps_timing_offset_max_sec": 300.0,
     "smps_timing_offset_step_sec": 10.0,
@@ -191,6 +192,7 @@ def save_settings():
         "smallest_size": float(smallest_size.value),
         "scan_inversion_type": scan_inversion_type.value,
         "smps_settling_time_sec": float(smps_settling_time_sec.value),
+        "smps_size_step_shift": int(smps_size_step_shift.value),
         "smps_timing_offset_min_sec": float(smps_timing_offset_min_sec.value),
         "smps_timing_offset_max_sec": float(smps_timing_offset_max_sec.value),
         "smps_timing_offset_step_sec": float(smps_timing_offset_step_sec.value),
@@ -552,41 +554,25 @@ def interpolate_cpc_gaps_for_inversion(size_nm, cpc_values):
 def apply_smps_size_shift(df):
     df = df.copy()
     df["inversion_size_nm"] = pd.to_numeric(df["size_nm"], errors="coerce")
+    return df
 
+
+def apply_smps_size_step_shift(y_series):
     if scan_inversion_type.value != "SMPS":
-        return df
+        return y_series
 
-    delay = float(smps_settling_time_sec.value)
-    if not np.isfinite(delay) or delay <= 0:
-        return df
+    try:
+        shift = int(smps_size_step_shift.value)
+    except Exception:
+        shift = int(DEFAULT_SETTINGS["smps_size_step_shift"])
 
-    df["time"] = pd.to_datetime(df["time"], errors="coerce")
-    df["smps_source_time"] = df["time"] - pd.to_timedelta(delay, unit="s")
-    shifted_parts = []
-    group_cols = [col for col in ["scan_id", "scan_number", "scan_range", "polarity"] if col in df.columns]
+    if shift == 0 or len(y_series) < 2:
+        return y_series
 
-    for _, group in df.groupby(group_cols, dropna=False) if group_cols else [(None, df)]:
-        group = group.sort_values("time").copy()
-        timeline = group[["time", "size_nm"]].dropna(subset=["time"]).copy()
-        samples = group.reset_index().sort_values("smps_source_time")
-        samples["inversion_size_nm"] = np.nan
-
-        valid_samples = samples["smps_source_time"].notna()
-        if not timeline.empty and valid_samples.any():
-            matched = pd.merge_asof(
-                samples[valid_samples],
-                timeline.rename(columns={"time": "smps_source_time", "size_nm": "shifted_size_nm"}).sort_values("smps_source_time"),
-                on="smps_source_time",
-                direction="backward",
-            )
-            samples.loc[valid_samples, "inversion_size_nm"] = matched["shifted_size_nm"].to_numpy()
-
-        shifted_parts.append(samples.set_index("index"))
-
-    if shifted_parts:
-        df = pd.concat(shifted_parts).sort_index()
-
-    return df.drop(columns=["smps_source_time"], errors="ignore")
+    y_series = y_series.sort_index()
+    values = y_series.to_numpy(dtype=float)
+    source_indices = np.clip(np.arange(len(values)) + shift, 0, len(values) - 1)
+    return pd.Series(values[source_indices], index=y_series.index, name=y_series.name)
 
 
 def normalize_inversion_methods(values):
@@ -1310,6 +1296,15 @@ smps_settling_time_sec = pn.widgets.FloatInput(
     step=1.0,
     width=180,
 )
+smps_size_step_shift = pn.widgets.IntInput(
+    name="SMPS size step shift",
+    value=int(settings.get(
+        "smps_size_step_shift",
+        DEFAULT_SETTINGS["smps_size_step_shift"],
+    )),
+    step=1,
+    width=170,
+)
 smps_timing_offset_min_sec = pn.widgets.FloatInput(
     name="Timing fit min offset (s)",
     value=float(settings.get(
@@ -1943,7 +1938,6 @@ def invert_one_scan(
     temp=293.15,
     press=101325,
     inversion_method="gunn woessner mod",
-    expected_size_axis=None,
 ):
     d = d.copy()
     d = d[d["Ntot"] == False]
@@ -1955,10 +1949,8 @@ def invert_one_scan(
     d = d.sort_values("abs_size_nm")
 
     y_series = d.groupby("abs_size_nm")["cpc_float"].mean()
-    if cpc_gap_interpolation_enabled.value and expected_size_axis is not None:
-        expected = np.asarray(expected_size_axis, dtype=float)
-        expected = expected[(expected >= y_series.index.min()) & (expected <= y_series.index.max())]
-        y_series = y_series.reindex(expected)
+    y_series = apply_smps_size_step_shift(y_series)
+    if cpc_gap_interpolation_enabled.value:
         dp_meas_nm, y = interpolate_cpc_gaps_for_inversion(
             y_series.index.to_numpy(dtype=float),
             y_series.to_numpy(dtype=float),
@@ -2121,7 +2113,6 @@ def run_inversion_calculation(df):
                         temp=temp,
                         press=press,
                         inversion_method=inversion_method,
-                        expected_size_axis=size_axis,
                     )
 
                     if invdf.empty:
@@ -3669,6 +3660,7 @@ for w in [
     smallest_size,
     scan_inversion_type,
     smps_settling_time_sec,
+    smps_size_step_shift,
     smps_timing_offset_min_sec,
     smps_timing_offset_max_sec,
     smps_timing_offset_step_sec,
@@ -3696,7 +3688,7 @@ inversion_controls = pn.Column(
     pn.Row(qa_lpm, qs_lpm, temp_K, press_Pa),
     pn.Row(zratio_widget, zratio_min_widget, zratio_max_widget, zratio_smoothing_step),
     pn.Row(zratio_min_size_nm, zratio_estimate_offset, use_zratio_checkbox, smallest_size),
-    pn.Row(scan_inversion_type, smps_settling_time_sec, inversion_methods),
+    pn.Row(scan_inversion_type, smps_settling_time_sec, smps_size_step_shift, inversion_methods),
     pn.Row(inversion_size_bin_decimals, cpc_gap_interpolation_enabled, low_value_lift_enabled),
     pn.Row(low_value_lift_ratio, low_value_lift_alpha),
     tube_segments,
