@@ -52,6 +52,14 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 deploy/install-services.sh --origin customer-host.tailnet-name.ts.net
 ```
 
+By default, runtime settings and logs remain under `V09_BipolarProto`. To preserve an existing absolute collection path while running code from a clean clone, pass an existing writable state directory:
+
+```bash
+deploy/install-services.sh --origin customer-host.tailnet-name.ts.net --state-dir /home/pi/Desktop/TDMPS
+```
+
+The services then load code and dependencies from the Git checkout but retain `settings.json`, `settings_inversion.json`, `logs/`, and viewer state under the state directory.
+
 The default viewer origin is the same host on port 8443. Override it with `--viewer-origin HOST:PORT` if the proxy uses another exact origin. The installer creates `.venv`, synchronizes locked application dependencies plus Raspberry Pi hardware dependencies, syntax-checks both applications, installs the units and `dmps`, enables both application services, and verifies both localhost health endpoints.
 
 ## Operations and updates

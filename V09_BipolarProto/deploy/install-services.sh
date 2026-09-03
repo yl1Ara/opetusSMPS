@@ -2,16 +2,18 @@
 set -euo pipefail
 
 usage() {
-    printf 'Usage: %s --origin HOST[:PORT] [--viewer-origin HOST:PORT] [--user USER]\n' "$0"
+    printf 'Usage: %s --origin HOST[:PORT] [--viewer-origin HOST:PORT] [--state-dir PATH] [--user USER]\n' "$0"
 }
 
 user_name="${SUDO_USER:-$USER}"
 main_origin=""
 viewer_origin=""
+state_dir=""
 while (($#)); do
     case "$1" in
         --origin) main_origin="${2:?missing origin}"; shift 2 ;;
         --viewer-origin) viewer_origin="${2:?missing viewer origin}"; shift 2 ;;
+        --state-dir) state_dir="${2:?missing state directory}"; shift 2 ;;
         --user) user_name="${2:?missing user}"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; exit 2 ;;
@@ -35,8 +37,13 @@ fi
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 app_dir="$(cd -- "${script_dir}/.." && pwd)"
 repo_root="$(git -C "${app_dir}" rev-parse --show-toplevel)"
+state_dir="${state_dir:-${app_dir}}"
 if [[ "${app_dir}" != "${repo_root}/V09_BipolarProto" || ! -f "${app_dir}/gui.py" || ! -f "${app_dir}/offline_inversion_viewer.py" ]]; then
     printf 'Expected this checkout at repository-root/V09_BipolarProto; found %s\n' "${app_dir}" >&2
+    exit 1
+fi
+if [[ "${state_dir}" != /* || ! -d "${state_dir}" || ! -w "${state_dir}" ]]; then
+    printf 'State directory must be an existing writable absolute path: %s\n' "${state_dir}" >&2
     exit 1
 fi
 if [[ "$(id -un)" != "${user_name}" ]]; then
@@ -59,8 +66,8 @@ uv pip install --python "${app_dir}/.venv/bin/python" -r requirements-hardware.t
 
 config_tmp="$(mktemp)"
 trap 'rm -f "${config_tmp}"' EXIT
-printf 'APP_DIR="%s"\nDMPS_WEBSOCKET_ORIGIN_MAIN="%s"\nDMPS_WEBSOCKET_ORIGIN_VIEWER="%s"\n' \
-    "${app_dir}" "${main_origin}" "${viewer_origin}" >"${config_tmp}"
+printf 'APP_DIR="%s"\nDMPS_STATE_DIR="%s"\nDMPS_WEBSOCKET_ORIGIN_MAIN="%s"\nDMPS_WEBSOCKET_ORIGIN_VIEWER="%s"\n' \
+    "${app_dir}" "${state_dir}" "${main_origin}" "${viewer_origin}" >"${config_tmp}"
 
 sudo install -d -o root -g root -m 0755 /etc/dmps /usr/local/libexec
 sudo install -o root -g root -m 0644 "${config_tmp}" "/etc/dmps/${user_name}.env"

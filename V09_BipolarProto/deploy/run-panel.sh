@@ -22,7 +22,7 @@ case "${1:-}" in
         ;;
 esac
 
-cd "${APP_DIR}"
+cd "${DMPS_STATE_DIR:-${APP_DIR}}"
 exec "${APP_DIR}/.venv/bin/panel" serve "${app}" \
     --address 127.0.0.1 \
     --port "${port}" \
