@@ -83,25 +83,91 @@ def sheath_flow_relative_rmse(scan_rows):
     return float(flow_rmse), float(abs(flow_rmse / setpoint_median))
 
 
+def log_diameter_bin_widths(size_nm):
+    """Return inferred dlog10Dp bin widths for positive diameter-bin centers."""
+    size_nm = np.asarray(size_nm, dtype=float)
+    widths = np.full(size_nm.shape, np.nan, dtype=float)
+    valid_indices = np.flatnonzero(np.isfinite(size_nm) & (size_nm > 0))
+    if len(valid_indices) < 2:
+        return widths
+    order = valid_indices[np.argsort(size_nm[valid_indices])]
+    log_sizes = np.log10(size_nm[order])
+    if np.any(np.diff(log_sizes) <= 0):
+        return widths
+    edges = np.empty(len(log_sizes) + 1, dtype=float)
+    edges[1:-1] = 0.5 * (log_sizes[:-1] + log_sizes[1:])
+    edges[0] = log_sizes[0] - 0.5 * (log_sizes[1] - log_sizes[0])
+    edges[-1] = log_sizes[-1] + 0.5 * (log_sizes[-1] - log_sizes[-2])
+    widths[order] = np.diff(edges)
+    return widths
+
+
+def distribution_support_widths(size_nm, part_columns=None):
+    """Return bin widths without bridging independently measured ranges."""
+    size_nm = np.asarray(size_nm, dtype=float)
+    if part_columns is None:
+        return log_diameter_bin_widths(size_nm)
+
+    support = np.zeros(size_nm.shape, dtype=float)
+    valid_sizes = np.isfinite(size_nm) & (size_nm > 0)
+    order = np.flatnonzero(valid_sizes)[np.argsort(size_nm[valid_sizes])]
+    if len(order) < 2:
+        support[~valid_sizes] = np.nan
+        return support
+    intervals = np.diff(np.log10(size_nm[order]))
+    interval_supported = np.zeros(len(intervals), dtype=bool)
+    for column in part_columns:
+        part = np.asarray(column, dtype=float)
+        available = np.isfinite(part[order])
+        interval_supported |= available[:-1] & available[1:]
+    valid_intervals = interval_supported & np.isfinite(intervals) & (intervals > 0)
+    support[order[:-1]] += 0.5 * intervals * valid_intervals
+    support[order[1:]] += 0.5 * intervals * valid_intervals
+    support[~valid_sizes] = np.nan
+    return support
+
+
+def distribution_bin_coverage(size_nm, concentration, part_columns=None):
+    size_nm = np.asarray(size_nm, dtype=float)
+    concentration = np.asarray(concentration, dtype=float)
+    widths = distribution_support_widths(size_nm, part_columns)
+    available = np.isfinite(size_nm) & (size_nm > 0) & np.isfinite(concentration)
+    finite_width = np.isfinite(widths) & (widths > 0)
+    full_widths = log_diameter_bin_widths(size_nm)
+    full = np.isfinite(full_widths) & (full_widths > 0)
+    total_width = float(np.sum(full_widths[full]))
+    if total_width <= 0:
+        return np.nan
+    return float(np.sum(widths[finite_width & available]) / total_width)
+
+
 def integrate_number_distribution(size_nm, concentration, part_columns=None):
     size_nm = np.asarray(size_nm, dtype=float)
     concentration = np.asarray(concentration, dtype=float)
     valid = np.isfinite(size_nm) & (size_nm > 0) & np.isfinite(concentration)
-    if valid.sum() < 2:
+    if np.count_nonzero(np.isfinite(size_nm) & (size_nm > 0)) < 2:
         return np.nan
-    order = np.argsort(size_nm)
-    size_nm = size_nm[order]
-    concentration = concentration[order]
-    valid = valid[order]
     if part_columns is None:
-        connected = valid[:-1] & valid[1:]
-    else:
-        parts = np.vstack([np.asarray(column, dtype=float)[order] for column in part_columns])
-        connected = valid[:-1] & valid[1:] & np.any(
-            np.isfinite(parts[:, :-1]) & np.isfinite(parts[:, 1:]), axis=0
-        )
-    widths = np.diff(np.log10(size_nm))
-    trapezoids = 0.5 * (concentration[:-1] + concentration[1:]) * widths
+        widths = log_diameter_bin_widths(size_nm)
+        usable = valid & np.isfinite(widths) & (widths > 0)
+        if not np.any(usable):
+            return np.nan
+        return float(np.sum(concentration[usable] * widths[usable]))
+
+    valid_sizes = np.isfinite(size_nm) & (size_nm > 0)
+    order = np.flatnonzero(valid_sizes)[np.argsort(size_nm[valid_sizes])]
+    intervals = np.diff(np.log10(size_nm[order]))
+    supported = np.zeros(len(intervals), dtype=bool)
+    for column in part_columns:
+        part = np.asarray(column, dtype=float)
+        available = np.isfinite(part[order])
+        supported |= available[:-1] & available[1:]
+    connected = supported & valid[order[:-1]] & valid[order[1:]]
+    if not np.any(connected):
+        return np.nan
+    trapezoids = 0.5 * (
+        concentration[order[:-1]] + concentration[order[1:]]
+    ) * intervals
     return float(np.sum(trapezoids[connected]))
 
 
@@ -199,9 +265,7 @@ def build_formation_rate_diagnostics(
         event_sizes = event_sizes[order]
         event_z = event_z[order, :]
         conc = np.array([
-            np.trapezoid(col, np.log10(event_sizes))
-            if np.count_nonzero(np.isfinite(col)) >= 2 else np.nan
-            for col in event_z.T
+            integrate_number_distribution(event_sizes, col) for col in event_z.T
         ])
         conc = guard_diagnostic_values(conc, ntot_limit, use_ntot_limit=True, multiplier=8.0)
         conc, spike_limit = suppress_isolated_spikes(conc, multiplier=8.0)
@@ -230,6 +294,7 @@ def build_formation_rate_diagnostics(
             "time": times,
             "concentration": conc,
             "formation_rate": rate,
+            "rate_semantics": "apparent accumulation rate dN/dt; excludes growth flux and losses",
             "onset_time": onset_time,
             "threshold": threshold,
             "spike_limit": spike_limit,
@@ -718,13 +783,7 @@ def build_growth_rate_diagnostics(
 
 
 def integrate_distribution(size_nm, conc):
-    size_nm = np.asarray(size_nm, dtype=float)
-    conc = np.asarray(conc, dtype=float)
-    valid = np.isfinite(size_nm) & np.isfinite(conc) & (size_nm > 0)
-    if np.count_nonzero(valid) < 2:
-        return np.nan
-    order = np.argsort(size_nm[valid])
-    return float(np.trapezoid(conc[valid][order], np.log10(size_nm[valid][order])))
+    return integrate_number_distribution(size_nm, conc)
 
 
 def peak_diameter(size_nm, conc):

@@ -125,3 +125,30 @@ cd ~/opetusSMPS/V09_BipolarProto
 ```
 
 Set `ONLINE_VIEWER_ORIGIN=analysis-host.example:5007` when accessing it through another exact hostname. The launcher binds only to localhost by default; use a separate authenticated proxy or SSH forwarding for remote access.
+
+On the CSC analysis host, install the tracked service helper after cloning the repository:
+
+```bash
+cd /home/ubuntu/opetusSMPS/V09_BipolarProto
+sudo install -o root -g root -m 0755 deploy/inversion /usr/local/bin/inversion
+sudo install -o root -g root -m 0644 deploy/inversion-completion.bash /etc/bash_completion.d/inversion
+```
+
+The production defaults are service `opetus-panel.service`, checkout
+`/home/ubuntu/opetusSMPS/V09_BipolarProto`, and local health URL
+`http://127.0.0.1:5008/online_inversion_viewer`. They can be overridden with
+`INVERSION_SERVICE`, `INVERSION_APP_DIR`, and `INVERSION_HEALTH_URL`.
+
+Use `inversion status`, `inversion health`, and `inversion tail` for routine
+operation. `inversion update` refuses a dirty, detached, locally advanced, or
+diverged checkout. It fetches and fast-forwards only from `origin/main`, runs a
+locked dependency sync and Python/shell syntax checks, refreshes the helper,
+and health-checks the restarted viewer. A stopped viewer remains stopped.
+
+There is no reliable external signal for all per-session inversion jobs. When
+the viewer is active, update therefore requires an interactive `UPDATE`
+confirmation after all users have been notified and all jobs have finished.
+Do not automate this command. It stops the viewer before changing source or
+dependencies. A failed validation leaves it stopped; correct the problem,
+rerun `inversion update`, then use `inversion start`. The Pi-specific
+measurement-idle check does not protect online inversion work.

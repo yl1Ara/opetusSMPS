@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+app_dir="${INVERSION_APP_DIR:-/home/ubuntu/opetusSMPS/V09_BipolarProto}"
+service="${INVERSION_SERVICE:-opetus-panel.service}"
+health_url="${INVERSION_HEALTH_URL:-http://127.0.0.1:5008/online_inversion_viewer}"
+lock_file="${INVERSION_UPDATE_LOCK:-/tmp/opetus-inversion-update.lock}"
+
+check_health() {
+    local attempt
+    systemctl is-active --quiet "${service}"
+    for attempt in {1..30}; do
+        if curl --connect-timeout 2 --max-time 5 --fail --silent --show-error \
+            --output /dev/null "${health_url}"; then
+            printf 'inversion viewer healthy: %s\n' "${health_url}"
+            return 0
+        fi
+        sleep 1
+    done
+    printf 'Inversion viewer failed its health check: %s\n' "${health_url}" >&2
+    printf "Inspect it with 'inversion status' and 'inversion tail'.\n" >&2
+    return 1
+}
+
+control() {
+    case "$1" in
+        start|stop|restart|reload|enable|disable)
+            exec 9>"${lock_file}"
+            if ! flock -n 9; then
+                printf 'An inversion update or control operation is already running.\n' >&2
+                exit 1
+            fi
+            case "$1" in
+                start|stop|restart) sudo systemctl "$1" "${service}" ;;
+                reload) sudo systemctl daemon-reload ;;
+                enable|disable) sudo systemctl "$1" "${service}" ;;
+            esac
+            ;;
+        status) systemctl --no-pager --full status "${service}" ;;
+        health) check_health ;;
+        log|logs|tail) journalctl -u "${service}" -n 100 -f ;;
+        *) printf 'Unknown command: %s\n' "$1" >&2; exit 2 ;;
+    esac
+}
+
+install_runtime_files() {
+    sudo install -o root -g root -m 0755 "${app_dir}/deploy/inversion" /usr/local/bin/inversion
+    sudo install -o root -g root -m 0644 \
+        "${app_dir}/deploy/inversion-completion.bash" \
+        /etc/bash_completion.d/inversion
+}
+
+update_app() {
+    local repo_root branch upstream service_was_active=false confirmation
+
+    if [[ "$(id -u)" -eq 0 ]]; then
+        printf 'Run inversion update as the service user, not root.\n' >&2
+        return 1
+    fi
+    for command_name in git uv systemctl curl sudo flock; do
+        if ! command -v "${command_name}" >/dev/null 2>&1; then
+            printf 'Required command is missing: %s\n' "${command_name}" >&2
+            return 1
+        fi
+    done
+    if [[ ! -f "${app_dir}/online_inversion_viewer.py" ]]; then
+        printf 'Invalid inversion application directory: %s\n' "${app_dir}" >&2
+        return 1
+    fi
+
+    exec 9>"${lock_file}"
+    if ! flock -n 9; then
+        printf 'Another inversion update is already running.\n' >&2
+        return 1
+    fi
+
+    repo_root="$(git -C "${app_dir}" rev-parse --show-toplevel)"
+    if [[ "${app_dir}" != "${repo_root}/V09_BipolarProto" ]]; then
+        printf 'Expected APP_DIR at repository-root/V09_BipolarProto.\n' >&2
+        return 1
+    fi
+    if [[ -n "$(git -C "${repo_root}" status --porcelain --untracked-files=normal)" ]]; then
+        printf 'Refusing update: repository has tracked or untracked changes.\n' >&2
+        git -C "${repo_root}" status --short >&2
+        return 1
+    fi
+    branch="$(git -C "${repo_root}" symbolic-ref --quiet --short HEAD || true)"
+    upstream="$(git -C "${repo_root}" rev-parse --abbrev-ref '@{upstream}' 2>/dev/null || true)"
+    if [[ "${branch}" != "main" || "${upstream}" != "origin/main" ]]; then
+        printf 'Refusing update: expected attached main branch tracking origin/main.\n' >&2
+        return 1
+    fi
+
+    git -C "${repo_root}" fetch --prune origin
+    if ! git -C "${repo_root}" merge-base --is-ancestor HEAD origin/main; then
+        printf 'Refusing update: local main is ahead of or diverged from origin/main.\n' >&2
+        return 1
+    fi
+    if [[ -n "$(git -C "${repo_root}" status --porcelain --untracked-files=normal)" ]]; then
+        printf 'Refusing update: repository changed during fetch.\n' >&2
+        return 1
+    fi
+
+    if systemctl is-active --quiet "${service}"; then
+        service_was_active=true
+        if [[ ! -t 0 ]]; then
+            printf 'Refusing noninteractive update of an active inversion viewer.\n' >&2
+            return 1
+        fi
+        printf 'This will terminate all viewer sessions. Confirm no inversion is running.\n'
+        printf 'Type UPDATE to continue: '
+        read -r confirmation
+        if [[ "${confirmation}" != "UPDATE" ]]; then
+            printf 'Update cancelled.\n' >&2
+            return 1
+        fi
+    fi
+
+    sudo -v
+    if [[ -n "$(git -C "${repo_root}" status --porcelain --untracked-files=normal)" ]]; then
+        printf 'Refusing update: repository changed during confirmation.\n' >&2
+        return 1
+    fi
+    if [[ "${service_was_active}" == false ]] && systemctl is-active --quiet "${service}"; then
+        printf 'Refusing update: inversion viewer started during confirmation.\n' >&2
+        return 1
+    fi
+    if [[ "${service_was_active}" == true ]]; then
+        sudo systemctl stop "${service}"
+        if systemctl is-active --quiet "${service}"; then
+            printf 'Refusing update: inversion viewer did not stop.\n' >&2
+            return 1
+        fi
+    fi
+
+    git -C "${repo_root}" merge --ff-only origin/main
+    (
+        cd "${app_dir}"
+        uv sync --locked
+        .venv/bin/python deploy/compile-check.py \
+            online_inversion_viewer.py inversion.py DMPS_inversion_gui inv_funcs
+        bash -n run_online_inversion_viewer.sh deploy/inversion \
+            deploy/inversion-completion.bash
+    )
+    install_runtime_files
+
+    if [[ "${service_was_active}" == true ]]; then
+        sudo systemctl start "${service}"
+        check_health
+    fi
+    printf 'Update complete at %s. Services that were stopped remain stopped.\n' \
+        "$(git -C "${repo_root}" rev-parse --short HEAD)"
+}
+
+case "${1:-help}" in
+    start|stop|restart|reload|status|health|log|logs|tail|enable|disable) control "$1" ;;
+    update) update_app ;;
+    process|ps) systemctl show "${service}" -p MainPID -p NRestarts -p ActiveState -p SubState ;;
+    url) printf '%s\n' "${health_url}" ;;
+    shell) cd "${app_dir}"; exec "${SHELL:-/bin/bash}" ;;
+    help|-help|--help|-h)
+        cat <<'EOF'
+Usage:
+  inversion start|stop|restart|status|health|tail
+  inversion update    Fast-forward, validate, and safely restart the viewer
+  inversion process   Show the service process state
+  inversion url       Print the local health URL
+  inversion shell     Open a shell in V09_BipolarProto
+EOF
+        ;;
+    *) printf "Unknown command. Run 'inversion help'.\n" >&2; exit 2 ;;
+esac

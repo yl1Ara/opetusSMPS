@@ -5,6 +5,7 @@ import pandas as pd
 
 from DMPS_inversion_gui.diagnostics import (
     build_growth_rate_diagnostics,
+    distribution_bin_coverage,
     growth_models_from_settings,
     integrate_number_distribution,
     range_overlap_metrics,
@@ -401,7 +402,7 @@ class InversionDiagnosticTests(unittest.TestCase):
 
         self.assertAlmostEqual(
             integrate_number_distribution(sizes, concentration),
-            200.0,
+            300.0,
         )
 
     def test_range_overlap_reports_relative_seam(self):
@@ -424,6 +425,69 @@ class InversionDiagnosticTests(unittest.TestCase):
         self.assertAlmostEqual(
             integrate_number_distribution(sizes, concentration, part_columns=parts),
             200.0,
+        )
+
+    def test_stitched_ranges_do_not_assign_unmeasured_gap_to_end_bins(self):
+        sizes = np.array([10.0, 20.0, 1000.0, 2000.0])
+        concentration = np.full(4, 100.0)
+        parts = [
+            np.array([100.0, 100.0, np.nan, np.nan]),
+            np.array([np.nan, np.nan, 100.0, 100.0]),
+        ]
+
+        self.assertAlmostEqual(
+            integrate_number_distribution(sizes, concentration, part_columns=parts),
+            200.0 * np.log10(2.0),
+        )
+        self.assertLess(
+            distribution_bin_coverage(sizes, concentration, part_columns=parts),
+            0.25,
+        )
+
+    def test_stitched_support_handles_internal_gap_after_missing_bins(self):
+        sizes = np.array([5.0, 10.0, 20.0, 500.0, 1000.0, 2000.0])
+        concentration = np.full(6, 100.0)
+        parts = [np.array([np.nan, 100.0, 100.0, np.nan, 100.0, 100.0])]
+
+        self.assertAlmostEqual(
+            integrate_number_distribution(sizes, concentration, part_columns=parts),
+            200.0 * np.log10(2.0),
+        )
+
+    def test_stitched_ranges_joining_at_one_center_keep_both_intervals(self):
+        sizes = np.array([10.0, 20.0, 100.0])
+        concentration = np.full(3, 100.0)
+        parts = [
+            np.array([100.0, 100.0, np.nan]),
+            np.array([np.nan, 100.0, 100.0]),
+        ]
+
+        self.assertAlmostEqual(
+            integrate_number_distribution(sizes, concentration, part_columns=parts),
+            100.0,
+        )
+        self.assertAlmostEqual(
+            distribution_bin_coverage(sizes, concentration, part_columns=parts),
+            2.0 / 3.0,
+        )
+
+    def test_distribution_integration_reports_missing_bin_coverage(self):
+        sizes = np.array([10.0, 20.0, 100.0, 1000.0])
+        concentration = np.array([100.0, np.nan, 100.0, 100.0])
+        widths = np.array([
+            np.log10(20.0 / 10.0),
+            0.5 * np.log10(100.0 / 10.0),
+            0.5 * np.log10(1000.0 / 20.0),
+            np.log10(1000.0 / 100.0),
+        ])
+
+        self.assertAlmostEqual(
+            integrate_number_distribution(sizes, concentration),
+            100.0 * np.sum(widths[[0, 2, 3]]),
+        )
+        self.assertAlmostEqual(
+            distribution_bin_coverage(sizes, concentration),
+            np.sum(widths[[0, 2, 3]]) / np.sum(widths),
         )
 
 

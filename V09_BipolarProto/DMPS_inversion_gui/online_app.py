@@ -2636,6 +2636,9 @@ def run_inversion_calculation(df):
                 ntot_scan = diag.integrate_number_distribution(
                     size_axis, full_col, part_columns=part_columns
                 )
+                ntot_bin_coverage = diag.distribution_bin_coverage(
+                    size_axis, full_col, part_columns=part_columns
+                )
 
                 if len(part_columns) >= 2 and inversion_method == inversion_method_values[0]:
                     overlap_metrics = diag.range_overlap_metrics(part_columns)
@@ -2660,6 +2663,7 @@ def run_inversion_calculation(df):
                     "method": inversion_method,
                     "polarity": polarity,
                     "inverted_ntot": ntot_scan,
+                    "inverted_bin_coverage": ntot_bin_coverage,
                     "measured_ntot_raw": measured_ntot_raw,
                     "measured_ntot": measured_ntot,
                     "cpc_type": scan_cpc_type,
@@ -2819,7 +2823,7 @@ def plot_inversion_result(result):
         )
         subplot_titles.append(f"NPF growth-model comparison ({rates})")
     if formation_diagnostics:
-        subplot_titles.append("NPF formation-rate / onset diagnostic")
+        subplot_titles.append("NPF apparent accumulation / onset diagnostic")
     if scan_health:
         subplot_titles.append("Scan health")
     subplot_titles.extend([
@@ -3174,7 +3178,7 @@ def plot_inversion_result(result):
                 hovertemplate=(
                     "time=%{x|%Y-%m-%d %H:%M}<br>"
                     "N(%{fullData.name})=%{y:.2f}<br>"
-                    "dN/dt=%{customdata[0]:.2f} cm-3 h-1<br>"
+                    "apparent accumulation dN/dt=%{customdata[0]:.2f} cm-3 h-1<br>"
                     "onset threshold=%{customdata[1]:.2f}<br>"
                     "spike guard=%{customdata[2]:.2f}<extra></extra>"
                 ),
@@ -3299,7 +3303,7 @@ def plot_inversion_result(result):
         )
         fig.update_xaxes(title_text="Banana-track model", row=growth_row, col=1)
     if formation_row is not None:
-        fig.update_yaxes(title_text="N in event range", row=formation_row, col=1)
+        fig.update_yaxes(title_text="N in event range (dN/dt is apparent accumulation)", row=formation_row, col=1)
         fig.update_xaxes(title_text="Time", tickformat="%H:%M", row=formation_row, col=1)
     if scan_health_row is not None:
         fig.update_yaxes(title_text="NaN % / flow RMSE", row=scan_health_row, col=1)
@@ -4177,6 +4181,12 @@ def run_inversion(event=None):
                 closure = closure[np.isfinite(closure)]
                 if len(closure):
                     status_text += f" Median Ntot closure {np.median(closure):.2f}."
+                coverage = np.asarray([
+                    row.get("inverted_bin_coverage", np.nan) for row in closure_rows
+                ], dtype=float)
+                coverage = coverage[np.isfinite(coverage)]
+                if len(coverage):
+                    status_text += f" Median inverted-bin coverage {100 * np.median(coverage):.0f}%."
 
                 status.object = status_text
                 publish_shared_state(
