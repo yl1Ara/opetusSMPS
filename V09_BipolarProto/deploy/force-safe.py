@@ -46,6 +46,11 @@ def main():
     if valve is not None:
         attempt("inlet valve close", valve.close)
 
+    # Always safe the locally connected bipolar DAC before optional serial HV.
+    attempt("bipolar SPI setup", ctl.HV.setup)
+    attempt("bipolar HV zero", ctl.HV.zero)
+    attempt("bipolar SPI close", ctl.HV.cleanup)
+
     spellman = None
 
     def connect_spellman():
@@ -60,10 +65,6 @@ def main():
     if spellman is not None:
         attempt("Spellman zero", spellman.zero)
         attempt("Spellman disable", spellman.disable)
-        attempt("Spellman close", spellman.close)
-    attempt("bipolar SPI setup", ctl.HV.setup)
-    attempt("bipolar HV zero", ctl.HV.zero)
-    attempt("bipolar SPI close", ctl.HV.cleanup)
 
     if errors:
         print("Force-safe completed with errors: " + "; ".join(errors), flush=True)
