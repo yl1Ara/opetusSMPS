@@ -1,6 +1,7 @@
 GP8XXX-IIC==0.0.4
 gpiozero==2.0.1
 pyserial==3.5
+rpi-lgpio==0.6
 sensirion_i2c_driver==1.0.2
 sensirion_i2c_sdp==0.1.1
 simple-pid==2.0.1
