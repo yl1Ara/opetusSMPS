@@ -7,22 +7,22 @@ from pathlib import Path
 
 import panel as pn
 
-from DMPS_inversion_gui import offline_app as global_app
+from DMPS_inversion_gui import online_app as global_app
 
 
-APP_PATH = Path(__file__).resolve().parent / "DMPS_inversion_gui" / "offline_app.py"
+APP_PATH = Path(__file__).resolve().parent / "DMPS_inversion_gui" / "online_app.py"
 SESSION_SETTINGS_DIR = Path(__file__).resolve().parent / ".session_inversion_settings"
 
 
 def _load_session_app():
     session_id = uuid.uuid4().hex
-    module_name = f"DMPS_inversion_gui.offline_app_session_{session_id}"
+    module_name = f"DMPS_inversion_gui.online_app_session_{session_id}"
     spec = importlib.util.spec_from_file_location(module_name, APP_PATH)
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
 
-    module.SHARED_STATE_KEY = f"offline_inversion_viewer_session_state_{session_id}"
+    module.SHARED_STATE_KEY = f"online_inversion_viewer_session_state_{session_id}"
     module.shared_state = pn.state.cache.setdefault(
         module.SHARED_STATE_KEY,
         {
@@ -139,9 +139,9 @@ def _global_live_tab():
 
 def start_multi_app():
     print(f"DMPS inversion viewer {global_app.APP_VERSION}: {APP_PATH}", flush=True)
-    if not pn.state.cache.get("offline_inversion_viewer_global_started", False):
+    if not pn.state.cache.get("online_inversion_viewer_global_started", False):
         global_app.start_app()
-        pn.state.cache["offline_inversion_viewer_global_started"] = True
+        pn.state.cache["online_inversion_viewer_global_started"] = True
 
     global_live = _global_live_tab()
 

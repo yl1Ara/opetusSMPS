@@ -8,6 +8,7 @@ Type=simple
 User=%i
 EnvironmentFile=/etc/dmps/%i.env
 ExecStart=/usr/bin/env /usr/local/libexec/dmps-run-panel main
+ExecStopPost=/usr/local/libexec/dmps-force-safe
 Restart=on-failure
 RestartSec=5
 KillMode=control-group

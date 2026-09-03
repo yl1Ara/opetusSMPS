@@ -22,6 +22,7 @@ _GL_NODES, _GL_WEIGHTS = leggauss(5)
 
 import inv_funcs as inv
 from DMPS_inversion_gui import diagnostics as diag
+from DMPS_inversion_gui.cpc_delay import assign_cpc_samples_to_setpoints
 from inv_funcs.cpc_loss import cpc_loss1
 from inv_funcs.dmps_loss import dmps_loss1
 from inv_funcs.ltubefl import ltubefl
@@ -33,7 +34,7 @@ from inv_funcs.ltubefl import ltubefl
 
 APP_ROOT = Path(__file__).resolve().parents[1]
 SETTINGS_FILE = APP_ROOT / "settings_inversion.json"
-APP_VERSION = "2026-07-31-diagnostics-tabs"
+APP_VERSION = (APP_ROOT / "VERSION").read_text().strip()
 
 DEFAULT_SETTINGS = {
     "scan_root": "logs/scans",
@@ -72,6 +73,8 @@ DEFAULT_SETTINGS = {
     "smallest_size": 6.5,
     "scan_inversion_type": "DMPS",
     "smps_settling_time_sec": 30.0,
+    "smps_correction_mode": "Transport delay",
+    "smps_transport_delay_sec": 30.0,
     "smps_size_step_shift": 0,
     "smps_timing_offset_min_sec": -300.0,
     "smps_timing_offset_max_sec": 300.0,
@@ -103,7 +106,7 @@ latest_difference_diagnostics = None
 auto_pending_signature = None
 AUTO_STATE_FILE = APP_ROOT / "auto_inversion_state.json"
 scan_time_cache = {}
-SHARED_STATE_KEY = "offline_inversion_viewer_shared_state"
+SHARED_STATE_KEY = "online_inversion_viewer_shared_state"
 shared_state = pn.state.cache.setdefault(
     SHARED_STATE_KEY,
     {
@@ -146,7 +149,11 @@ def ensure_settings_file():
 def load_settings():
     ensure_settings_file()
     try:
-        return json.loads(SETTINGS_FILE.read_text())
+        settings = json.loads(SETTINGS_FILE.read_text())
+        if "smps_correction_mode" not in settings and "smps_size_step_shift" in settings:
+            settings["smps_correction_mode"] = "Integer step shift"
+            SETTINGS_FILE.write_text(json.dumps(settings, indent=2))
+        return settings
     except json.JSONDecodeError:
         broken = SETTINGS_FILE.with_name("settings_inversion_broken.json")
         SETTINGS_FILE.rename(broken)
@@ -192,6 +199,8 @@ def save_settings():
         "smallest_size": float(smallest_size.value),
         "scan_inversion_type": scan_inversion_type.value,
         "smps_settling_time_sec": float(smps_settling_time_sec.value),
+        "smps_correction_mode": smps_correction_mode.value,
+        "smps_transport_delay_sec": float(smps_transport_delay_sec.value),
         "smps_size_step_shift": int(smps_size_step_shift.value),
         "smps_timing_offset_min_sec": float(smps_timing_offset_min_sec.value),
         "smps_timing_offset_max_sec": float(smps_timing_offset_max_sec.value),
@@ -530,10 +539,12 @@ def one_sided_low_value_lift(values):
 def interpolate_cpc_gaps_for_inversion(size_nm, cpc_values):
     sizes = np.asarray(size_nm, dtype=float)
     y = np.asarray(cpc_values, dtype=float)
-    repaired = y.copy()
-    valid = np.isfinite(sizes) & (sizes > 0) & np.isfinite(y) & (y > 0)
-    if np.count_nonzero(valid) < 2:
-        return sizes[valid], y[valid]
+    keep = np.isfinite(sizes) & (sizes > 0)
+    sizes = sizes[keep]
+    repaired = y[keep].copy()
+    valid = np.isfinite(repaired) & (repaired > 0)
+    if np.count_nonzero(valid) == 0:
+        return sizes[:0], repaired[:0]
 
     try:
         ratio = float(low_value_lift_ratio.value)
@@ -542,13 +553,17 @@ def interpolate_cpc_gaps_for_inversion(size_nm, cpc_values):
     ratio = float(np.clip(ratio, 0.05, 1.0))
 
     log_sizes = np.log10(sizes)
-    expected = np.exp(np.interp(log_sizes, log_sizes[valid], np.log(y[valid])))
+    if np.count_nonzero(valid) == 1:
+        expected = np.full(len(sizes), np.nan, dtype=float)
+        expected[valid] = repaired[valid]
+    else:
+        expected = np.exp(np.interp(log_sizes, log_sizes[valid], np.log(repaired[valid])))
+        expected[(log_sizes < log_sizes[valid].min()) | (log_sizes > log_sizes[valid].max())] = np.nan
     floor = expected * ratio
-    low = np.isfinite(sizes) & (sizes > 0) & (~np.isfinite(repaired) | (repaired <= 0) | (repaired < floor))
+    low = ~np.isfinite(repaired) | (repaired <= 0) | (repaired < floor)
     repaired[low] = floor[low]
-
-    keep = np.isfinite(sizes) & (sizes > 0) & np.isfinite(repaired) & (repaired > 0)
-    return sizes[keep], repaired[keep]
+    measured = np.isfinite(repaired)
+    return sizes[measured], repaired[measured]
 
 
 def apply_smps_size_shift(df):
@@ -566,6 +581,18 @@ def smps_size_step_shift_value():
 
 def build_cpc_series_for_inversion(d):
     if scan_inversion_type.value != "SMPS":
+        return d.groupby("abs_size_nm")["cpc_float"].mean()
+
+    if smps_correction_mode.value == "Transport delay":
+        assignment = assign_cpc_samples_to_setpoints(
+            d,
+            delay_seconds=float(smps_transport_delay_sec.value),
+            settling_seconds=float(smps_settling_time_sec.value),
+        )
+        assignment.cpc_by_size.attrs["assignment_diagnostics"] = assignment.diagnostics
+        return assignment.cpc_by_size
+
+    if smps_correction_mode.value == "None":
         return d.groupby("abs_size_nm")["cpc_float"].mean()
 
     shift = smps_size_step_shift_value()
@@ -619,7 +646,8 @@ def build_cpc_series_for_inversion(d):
     if not parts:
         return averaged
 
-    return pd.DataFrame(parts).groupby("abs_size_nm")["cpc_float"].mean()
+    shifted = pd.DataFrame(parts).groupby("abs_size_nm")["cpc_float"].mean()
+    return shifted.reindex(sizes).combine_first(averaged.reindex(sizes))
 
 
 def normalize_inversion_methods(values):
@@ -1343,6 +1371,26 @@ smps_settling_time_sec = pn.widgets.FloatInput(
     step=1.0,
     width=180,
 )
+smps_correction_mode = pn.widgets.Select(
+    name="SMPS CPC correction",
+    options=["Transport delay", "Integer step shift", "None"],
+    value=(
+        settings.get("smps_correction_mode", DEFAULT_SETTINGS["smps_correction_mode"])
+        if settings.get("smps_correction_mode", DEFAULT_SETTINGS["smps_correction_mode"])
+        in ["Transport delay", "Integer step shift", "None"]
+        else DEFAULT_SETTINGS["smps_correction_mode"]
+    ),
+    width=180,
+)
+smps_transport_delay_sec = pn.widgets.FloatInput(
+    name="CPC transport delay (s)",
+    value=float(settings.get(
+        "smps_transport_delay_sec",
+        DEFAULT_SETTINGS["smps_transport_delay_sec"],
+    )),
+    step=1.0,
+    width=180,
+)
 smps_size_step_shift = pn.widgets.IntInput(
     name="SMPS size step shift",
     value=int(settings.get(
@@ -1985,6 +2033,8 @@ def invert_one_scan(
     temp=293.15,
     press=101325,
     inversion_method="gunn woessner mod",
+    cpc_series_override=None,
+    assignment_diagnostics=None,
 ):
     d = d.copy()
     d = d[d["Ntot"] == False]
@@ -1995,14 +2045,23 @@ def invert_one_scan(
     d = d[d["abs_size_nm"] > smallest_size.value]
     d = d.sort_values("abs_size_nm")
 
-    y_series = build_cpc_series_for_inversion(d)
+    y_series = (
+        build_cpc_series_for_inversion(d)
+        if cpc_series_override is None
+        else cpc_series_override.copy()
+    )
+    if assignment_diagnostics is None:
+        assignment_diagnostics = y_series.attrs.get("assignment_diagnostics")
     if cpc_gap_interpolation_enabled.value:
         dp_meas_nm, y = interpolate_cpc_gaps_for_inversion(
             y_series.index.to_numpy(dtype=float),
             y_series.to_numpy(dtype=float),
         )
     else:
-        y_series = y_series[y_series > 0]
+        if smps_correction_mode.value == "Transport delay":
+            y_series = y_series[np.isfinite(y_series)]
+        else:
+            y_series = y_series[y_series > 0]
         dp_meas_nm = y_series.index.to_numpy(dtype=float)
         y = y_series.to_numpy(dtype=float)
 
@@ -2078,7 +2137,7 @@ def invert_one_scan(
         where=y != 0,
     )
 
-    return pd.DataFrame({
+    result = pd.DataFrame({
         "abs_size_nm": dp_grid_nm,
         "N_GWalpha": x,
         "measured_cpc": y,
@@ -2086,6 +2145,9 @@ def invert_one_scan(
         "residual_cpc": residual,
         "residual_rel": residual_rel,
     })
+    if assignment_diagnostics is not None:
+        result.attrs["assignment_diagnostics"] = assignment_diagnostics
+    return result
 
 
 def run_inversion_calculation(df):
@@ -2098,8 +2160,28 @@ def run_inversion_calculation(df):
     size_axis = get_scan_size_axis(df[df["Ntot"] == False])
     output = []
     ion_points = []
+    assignment_diagnostics = []
 
     group_key = "scan_id" if "scan_id" in df.columns else "scan_number"
+    transport_assignments = {}
+    if scan_inversion_type.value == "SMPS" and smps_correction_mode.value == "Transport delay":
+        for scan_id, full_scan in df.groupby(group_key):
+            assignment_rows = full_scan[full_scan["Ntot"] == False].copy()
+            assignment_rows["cpc_float"] = pd.to_numeric(
+                assignment_rows["cpc_count"], errors="coerce"
+            )
+            assignment_rows["abs_size_nm"] = merged_abs_size_nm(
+                assignment_rows[inversion_size_column(assignment_rows)]
+            )
+            assignment_rows = assignment_rows[
+                assignment_rows["abs_size_nm"] > smallest_size.value
+            ]
+            transport_assignments[scan_id] = assign_cpc_samples_to_setpoints(
+                assignment_rows,
+                delay_seconds=float(smps_transport_delay_sec.value),
+                settling_seconds=float(smps_settling_time_sec.value),
+                group_columns=("polarity", "scan_range"),
+            )
 
     zratios = {}
     for scan_id, g_scan in df.groupby(group_key):
@@ -2116,7 +2198,8 @@ def run_inversion_calculation(df):
         if np.isfinite(smoothed_zratio) and smoothed_zratio != 0:
             zratios[scan_id] = smoothed_zratio
 
-    for inversion_method in selected_inversion_methods():
+    inversion_method_values = selected_inversion_methods()
+    for inversion_method in inversion_method_values:
         for polarity in ["positive", "negative"]:
             dd = df[df["polarity"] == polarity].copy()
 
@@ -2152,6 +2235,24 @@ def run_inversion_calculation(df):
                 measured_ntot = ntot_rows["cpc_float"].mean()
 
                 for _, g_range in g_scan.groupby("scan_range"):
+                    cpc_series_override = None
+                    group_assignment_diagnostics = None
+                    if scan_id in transport_assignments:
+                        assignment = transport_assignments[scan_id]
+                        range_value = g_range["scan_range"].iloc[0]
+                        try:
+                            cpc_series_override = assignment.cpc_by_size.xs(
+                                (polarity, range_value),
+                                level=("polarity", "scan_range"),
+                            )
+                            group_assignment_diagnostics = {
+                                **assignment.diagnostics,
+                                "scan_id": str(scan_id),
+                                "scan_range": range_value,
+                                "polarity": polarity,
+                            }
+                        except KeyError:
+                            cpc_series_override = pd.Series(dtype=float)
                     invdf = invert_one_scan(
                         g_range,
                         polarity=polarity,
@@ -2159,10 +2260,23 @@ def run_inversion_calculation(df):
                         temp=temp,
                         press=press,
                         inversion_method=inversion_method,
+                        cpc_series_override=cpc_series_override,
+                        assignment_diagnostics=group_assignment_diagnostics,
                     )
 
                     if invdf.empty:
                         continue
+
+                    assignment = invdf.attrs.get("assignment_diagnostics")
+                    if assignment is not None and inversion_method == inversion_method_values[0]:
+                        assignment = {
+                            **assignment,
+                            "scan_id": str(scan_id),
+                            "scan_range": g_range["scan_range"].iloc[0],
+                            "polarity": polarity,
+                        }
+                        assignment_diagnostics.append(assignment)
+                        print(f"SMPS CPC assignment: {assignment}", flush=True)
 
                     dp_inv = invdf["abs_size_nm"].to_numpy(dtype=float)
                     n_inv = invdf["N_GWalpha"].to_numpy(dtype=float)
@@ -2271,6 +2385,10 @@ def run_inversion_calculation(df):
     output.append({
         "kind": "scan_health",
         "rows": diag.build_scan_health(df, group_key),
+    })
+    output.append({
+        "kind": "cpc_assignment_diagnostics",
+        "rows": assignment_diagnostics,
     })
 
     return output
@@ -2836,7 +2954,7 @@ def plot_inversion_result(result):
     fig.update_layout(
         height=max(1200, 520 * rows),
         width=1300,
-        title="Offline inversion result",
+        title="Online inversion result",
         showlegend=True,
         margin=dict(l=50, r=260, t=60, b=30),
         legend=dict(x=1.02, y=1.0),
@@ -3544,6 +3662,23 @@ def run_inversion(event=None):
                 else:
                     status_text = "Inversion finished."
 
+                assignment_rows = next(
+                    (item["rows"] for item in result if item.get("kind") == "cpc_assignment_diagnostics"),
+                    [],
+                )
+                if assignment_rows:
+                    fallback_bins = sum(
+                        len(row["source_fallback_bins"])
+                        + len(row["interpolated_bins"])
+                        + len(row["edge_fallback_bins"])
+                        for row in assignment_rows
+                    )
+                    duplicate_ids = sum(row["duplicate_cpc_ids_ignored"] for row in assignment_rows)
+                    status_text += (
+                        f" CPC assignment: {fallback_bins} fallback bins, "
+                        f"{duplicate_ids} duplicate sample IDs ignored."
+                    )
+
                 status.object = status_text
                 publish_shared_state(
                     inversion_fig=fig,
@@ -3706,6 +3841,8 @@ for w in [
     smallest_size,
     scan_inversion_type,
     smps_settling_time_sec,
+    smps_correction_mode,
+    smps_transport_delay_sec,
     smps_size_step_shift,
     smps_timing_offset_min_sec,
     smps_timing_offset_max_sec,
@@ -3734,7 +3871,8 @@ inversion_controls = pn.Column(
     pn.Row(qa_lpm, qs_lpm, temp_K, press_Pa),
     pn.Row(zratio_widget, zratio_min_widget, zratio_max_widget, zratio_smoothing_step),
     pn.Row(zratio_min_size_nm, zratio_estimate_offset, use_zratio_checkbox, smallest_size),
-    pn.Row(scan_inversion_type, smps_settling_time_sec, smps_size_step_shift, inversion_methods),
+    pn.Row(scan_inversion_type, smps_settling_time_sec, smps_correction_mode, smps_transport_delay_sec),
+    pn.Row(smps_size_step_shift, inversion_methods),
     pn.Row(inversion_size_bin_decimals, cpc_gap_interpolation_enabled, low_value_lift_enabled),
     pn.Row(low_value_lift_ratio, low_value_lift_alpha),
     tube_segments,
@@ -3773,7 +3911,7 @@ plot_tabs = pn.Tabs(
 )
 
 layout = pn.Column(
-    "# Offline DMPS inversion / scan viewer",
+    f"# Online DMPS inversion / scan viewer v{APP_VERSION}",
     controls,
     plot_tabs,
     width=1400,

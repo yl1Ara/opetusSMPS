@@ -13,12 +13,19 @@ import threading
 import traceback
 import os
 import subprocess
+import atexit
+import shutil
+import signal
 from concurrent.futures import ThreadPoolExecutor
+from datetime import timezone
 from DmpsControl.tuning import aerosol_factor_from_pressures
 
 pn.config.session_key_func = lambda request: request.path
 
 SETTINGS_FILE = Path("settings.json")
+STATE_DIR = Path(os.environ.get("DMPS_STATE_DIR", ".")).resolve()
+HEALTH_FILE = STATE_DIR / "health.json"
+HEALTH_INTERVAL_SEC = 2.0
 
 DEFAULT_SETTINGS = {
     "cpc_com_port": "/dev/ttyAMA0",
@@ -60,7 +67,7 @@ DEFAULT_SETTINGS = {
     "polarity_switch_time": 0,
     "Bipolar_toggle": True,
     "Ntot_time": 60,
-    "CPC_type": "3771",
+    "CPC_type": "3010",
 }
 
 hardware_executor = ThreadPoolExecutor(max_workers=1)
@@ -73,6 +80,8 @@ git_executor = ThreadPoolExecutor(max_workers=1)
 # Run manually or from a service with panel serve, for example:
 # uv run panel serve gui.py --address 0.0.0.0 --port 5006
 
+APP_VERSION = (Path(__file__).resolve().parent / "VERSION").read_text().strip()
+
 flowmeter = None
 blower = None
 flow_controller = None
@@ -83,6 +92,12 @@ hv_device = None
 active_hv_config = None
 aerosol_flowmeter = None
 aerosol_active_config = None
+hv_target_voltage = 0.0
+hv_runtime_status = "uninitialized"
+hv_io_lock = threading.RLock()
+last_scan_saved = None
+last_runtime_error = None
+last_runtime_error_lock = threading.Lock()
 
 measurement_running = threading.Event()
 measurement_thread = None
@@ -122,7 +137,7 @@ pn.state.cache[TUNING_CANCEL_EVENT_KEY] = tuning_cancel_event
 
 #### Widgets ####
 cpc_com_port = pn.widgets.TextInput(name="CPC COM port", value="/dev/ttyAMA0")
-cpc_type = pn.widgets.Select(name="CPC Type", options=["3771", "HY09"], value="3771")
+cpc_type = pn.widgets.Select(name="CPC Type", options=["3010", "HY09"], value="3010")
 hv_source = pn.widgets.Select(
     name="HV source",
     options=["Bipolar DAC", "Monopolar Spellman"],
@@ -268,16 +283,26 @@ last_row_pane = pn.pane.Str("Last measurement: -")
 scan_pane = pn.pane.Str("Scan program: -")
 
 CPC_DIAGNOSTIC_COMMANDS = {
-    "Read concentration (RD)": "RD",
-    "Read all/status (RALL)": "RALL",
-    "Read instrument status (RS)": "RS",
-    "Read firmware/config (RF)": "RF",
-    "Read instrument errors (RE)": "RE",
-    "Custom": "",
+    "3010": {
+        "Read liquid status (R0)": "R0",
+        "Read condenser temperature (R1)": "R1",
+        "Read saturator temperature (R2)": "R2",
+        "Read readiness (R5)": "R5",
+        "Read 6-second count (RA)": "RA",
+        "Read 1-second count (RB)": "RB",
+        "Read concentration (RD)": "RD",
+        "Read temperature difference (RT)": "RT",
+        "Read vacuum status (RV)": "RV",
+        "Custom": "",
+    },
+    "HY09": {
+        "Read concentration (RB)": "RB",
+        "Custom": "",
+    },
 }
 cpc_diag_command = pn.widgets.Select(
     name="CPC command",
-    options=CPC_DIAGNOSTIC_COMMANDS,
+    options=CPC_DIAGNOSTIC_COMMANDS["3010"],
     value=DEFAULT_SETTINGS["cpc_diag_command"],
     width=220,
 )
@@ -295,6 +320,13 @@ cpc_diag_interval_sec = pn.widgets.IntInput(
     width=130,
 )
 cpc_diag_status = pn.pane.Markdown("CPC diagnostics: idle")
+
+
+def update_cpc_diagnostic_options(event=None):
+    options = CPC_DIAGNOSTIC_COMMANDS[cpc_type.value]
+    previous = cpc_diag_command.value
+    cpc_diag_command.options = options
+    cpc_diag_command.value = previous if previous in options.values() else next(iter(options.values()))
 cpc_diag_table = pn.widgets.DataFrame(
     pd.DataFrame(columns=["time", "command", "response", "error"]),
     height=260,
@@ -325,6 +357,7 @@ rows = []
 current_size_index = 0
 phase = "idle"
 phase_start_time = time.time()
+point_set_time = phase_start_time
 scan_rows = []
 completed_scans = []
 scan_number = 0
@@ -365,6 +398,13 @@ last_spellman_query_time = 0.0
 aerosol_cache_lock = threading.Lock()
 aerosol_cache = {"flow": np.nan, "pressure": np.nan, "temperature": np.nan, "error": None}
 aerosol_poll_thread = None
+health_thread = None
+
+
+def record_runtime_error(error):
+    global last_runtime_error
+    with last_runtime_error_lock:
+        last_runtime_error = str(error)
 
 
 def ensure_settings_file():
@@ -444,6 +484,7 @@ def load_settings():
         with open(SETTINGS_FILE, "r") as f:
             settings = json.load(f)
 
+    settings_changed = False
     new_setting_keys = (
         "sheath_pid_kp", "sheath_pid_ki", "sheath_pid_kd",
         "sheath_tune_output_low_v", "sheath_tune_output_high_v",
@@ -452,11 +493,20 @@ def load_settings():
     )
     if any(key not in settings for key in new_setting_keys):
         settings.update({key: DEFAULT_SETTINGS[key] for key in new_setting_keys if key not in settings})
+        settings_changed = True
+
+    # Earlier releases mislabeled the 3010's 9600/7-E-1 protocol as "3771".
+    if settings.get("CPC_type") == "3771":
+        settings["CPC_type"] = "3010"
+        settings_changed = True
+
+    if settings_changed:
         with settings_file_lock:
             atomic_write_json(SETTINGS_FILE, settings)
 
     cpc_com_port.value = settings.get("cpc_com_port", DEFAULT_SETTINGS["cpc_com_port"])
     cpc_type.value = settings.get("CPC_type", DEFAULT_SETTINGS["CPC_type"])
+    update_cpc_diagnostic_options()
 
     range1.value = np.array(settings.get("range1", DEFAULT_SETTINGS["range1"]))
     sheath1.value = settings.get("range1_sheath", DEFAULT_SETTINGS["range1_sheath"])
@@ -534,8 +584,8 @@ def load_settings():
     )
     cpc_diag_command.value = (
         saved_cpc_diag_command
-        if saved_cpc_diag_command in CPC_DIAGNOSTIC_COMMANDS.values()
-        else DEFAULT_SETTINGS["cpc_diag_command"]
+        if saved_cpc_diag_command in cpc_diag_command.options.values()
+        else next(iter(cpc_diag_command.options.values()))
     )
 
 ensure_settings_file()
@@ -567,6 +617,7 @@ def bipolar_log_sizes(size_range_value, n, order="negative_then_positive", bipol
 
 
 def save_completed_scan(scan_rows, scan_number):
+    global last_scan_saved
     if not scan_rows:
         return
 
@@ -580,6 +631,7 @@ def save_completed_scan(scan_rows, scan_number):
     temporary_path = path.with_suffix(".tmp")
     pd.DataFrame(scan_rows).to_csv(temporary_path, index=False)
     temporary_path.replace(path)
+    last_scan_saved = str(path)
     print(f"Saved completed scan: {path}", flush=True)
 
 
@@ -704,7 +756,7 @@ def set_status_threadsafe(text):
 
 
 def setup_hv_source(settings=None):
-    global hv_device, active_hv_config
+    global hv_device, active_hv_config, hv_target_voltage, hv_runtime_status
 
     settings = settings or current_scan_settings()
     if settings["hv_source"] == "Monopolar Spellman":
@@ -723,6 +775,12 @@ def setup_hv_source(settings=None):
             hv_device.disable()
         except Exception as e:
             print(f"Previous Spellman shutdown failed: {e}", flush=True)
+    elif active_hv_config and active_hv_config[0] == "Bipolar DAC":
+        try:
+            ctl.HV.zero()
+            ctl.HV.cleanup()
+        except Exception as e:
+            print(f"Previous bipolar HV shutdown failed: {e}", flush=True)
 
     if settings["hv_source"] == "Monopolar Spellman":
         hv_device = ctl.SpellmanHV(
@@ -735,42 +793,61 @@ def setup_hv_source(settings=None):
             print(f"Spellman clear faults failed: {e}", flush=True)
         hv_device.enable()
         hv_device.zero()
+        hv_target_voltage = 0.0
+        hv_runtime_status = "zeroed/enabled"
         active_hv_config = config
         return
 
     hv_device = None
     ctl.setup()
     ctl.HV.zero()
+    hv_target_voltage = 0.0
+    hv_runtime_status = "zeroed"
     active_hv_config = config
 
 
 def zero_hv(disable=False):
-    if active_hv_config and active_hv_config[0] == "Monopolar Spellman" and hv_device is not None:
-        hv_device.zero()
-        if disable:
-            try:
-                hv_device.disable()
-            except Exception as e:
-                print(f"Spellman disable failed: {e}", flush=True)
-        return
+    global hv_target_voltage, hv_runtime_status
 
-    ctl.HV.zero()
+    with hv_io_lock:
+        if active_hv_config and active_hv_config[0] == "Monopolar Spellman" and hv_device is not None:
+            hv_device.zero()
+            if disable:
+                try:
+                    hv_device.disable()
+                except Exception as e:
+                    print(f"Spellman disable failed: {e}", flush=True)
+            hv_target_voltage = 0.0
+            hv_runtime_status = "zeroed/disabled" if disable else "zeroed"
+            return
+
+        ctl.HV.zero()
+        hv_target_voltage = 0.0
+        hv_runtime_status = "zeroed"
 
 
 def set_hv_for_point(point):
-    dp = point["dp"]
-    q_sheath = point["sheath"]
+    global hv_target_voltage, hv_runtime_status
+    with hv_io_lock:
+        if app_stop_event.is_set() or not measurement_running.is_set():
+            return
+        dp = point["dp"]
+        q_sheath = point["sheath"]
 
-    if active_scan_settings and active_scan_settings["hv_source"] == "Monopolar Spellman":
-        if hv_device is None:
-            raise RuntimeError("Monopolar Spellman HV is not initialized")
-        hv_device.voltage_set(abs(float(dp)), Q_sh_lpm=q_sheath)
-        return
+        if active_scan_settings and active_scan_settings["hv_source"] == "Monopolar Spellman":
+            if hv_device is None:
+                raise RuntimeError("Monopolar Spellman HV is not initialized")
+            hv_device.voltage_set(abs(float(dp)), Q_sh_lpm=q_sheath)
+            hv_target_voltage = abs(float(point.get("hv_target_v", 0.0)))
+            hv_runtime_status = "enabled"
+            return
 
-    if "dac_code" in point:
-        ctl.HV.write_dac8551(point["dac_code"])
-    else:
-        ctl.HV.voltage_set(dp, Q_sh_lpm=q_sheath)
+        if "dac_code" in point:
+            ctl.HV.write_dac8551(point["dac_code"])
+        else:
+            ctl.HV.voltage_set(dp, Q_sh_lpm=q_sheath)
+        hv_target_voltage = float(point.get("hv_target_v", 0.0))
+        hv_runtime_status = "enabled"
 
 
 def hardware_stop_and_zero():
@@ -793,6 +870,7 @@ def hardware_stop_and_zero():
         set_status_threadsafe("Status: stopped, HV zeroed")
     except Exception as e:
         _traceback.print_exc()
+        record_runtime_error(e)
         set_status_threadsafe(f"Stop/zero failed: {e}")
     finally:
         hardware_stop_pending = False
@@ -865,6 +943,7 @@ def init_done_callback(fut, start_after=False):
             set_status_threadsafe("Status: running")
     except Exception as e:
         _traceback.print_exc()
+        record_runtime_error(e)
         measurement_running.clear()
         set_status_threadsafe(f"Hardware init failed: {e}")
     finally:
@@ -957,6 +1036,7 @@ def cpc_reader_loop(
             value = _np.nan
             error = str(e)
             print(f"CPC read failed: {e}", flush=True)
+            record_runtime_error(e)
 
         if _stop_event.is_set() or _cpc_reader_stop.is_set():
             break
@@ -1013,6 +1093,7 @@ def aerosol_poll_loop(meter, _stop_event=app_stop_event):
             with aerosol_cache_lock:
                 aerosol_cache["error"] = str(e)
             print(f"Aerosol flowmeter read failed: {e}", flush=True)
+            record_runtime_error(e)
         _stop_event.wait(1.0)
 
 
@@ -1058,6 +1139,7 @@ def setup_aerosol_flowmeter(settings, raise_errors=False):
         with aerosol_cache_lock:
             aerosol_cache.update(flow=np.nan, pressure=np.nan, temperature=np.nan, error=str(e))
         print(f"Aerosol flowmeter initialization failed: {e}", flush=True)
+        record_runtime_error(e)
         if raise_errors:
             raise
 
@@ -1192,7 +1274,9 @@ def run_aerosol_calibration_blocking(meter, settings, sample_count):
     global aerosol_active_config
 
     try:
-        pressures = meter.read_pressure_samples(count=sample_count, interval_sec=0.5)
+        pressures = meter.read_pressure_samples(
+            count=sample_count, interval_sec=0.5, cancel_event=app_stop_event
+        )
         result = aerosol_factor_from_pressures(pressures)
         factor = result["factor_lpm_per_pa"]
         persist_aerosol_factor(factor)
@@ -1201,6 +1285,7 @@ def run_aerosol_calibration_blocking(meter, settings, sample_count):
         setup_aerosol_flowmeter(settings, raise_errors=True)
         tool_ui_updates.append({"kind": "calibration_result", "result": result})
     except Exception as e:
+        record_runtime_error(e)
         tool_ui_updates.append({"kind": "calibration_error", "message": str(e)})
     finally:
         calibration_running.clear()
@@ -1243,6 +1328,7 @@ def query_spellman_cache(device):
     except Exception as e:
         voltage, status, error = np.nan, None, str(e)
         print(f"Spellman background query failed: {e}", flush=True)
+        record_runtime_error(e)
     with spellman_cache_lock:
         spellman_cache.update(voltage=voltage, status=status, time=datetime.now().isoformat(), error=error, pending=False)
         if error:
@@ -1263,6 +1349,182 @@ def maybe_query_spellman():
 def spellman_snapshot():
     with spellman_cache_lock:
         return dict(spellman_cache)
+
+
+_software_identity = None
+
+
+def software_identity():
+    global _software_identity
+    if _software_identity is None:
+        try:
+            commit = subprocess.run(
+                ["git", "-C", str(Path(__file__).resolve().parent), "rev-parse", "--short", "HEAD"],
+                check=True, capture_output=True, text=True, timeout=2,
+            ).stdout.strip()
+        except Exception:
+            commit = os.environ.get("DMPS_COMMIT", "unknown")
+        _software_identity = {
+            "version": os.environ.get("DMPS_VERSION", APP_VERSION),
+            "commit": commit,
+        }
+    return dict(_software_identity)
+
+
+def build_health_payload():
+    cpc_value, cpc_age, _, cpc_error, _, cpc_sample_time = latest_cpc_snapshot()
+    aerosol_flow, aerosol_pressure, aerosol_temperature, aerosol_error = aerosol_snapshot()
+    spellman = spellman_snapshot()
+    flow_diagnostics = flowmeter.diagnostics() if flowmeter is not None else {
+        "connected": False, "error_count": 0, "consecutive_errors": 0,
+        "crc_error_count": 0, "reconnect_count": 0, "last_error": None,
+        "serial_number": None, "article_number": None, "sample_age_sec": None,
+    }
+    try:
+        sheath_flow = float(flowmeter.get_flow()) if flowmeter is not None else np.nan
+    except Exception as error:
+        sheath_flow = np.nan
+        flow_diagnostics["last_error"] = str(error)
+    try:
+        sheath_setpoint = float(flow_controller.pid.setpoint) if flow_controller is not None else np.nan
+    except Exception:
+        sheath_setpoint = np.nan
+    disk = shutil.disk_usage(STATE_DIR)
+    with last_runtime_error_lock:
+        runtime_error = last_runtime_error
+    active_source = active_hv_config[0] if active_hv_config else str(hv_source.value)
+    hv_status = spellman["status"] if active_source == "Monopolar Spellman" else hv_runtime_status
+    return {
+        **software_identity(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "scan_active": bool(measurement_running.is_set() and start_button.value),
+        "phase": "tuning" if tuning_running.is_set() else "calibration" if calibration_running.is_set() else phase,
+        "scan_number": int(scan_number),
+        "hardware_initialized": all(
+            item is not None for item in (flowmeter, blower, flow_controller, cpc, inletValve)
+        ) and active_hv_config is not None and bool(flow_diagnostics.get("connected")),
+        "cpc": {
+            "type": cpc_type.value,
+            "value_cm3": cpc_value, "sample_age_sec": cpc_age,
+            "sample_timestamp": cpc_sample_time, "error": cpc_error,
+        },
+        "sheath": {
+            "flow_lpm": sheath_flow, "setpoint_lpm": sheath_setpoint,
+            "error_lpm": sheath_flow - sheath_setpoint,
+        },
+        "flowmeter": flow_diagnostics,
+        "aerosol": {
+            "enabled": bool(aerosol_flow_enabled.value), "flow_lpm": aerosol_flow,
+            "pressure_pa": aerosol_pressure, "temperature_c": aerosol_temperature,
+            "error": aerosol_error,
+        },
+        "hv": {
+            "source": active_source, "target_v": hv_target_voltage,
+            "status": hv_status, "error": spellman["error"] if active_source == "Monopolar Spellman" else None,
+        },
+        "last_scan_saved": last_scan_saved,
+        "disk_free_bytes": disk.free,
+        "last_error": runtime_error,
+    }
+
+
+def write_health():
+    ctl.atomic_write_runtime_json(HEALTH_FILE, build_health_payload())
+
+
+def health_loop(_stop_event=app_stop_event):
+    while not _stop_event.is_set():
+        try:
+            write_health()
+        except Exception as error:
+            record_runtime_error(f"health write failed: {error}")
+            print(f"Health write failed: {error}", flush=True)
+        _stop_event.wait(HEALTH_INTERVAL_SEC)
+
+
+def _safe_shutdown_impl(reason):
+    global phase, aerosol_flowmeter, cpc, inletValve, flowmeter, blower, flow_controller
+    global hv_runtime_status
+
+    print(f"Safe shutdown started: {reason}", flush=True)
+    measurement_running.clear()
+    tuning_cancel_event.set()
+    app_stop_event.set()
+    cpc_reader_stop.set()
+    phase = "shutdown"
+
+    errors = []
+
+    def attempt(label, callback):
+        try:
+            callback()
+        except Exception as error:
+            errors.append(f"{label}: {error}")
+            print(f"Safe shutdown {label} failed: {error}", flush=True)
+
+    def safe_outputs(prefix):
+        global hv_runtime_status
+        controller = flow_controller
+        if controller is not None:
+            attempt(f"{prefix} flow controller emergency stop", controller.emergency_stop)
+            attempt(f"{prefix} flow controller thread stop", controller.stop)
+        if inletValve is not None:
+            attempt(f"{prefix} inlet valve off", inletValve.off)
+        with hv_io_lock:
+            if hv_device is not None:
+                attempt(f"{prefix} Spellman zero", hv_device.zero)
+                attempt(f"{prefix} Spellman disable", hv_device.disable)
+            # Independently zero the SPI DAC even when another HV source was selected.
+            if not active_hv_config or active_hv_config[0] != "Bipolar DAC":
+                attempt(f"{prefix} bipolar SPI setup", ctl.HV.setup)
+            attempt(f"{prefix} bipolar HV zero", ctl.HV.zero)
+            hv_runtime_status = "zeroed/disabled"
+        if blower is not None:
+            attempt(f"{prefix} blower zero", lambda: blower.set_voltage(0.0))
+
+    safe_outputs("initial")
+
+    for executor in (hardware_executor, tuning_executor, calibration_executor, cpc_diag_executor, spellman_executor):
+        attempt("executor stop", lambda executor=executor: executor.shutdown(wait=True, cancel_futures=True))
+    attempt("git executor stop", lambda: git_executor.shutdown(wait=False, cancel_futures=True))
+    measurement_running.clear()
+    tuning_running.clear()
+    calibration_running.clear()
+
+    for thread in (measurement_thread, cpc_reader_thread, aerosol_poll_thread, health_thread):
+        if thread is not None and thread is not threading.current_thread():
+            attempt(f"thread {thread.name}", lambda thread=thread: thread.join(timeout=2.0))
+
+    # Initialization or measurement I/O may have been in flight during the first pass.
+    safe_outputs("final")
+    attempt("bipolar SPI close", ctl.HV.cleanup)
+
+    meter, aerosol_flowmeter = aerosol_flowmeter, None
+    for label, resource in (
+        ("aerosol flowmeter close", meter), ("CPC close", cpc),
+        ("inlet valve close", inletValve), ("flowmeter close", flowmeter),
+        ("blower close", blower), ("output gate close", dac),
+    ):
+        close = getattr(resource, "close", None)
+        if close is not None:
+            attempt(label, close)
+
+    flow_controller = None
+    cpc = None
+    inletValve = None
+    flowmeter = None
+    blower = None
+    if errors:
+        record_runtime_error("; ".join(errors))
+    attempt("final health write", write_health)
+    print("Safe shutdown finished", flush=True)
+
+
+shutdown_coordinator = ctl.ShutdownCoordinator(_safe_shutdown_impl)
+
+
+def safe_shutdown(reason="requested"):
+    return shutdown_coordinator.run(reason)
 
 
 def queue_ui_row(row):
@@ -1337,6 +1599,7 @@ def drain_ui_updates():
 
     if flow_controller is not None and flowmeter is not None:
         flow = read_flow_value()
+        flow_diag = flowmeter.diagnostics()
         try:
             setpoint = float(flow_controller.pid.setpoint)
         except Exception:
@@ -1350,7 +1613,10 @@ def drain_ui_updates():
             if np.isfinite(error_value):
                 current_flow_pane.object = (
                     f"Current sheath flow: {flow:.2f} L/min | "
-                    f"set {setpoint:.2f} | error {error_value:+.2f} | blower {blower_v:.2f} V"
+                    f"set {setpoint:.2f} | error {error_value:+.2f} | blower {blower_v:.2f} V | "
+                    f"SFM {'connected' if flow_diag['connected'] else 'DISCONNECTED'}, "
+                    f"errors {flow_diag['error_count']} (CRC {flow_diag['crc_error_count']}), "
+                    f"reconnects {flow_diag['reconnect_count']}, serial {flow_diag['serial_number']}"
                 )
             else:
                 current_flow_pane.object = f"Current sheath flow: {flow:.2f} L/min"
@@ -1738,6 +2004,7 @@ def measurement_step(debug=True):
         active_point_key, \
         next_sample_time, \
         last_point_set_duration_sec, \
+        point_set_time, \
         final_hold_start_sample_id
 
     if not start_button.value:
@@ -1773,6 +2040,7 @@ def measurement_step(debug=True):
             if measurement_finished:
                 new_sign = int(np.sign(dp))
                 point_set_started = time.monotonic()
+                point_set_time = time.time()
                 apply_scan_point(point)
                 last_point_set_duration_sec = time.monotonic() - point_set_started
                 if polarity_switch != 0 and new_sign != polarity_switch:
@@ -1793,6 +2061,8 @@ def measurement_step(debug=True):
                 scan_number,
                 is_ntot=False,
                 extra={
+                    "point_index": current_size_index,
+                    "point_start_time": datetime.fromtimestamp(point_set_time).isoformat(),
                     "point_elapsed_sec": time.time() - phase_start_time,
                     "point_set_duration_sec": last_point_set_duration_sec,
                     "phase": "measuring",
@@ -1843,6 +2113,8 @@ def measurement_step(debug=True):
                         scan_number,
                         is_ntot=False,
                         extra={
+                            "point_index": current_size_index,
+                            "point_start_time": datetime.fromtimestamp(point_set_time).isoformat(),
                             "point_elapsed_sec": time.time() - phase_start_time,
                             "point_set_duration_sec": last_point_set_duration_sec,
                             "phase": "final_hold",
@@ -1886,6 +2158,7 @@ def measurement_step(debug=True):
         _traceback.print_exc()
         status_text.object = f"Measurement error: {e}"
         print(f"Measurement error: {e}", flush=True)
+        record_runtime_error(e)
 
 
 def append_row_csv(path, row):
@@ -2268,9 +2541,12 @@ def refresh_live_plot(force=False):
 
 
 def startup_load():
-    global ui_callback
+    global ui_callback, last_scan_saved
 
     df0 = get_recent_completed_scans(int(n_scans_plot.value))
+    saved_scans = sorted(Path("logs/scans").glob("*/*.csv"))
+    if saved_scans:
+        last_scan_saved = str(saved_scans[-1])
 
     if df0 is not None and not df0.empty:
         print(f"Startup loaded {len(df0)} rows", flush=True)
@@ -2308,6 +2584,8 @@ def on_scan_setting_change(event):
     else:
         pending_settings_pane.object = "Settings: current"
 
+
+cpc_type.param.watch(update_cpc_diagnostic_options, "value")
 
 for widget in [
     cpc_com_port,
@@ -2364,7 +2642,7 @@ update_scan_preview()
 
 #### Layout ####
 control_layout = pn.Column(
-    "# DMA / CPC Control GUI",
+    f"# DMA / CPC Control GUI v{APP_VERSION}",
     pn.Row(git_update_status, git_update_button, sizing_mode="stretch_width"),
     pn.Row(cpc_com_port, cpc_type),
     pn.Row(hv_source, spellman_port, spellman_baud, spellman_max_voltage),
@@ -2416,5 +2694,19 @@ layout = pn.Tabs(
     ("Control", control_layout),
     ("CPC Diagnostics", cpc_diagnostics_layout),
 )
+
+health_thread = threading.Thread(target=health_loop, daemon=True, name="health-writer")
+health_thread.start()
+
+
+def _termination_handler(signum, frame):
+    safe_shutdown(signal.Signals(signum).name)
+    raise SystemExit(128 + signum)
+
+
+if threading.current_thread() is threading.main_thread():
+    signal.signal(signal.SIGTERM, _termination_handler)
+    signal.signal(signal.SIGINT, _termination_handler)
+atexit.register(safe_shutdown, "process exit")
 
 layout.servable()

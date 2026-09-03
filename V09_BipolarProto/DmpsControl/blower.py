@@ -19,9 +19,11 @@ class FlowController:
         self.pid = PID(kp, ki, kd, setpoint=flow_lpm, auto_mode=False)
         self.pid.output_limits = (0, 5)
         self.running = False
+        self.thread = None
         self._io_lock = threading.Lock()
         self._tuning_lock = threading.Lock()
         self._tuning = threading.Event()
+        self._shutdown = threading.Event()
         self.flow_error_count = 0
         self.out = 2.5
         self.blower.set_voltage(self.out)
@@ -39,10 +41,23 @@ class FlowController:
         if self.running:
             return
         self.running = True
-        threading.Thread(target=self.loop, daemon=True).start()
+        self.thread = threading.Thread(target=self.loop, daemon=True, name="sheath-flow-controller")
+        self.thread.start()
 
-    def stop(self):
+    def stop(self, timeout=2.0):
         self.running = False
+        if self.thread is not None and self.thread is not threading.current_thread():
+            self.thread.join(timeout=timeout)
+
+    def emergency_stop(self):
+        self.running = False
+        self._shutdown.set()
+        self._tuning.set()
+        with self._io_lock:
+            self.pid.setpoint = 0.0
+            self.pid.set_auto_mode(False)
+            self.out = 0.0
+            self.blower.set_voltage(0.0)
 
     def loop(self):
         while self.running:
@@ -63,11 +78,10 @@ class FlowController:
             except Exception as e:
                 self.flow_error_count += 1
                 print(f"Flowmeter error {self.flow_error_count}: {e}", flush=True)
-                if self.flow_error_count >= 5:
-                    with self._io_lock:
-                        self.out = 0.0
-                        self.blower.set_voltage(self.out)
-                    print("Repeated flowmeter errors: blower commanded to zero", flush=True)
+                with self._io_lock:
+                    self.out = 0.0
+                    self.blower.set_voltage(self.out)
+                print("Flowmeter failure: blower commanded to zero", flush=True)
                 time.sleep(0.5)
 
             time.sleep(0.1)
@@ -158,7 +172,13 @@ class FlowController:
             return result
         finally:
             try:
-                if previous_setpoint is not None and previous_output is not None:
+                if self._shutdown.is_set():
+                    with self._io_lock:
+                        self.pid.setpoint = 0.0
+                        self.pid.set_auto_mode(False)
+                        self.out = 0.0
+                        self.blower.set_voltage(0.0)
+                elif previous_setpoint is not None and previous_output is not None:
                     with self._io_lock:
                         self.pid.setpoint = previous_setpoint
                         self.out = previous_output

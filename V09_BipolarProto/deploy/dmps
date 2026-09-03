@@ -22,8 +22,11 @@ check_health() {
     systemctl is-active --quiet "${main_service}"
     for attempt in {1..30}; do
         if curl --fail --silent --show-error --output /dev/null "${url}"; then
-            printf 'main healthy: %s\n' "${url}"
-            return 0
+            if "${APP_DIR}/.venv/bin/python" "${APP_DIR}/deploy/check-health.py" \
+                "${DMPS_STATE_DIR:-${APP_DIR}}/health.json" 10; then
+                printf 'main healthy: %s\n' "${url}"
+                return 0
+            fi
         fi
         sleep 1
     done
@@ -51,6 +54,7 @@ measurement_is_idle() {
 
 sync_runtime_files() {
     sudo install -o root -g root -m 0755 "${APP_DIR}/deploy/run-panel.sh" /usr/local/libexec/dmps-run-panel
+    sudo install -o root -g root -m 0755 "${APP_DIR}/deploy/run-force-safe.sh" /usr/local/libexec/dmps-force-safe
     sudo install -o root -g root -m 0644 "${APP_DIR}/deploy/tdmps@.service" /etc/systemd/system/tdmps@.service
     sudo install -o root -g root -m 0644 "${APP_DIR}/deploy/tdmps-serve@.service" /etc/systemd/system/tdmps-serve@.service
     install -m 0755 "${APP_DIR}/deploy/dmps" "${HOME}/bin/dmps"
@@ -81,7 +85,7 @@ update_app() {
     cd "${APP_DIR}"
     uv sync --locked
     uv pip install --python "${APP_DIR}/.venv/bin/python" -r requirements-hardware.txt
-    "${APP_DIR}/.venv/bin/python" deploy/compile-check.py gui.py offline_inversion_viewer.py DMPS_inversion_gui DmpsControl inv_funcs
+    "${APP_DIR}/.venv/bin/python" deploy/compile-check.py gui.py DmpsControl deploy/force-safe.py deploy/check-health.py
     sync_runtime_files
 
     if [[ "${main_was_active}" == true ]]; then

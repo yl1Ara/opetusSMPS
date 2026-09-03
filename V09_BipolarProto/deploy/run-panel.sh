@@ -17,7 +17,7 @@ case "${1:-}" in
 esac
 
 cd "${DMPS_STATE_DIR:-${APP_DIR}}"
-exec "${APP_DIR}/.venv/bin/panel" serve "${app}" \
+exec "${APP_DIR}/.venv/bin/panel" serve "${APP_DIR}/${app}" \
     --address 127.0.0.1 \
     --port "${port}" \
     --allow-websocket-origin "127.0.0.1:${port}" \

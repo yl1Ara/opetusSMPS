@@ -3,7 +3,7 @@
 This deployment keeps all source files in one SSH-cloned monorepo checkout, but runs only the hardware GUI on an instrument Raspberry Pi:
 
 - Hardware GUI: `gui.py`, systemd `tdmps@USER.service`, localhost port 5006
-- Offline inversion files remain available for deployment on a separate analysis computer; they are not started on the Pi.
+- Online inversion files remain available for deployment on a separate analysis computer; they are not started on the Pi.
 
 The hardware service restarts after process failures so its web interface remains available. Restarting the web process does not automatically initialize hardware or resume a scan. The server binds only to localhost and accepts only its configured exact websocket origin; wildcards are not used.
 
@@ -60,7 +60,7 @@ deploy/install-services.sh --origin customer-host.tailnet-name.ts.net --state-di
 
 The services then load code and dependencies from the Git checkout but retain `settings.json`, `settings_inversion.json`, `logs/`, and viewer state under the state directory.
 
-The installer creates `.venv`, synchronizes locked application dependencies plus Raspberry Pi hardware dependencies, syntax-checks the sources, installs `dmps`, enables only the hardware service, and verifies its localhost health endpoint.
+The installer creates `.venv`, synchronizes locked application dependencies plus Raspberry Pi hardware dependencies, syntax-checks only the instrument application and hardware modules, installs `dmps`, enables only the hardware service, and verifies both its localhost endpoint and fresh `health.json` heartbeat. Inversion code is not executed on the instrument.
 
 ## Operations and updates
 
@@ -75,6 +75,8 @@ dmps update
 Stop a measurement in the GUI and confirm it is idle before updating. Do not schedule `dmps update` from cron or a systemd timer. Do not manually run a second hardware GUI beside `tdmps@USER.service`.
 
 Service logs are available with `dmps log`. The existing `tdmps@USER.service` name is retained for compatibility.
+
+Stopping the service first invokes the application's idempotent safe shutdown. After the process exits, `ExecStopPost` independently commands the inlet valve off, both HV outputs safe, and the blower DAC to zero. This second layer never runs alongside the application.
 
 ## Tailscale exposure
 
@@ -109,17 +111,17 @@ cd ~/opetusSMPS/V09_BipolarProto
 deploy/install-services.sh --origin "$(tailscale status --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))')"
 ```
 
-The installer intentionally refuses to proceed while the legacy service is active, preventing two hardware controllers from binding the same port or opening the same devices. Keep the old directory as a backup until the new main GUI, offline viewer, settings, and historical logs have been verified.
+The installer intentionally refuses to proceed while the legacy service is active, preventing two hardware controllers from binding the same port or opening the same devices. Keep the old directory as a backup until the new main GUI, online viewer, settings, and historical logs have been verified.
 
 The repository no longer tracks Python bytecode. Commit the accompanying `__pycache__` deletions and `.gitignore` update before cloning customer systems; otherwise imported bytecode can make future pulls dirty.
 
-## Offline inversion computer
+## Online inversion computer
 
-Run inversion on a separate analysis computer, not on the instrument Pi. The repository still includes `offline_inversion_viewer.py`, `DMPS_inversion_gui/`, and `run_offline_inversion_viewer.sh`. On the analysis computer:
+Run inversion on a separate analysis computer, not on the instrument Pi. The repository includes `online_inversion_viewer.py`, `DMPS_inversion_gui/`, and `run_online_inversion_viewer.sh`. On the analysis computer:
 
 ```bash
 cd ~/opetusSMPS/V09_BipolarProto
-./run_offline_inversion_viewer.sh
+./run_online_inversion_viewer.sh
 ```
 
-Set `OFFLINE_VIEWER_ORIGIN=analysis-host.example:5007` when accessing it through another exact hostname. The launcher binds only to localhost by default; use a separate authenticated proxy or SSH forwarding for remote access.
+Set `ONLINE_VIEWER_ORIGIN=analysis-host.example:5007` when accessing it through another exact hostname. The launcher binds only to localhost by default; use a separate authenticated proxy or SSH forwarding for remote access.

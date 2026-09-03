@@ -26,7 +26,7 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 app_dir="$(cd -- "${script_dir}/.." && pwd)"
 repo_root="$(git -C "${app_dir}" rev-parse --show-toplevel)"
 state_dir="${state_dir:-${app_dir}}"
-if [[ "${app_dir}" != "${repo_root}/V09_BipolarProto" || ! -f "${app_dir}/gui.py" || ! -f "${app_dir}/offline_inversion_viewer.py" ]]; then
+if [[ "${app_dir}" != "${repo_root}/V09_BipolarProto" || ! -f "${app_dir}/gui.py" ]]; then
     printf 'Expected this checkout at repository-root/V09_BipolarProto; found %s\n' "${app_dir}" >&2
     exit 1
 fi
@@ -50,7 +50,7 @@ fi
 cd "${app_dir}"
 uv sync --locked
 uv pip install --python "${app_dir}/.venv/bin/python" -r requirements-hardware.txt
-"${app_dir}/.venv/bin/python" deploy/compile-check.py gui.py offline_inversion_viewer.py DMPS_inversion_gui DmpsControl inv_funcs
+"${app_dir}/.venv/bin/python" deploy/compile-check.py gui.py DmpsControl deploy/force-safe.py deploy/check-health.py
 
 config_tmp="$(mktemp)"
 trap 'rm -f "${config_tmp}"' EXIT
@@ -60,6 +60,7 @@ printf 'APP_DIR="%s"\nDMPS_STATE_DIR="%s"\nDMPS_WEBSOCKET_ORIGIN_MAIN="%s"\n' \
 sudo install -d -o root -g root -m 0755 /etc/dmps /usr/local/libexec
 sudo install -o root -g root -m 0644 "${config_tmp}" "/etc/dmps/${user_name}.env"
 sudo install -o root -g root -m 0755 "${script_dir}/run-panel.sh" /usr/local/libexec/dmps-run-panel
+sudo install -o root -g root -m 0755 "${script_dir}/run-force-safe.sh" /usr/local/libexec/dmps-force-safe
 sudo install -o root -g root -m 0644 "${script_dir}/tdmps@.service" /etc/systemd/system/tdmps@.service
 sudo install -o root -g root -m 0644 "${script_dir}/tdmps-serve@.service" /etc/systemd/system/tdmps-serve@.service
 install -d -m 0755 "${HOME}/bin"
