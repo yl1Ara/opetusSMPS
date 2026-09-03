@@ -72,10 +72,13 @@ DEFAULT_SETTINGS = {
     "ntot_plot_max": 10000,
     "heatmap_clip": 20000,
     "raw_uncertainty": "percentile 10-90",
-    "growth_method": "weighted centroid",
+    "growth_models": ["Lower edge D25", "Center D50", "Upper edge D75", "Ridge peak"],
     "growth_min_size_nm": 6.5,
     "growth_max_size_nm": 30.0,
     "growth_threshold_fraction": 0.35,
+    "growth_max_gap_minutes": 90.0,
+    "growth_min_event_scans": 4,
+    "growth_max_rate_nm_h": 15.0,
     "difference_peak_min_size_nm": 30.0,
     "smallest_size": 6.5,
     "scan_inversion_type": "DMPS",
@@ -114,6 +117,8 @@ inversion_lock = threading.Lock()
 inversion_running = False
 latest_inversion = None
 latest_difference_diagnostics = None
+latest_growth_diagnostics = []
+latest_growth_settings = {}
 auto_pending_signature = None
 AUTO_STATE_FILE = APP_ROOT / "auto_inversion_state.json"
 scan_time_cache = {}
@@ -129,12 +134,16 @@ shared_state = pn.state.cache.setdefault(
         "smps_timing_fig": None,
         "difference_fig": None,
         "difference_diagnostics": None,
+        "growth_diagnostics": [],
+        "growth_settings": {},
         "latest_inversion": None,
         "status": "Status: idle",
     },
 )
 shared_state.setdefault("residual_fig", None)
 shared_state.setdefault("smps_timing_fig", None)
+shared_state.setdefault("growth_diagnostics", [])
+shared_state.setdefault("growth_settings", {})
 with shared_state["lock"]:
     local_shared_version = (
         shared_state["version"]
@@ -202,10 +211,13 @@ def save_settings():
         "ntot_plot_max": float(ntot_plot_max.value),
         "heatmap_clip": float(heatmap_clip.value),
         "raw_uncertainty": raw_uncertainty.value,
-        "growth_method": growth_method.value,
+        "growth_models": list(growth_models.value),
         "growth_min_size_nm": float(growth_min_size_nm.value),
         "growth_max_size_nm": float(growth_max_size_nm.value),
         "growth_threshold_fraction": float(growth_threshold_fraction.value),
+        "growth_max_gap_minutes": float(growth_max_gap_minutes.value),
+        "growth_min_event_scans": int(growth_min_event_scans.value),
+        "growth_max_rate_nm_h": float(growth_max_rate_nm_h.value),
         "difference_peak_min_size_nm": float(difference_peak_min_size_nm.value),
         "smallest_size": float(smallest_size.value),
         "scan_inversion_type": scan_inversion_type.value,
@@ -235,6 +247,8 @@ def save_settings():
 def _json_safe(value):
     if isinstance(value, np.ndarray):
         return value.tolist()
+    if isinstance(value, (pd.Index, pd.Series)):
+        return [_json_safe(v) for v in value.tolist()]
     if isinstance(value, (pd.Timestamp,)):
         return value.isoformat()
     if isinstance(value, (np.integer,)):
@@ -425,6 +439,46 @@ def save_data(event=None):
         ntot_df.to_csv(outdir / f"ntot_{stamp}.csv")
     if latest_difference_diagnostics is not None:
         save_difference_diagnostics_data(outdir, stamp, latest_difference_diagnostics)
+    growth_diagnostics = latest_growth_diagnostics
+    if growth_diagnostics:
+        summary_rows = []
+        track_rows = []
+        for growth in growth_diagnostics:
+            summary_rows.append({
+                key: value for key, value in growth.items()
+                if key not in {"time", "dp", "fit"}
+            })
+            for timestamp, diameter, fitted in zip(
+                growth["time"], growth["dp"], growth["fit"]
+            ):
+                track_rows.append({
+                    "event_id": growth["event_id"],
+                    "model": growth["model"],
+                    "method": growth["source_method"],
+                    "polarity": growth["polarity"],
+                    "time": timestamp,
+                    "diameter_nm": diameter,
+                    "fitted_diameter_nm": fitted,
+                })
+        pd.DataFrame(summary_rows).to_csv(
+            outdir / f"npf_growth_model_summary_{stamp}.csv", index=False
+        )
+        pd.DataFrame(track_rows).to_csv(
+            outdir / f"npf_growth_model_tracks_{stamp}.csv", index=False
+        )
+        (outdir / f"npf_growth_models_{stamp}.json").write_text(
+            json.dumps(_json_safe({
+                "settings": latest_growth_settings,
+                "diagnostics": growth_diagnostics,
+            }), indent=2)
+        )
+    elif daily_overwrite_checkbox.value:
+        for filename in (
+            f"npf_growth_model_summary_{stamp}.csv",
+            f"npf_growth_model_tracks_{stamp}.csv",
+            f"npf_growth_models_{stamp}.json",
+        ):
+            (outdir / filename).unlink(missing_ok=True)
     status.object = f"Saved plots and data to `{outdir}`."
 
 
@@ -1556,18 +1610,28 @@ raw_uncertainty = pn.widgets.Select(
     value=settings.get("raw_uncertainty", DEFAULT_SETTINGS["raw_uncertainty"]),
     width=180,
 )
-growth_method = pn.widgets.Select(
-    name="Growth method",
-    options=[
-        "weighted centroid",
-        "peak size",
-        "appearance time",
-        "sliding window",
-        "quantile D50",
-        "log-size fit",
-    ],
-    value=settings.get("growth_method", DEFAULT_SETTINGS["growth_method"]),
-    width=180,
+GROWTH_MODEL_OPTIONS = [
+    "Lower edge D25",
+    "Center D50",
+    "Upper edge D75",
+    "Ridge peak",
+    "Appearance time",
+]
+GROWTH_MODEL_COLORS = {
+    "Lower edge D25": "#2a9d8f",
+    "Center D50": "#f4a261",
+    "Upper edge D75": "#e76f51",
+    "Ridge peak": "#7b2cbf",
+    "Appearance time": "#277da1",
+}
+saved_growth_models = diag.growth_models_from_settings(
+    settings, GROWTH_MODEL_OPTIONS, DEFAULT_SETTINGS["growth_models"]
+)
+growth_models = pn.widgets.MultiChoice(
+    name="NPF growth tracks",
+    options=GROWTH_MODEL_OPTIONS,
+    value=saved_growth_models,
+    width=500,
 )
 growth_min_size_nm = pn.widgets.FloatInput(
     name="Growth min dp (nm)",
@@ -1586,6 +1650,31 @@ growth_threshold_fraction = pn.widgets.FloatInput(
         DEFAULT_SETTINGS["growth_threshold_fraction"],
     )),
     step=0.05,
+)
+growth_max_gap_minutes = pn.widgets.FloatInput(
+    name="Growth max gap (min)",
+    value=float(settings.get(
+        "growth_max_gap_minutes", DEFAULT_SETTINGS["growth_max_gap_minutes"]
+    )),
+    step=5.0,
+    width=180,
+)
+growth_min_event_scans = pn.widgets.IntInput(
+    name="Growth min scans/event",
+    value=int(settings.get(
+        "growth_min_event_scans", DEFAULT_SETTINGS["growth_min_event_scans"]
+    )),
+    start=3,
+    step=1,
+    width=190,
+)
+growth_max_rate_nm_h = pn.widgets.FloatInput(
+    name="Growth max plausible rate (nm/h)",
+    value=float(settings.get(
+        "growth_max_rate_nm_h", DEFAULT_SETTINGS["growth_max_rate_nm_h"]
+    )),
+    step=1.0,
+    width=220,
 )
 difference_peak_min_size_nm = pn.widgets.FloatInput(
     name="Diff peak min dp (nm)",
@@ -1633,6 +1722,8 @@ def publish_shared_state(
     smps_timing_fig=None,
     difference_fig=None,
     difference_diagnostics=None,
+    growth_diagnostics=None,
+    growth_settings=None,
     inversion_result=None,
     status_text=None,
 ):
@@ -1649,6 +1740,10 @@ def publish_shared_state(
             shared_state["difference_fig"] = difference_fig
         if difference_diagnostics is not None:
             shared_state["difference_diagnostics"] = difference_diagnostics
+        if growth_diagnostics is not None:
+            shared_state["growth_diagnostics"] = copy.deepcopy(growth_diagnostics)
+        if growth_settings is not None:
+            shared_state["growth_settings"] = copy.deepcopy(growth_settings)
         if inversion_result is not None:
             shared_state["latest_inversion"] = inversion_result
         if status_text is not None:
@@ -1657,7 +1752,8 @@ def publish_shared_state(
 
 
 def sync_shared_state():
-    global latest_inversion, latest_difference_diagnostics, local_shared_version
+    global latest_inversion, latest_difference_diagnostics
+    global latest_growth_diagnostics, latest_growth_settings, local_shared_version
 
     with shared_state["lock"]:
         version = shared_state["version"]
@@ -1669,6 +1765,8 @@ def sync_shared_state():
         smps_timing_fig = shared_state["smps_timing_fig"]
         difference_fig = shared_state["difference_fig"]
         difference_diagnostics = shared_state["difference_diagnostics"]
+        growth_diagnostics = copy.deepcopy(shared_state["growth_diagnostics"])
+        growth_settings = copy.deepcopy(shared_state["growth_settings"])
         inversion_result = shared_state["latest_inversion"]
         status_text = shared_state["status"]
 
@@ -1684,6 +1782,8 @@ def sync_shared_state():
         difference_plot.object = copy.deepcopy(difference_fig)
     if difference_diagnostics is not None:
         latest_difference_diagnostics = difference_diagnostics
+    latest_growth_diagnostics = growth_diagnostics
+    latest_growth_settings = growth_settings
     if inversion_result is not None:
         latest_inversion = inversion_result
     if status_text is not None:
@@ -2661,6 +2761,7 @@ def linear(x, m, c):
     return m * x + c
 
 def plot_inversion_result(result):
+    global latest_growth_diagnostics, latest_growth_settings
     heatmaps = [tr for tr in result if tr["kind"] == "heatmap"]
     heatmap_keys = [(tr.get("method", "gunn woessner mod"), tr["polarity"]) for tr in heatmaps]
     comparisons = build_scan_smeariii_comparison_heatmaps(result)
@@ -2671,9 +2772,23 @@ def plot_inversion_result(result):
         growth_min_size_nm=float(growth_min_size_nm.value),
         growth_max_size_nm=float(growth_max_size_nm.value),
         growth_threshold_fraction=float(growth_threshold_fraction.value),
-        growth_method=growth_method.value,
+        growth_models=growth_models.value,
         method_label=method_label,
+        growth_max_gap_minutes=float(growth_max_gap_minutes.value),
+        growth_min_event_scans=int(growth_min_event_scans.value),
+        growth_max_rate_nm_h=float(growth_max_rate_nm_h.value),
     )
+    latest_growth_diagnostics = growth_diagnostics
+    latest_growth_settings = {
+        "models": list(growth_models.value),
+        "min_size_nm": float(growth_min_size_nm.value),
+        "max_size_nm": float(growth_max_size_nm.value),
+        "threshold_fraction": float(growth_threshold_fraction.value),
+        "max_gap_minutes": float(growth_max_gap_minutes.value),
+        "min_event_scans": int(growth_min_event_scans.value),
+        "max_rate_nm_h": float(growth_max_rate_nm_h.value),
+        "app_version": APP_VERSION,
+    }
     formation_diagnostics = diag.build_formation_rate_diagnostics(
         result,
         growth_min_size_nm=float(growth_min_size_nm.value),
@@ -2698,10 +2813,11 @@ def plot_inversion_result(result):
     subplot_titles.extend(["Ntot", "Estimated Zn/Zp ratio"])
     if growth_diagnostics:
         rates = ", ".join(
-            f"{growth_diag['label']}: {growth_diag['growth_rate']:.2f} nm/h, R2={growth_diag['r2']:.2f}"
+            f"{growth_diag['model']} {growth_diag['polarity']}: "
+            f"{growth_diag['growth_rate']:.2f} nm/h"
             for growth_diag in growth_diagnostics
         )
-        subplot_titles.append(f"NPF growth-rate diagnostic ({rates})")
+        subplot_titles.append(f"NPF growth-model comparison ({rates})")
     if formation_diagnostics:
         subplot_titles.append("NPF formation-rate / onset diagnostic")
     if scan_health:
@@ -2777,6 +2893,54 @@ def plot_inversion_result(result):
                 row=row,
                 col=1,
             )
+
+            for growth_diag in growth_diagnostics:
+                if (
+                    growth_diag["source_method"] == method
+                    and growth_diag["polarity"] == tr["polarity"]
+                ):
+                    track_color = GROWTH_MODEL_COLORS[growth_diag["model"]]
+                    fig.add_scatter(
+                        x=growth_diag["time"],
+                        y=growth_diag["dp"],
+                        mode="lines+markers",
+                        marker=dict(size=5, color=track_color),
+                        line=dict(width=2, color=track_color),
+                        name=(
+                            f"Event {growth_diag['event_number']} {growth_diag['model']} "
+                            f"{tr['polarity']} "
+                            f"({growth_diag['growth_rate']:.2f} nm/h)"
+                        ),
+                        customdata=np.column_stack((
+                            growth_diag["fit"],
+                            np.full(len(growth_diag["dp"]), growth_diag["r2"]),
+                        )),
+                        hovertemplate=(
+                            "time=%{x|%Y-%m-%d %H:%M}<br>"
+                            "track dp=%{y:.2f} nm<br>fit dp=%{customdata[0]:.2f} nm<br>"
+                            f"model={growth_diag['model']}<br>"
+                            f"GR={growth_diag['growth_rate']:.2f} nm/h<br>"
+                            "R2=%{customdata[1]:.3f}<extra></extra>"
+                        ),
+                        row=row,
+                        col=1,
+                    )
+                    fig.add_scatter(
+                        x=growth_diag["time"],
+                        y=growth_diag["fit"],
+                        mode="lines",
+                        line=dict(width=2, dash="dash", color=track_color),
+                        name=(
+                            f"Event {growth_diag['event_number']} "
+                            f"{growth_diag['model']} robust fit"
+                        ),
+                        hovertemplate=(
+                            "time=%{x|%Y-%m-%d %H:%M}<br>"
+                            "fitted dp=%{y:.2f} nm<extra></extra>"
+                        ),
+                        row=row,
+                        col=1,
+                    )
 
             update_log_size_axis(fig, row, tr["y"])
             fig.update_xaxes(title_text="Time", tickformat="%H:%M", row=row, col=1)
@@ -2961,31 +3125,35 @@ def plot_inversion_result(result):
     if growth_row is not None:
         for growth_diag in growth_diagnostics:
             fig.add_scatter(
-                x=growth_diag["time"],
-                y=growth_diag["dp"],
+                x=[
+                    f"Event {growth_diag['event_number']} {growth_diag['model']}<br>"
+                    f"{growth_diag['polarity']} / {method_label(growth_diag['source_method'])}"
+                ],
+                y=[growth_diag["growth_rate"]],
                 mode="markers",
-                name=f"{growth_diag['label']} event mode",
-                customdata=np.column_stack((
-                    np.full(len(growth_diag["dp"]), growth_diag["growth_rate"]),
-                    np.full(len(growth_diag["dp"]), growth_diag["r2"]),
-                    np.full(len(growth_diag["dp"]), growth_diag["n_points"]),
-                )),
-                hovertemplate=(
-                    "time=%{x|%Y-%m-%d %H:%M}<br>"
-                    "event mode dp=%{y:.2f} nm<br>"
-                    "GR=%{customdata[0]:.2f} nm/h<br>"
-                    "R2=%{customdata[1]:.3f}<br>"
-                    "fit points=%{customdata[2]:.0f}<extra></extra>"
+                marker=dict(size=12, color=GROWTH_MODEL_COLORS[growth_diag["model"]]),
+                error_y=dict(
+                    type="data",
+                    symmetric=False,
+                    array=[max(0.0, growth_diag["slope_p90"] - growth_diag["growth_rate"])],
+                    arrayminus=[max(0.0, growth_diag["growth_rate"] - growth_diag["slope_p10"])],
                 ),
-                row=growth_row,
-                col=1,
-            )
-            fig.add_scatter(
-                x=growth_diag["time"],
-                y=growth_diag["fit"],
-                mode="lines",
-                name=f"{growth_diag['label']} GR {growth_diag['growth_rate']:.2f} nm/h",
-                hovertemplate="time=%{x|%Y-%m-%d %H:%M}<br>fit dp=%{y:.2f} nm<extra></extra>",
+                name=(
+                    f"Event {growth_diag['event_number']} "
+                    f"{growth_diag['label']} {growth_diag['model']}"
+                ),
+                customdata=[[
+                    growth_diag["r2"], growth_diag["rmse_nm"], growth_diag["n_points"],
+                    growth_diag["duration_hours"], growth_diag["fit_quality"],
+                    growth_diag["background_quality"],
+                ]],
+                hovertemplate=(
+                    "model=%{x}<br>GR=%{y:.2f} nm/h<br>"
+                    "R2=%{customdata[0]:.3f}<br>RMSE=%{customdata[1]:.2f} nm<br>"
+                    "fit points=%{customdata[2]:.0f}<br>duration=%{customdata[3]:.2f} h<br>"
+                    "fit quality=%{customdata[4]}<br>background=%{customdata[5]}<br>"
+                    "whisker=pairwise-slope P10-P90 (not confidence)<extra></extra>"
+                ),
                 row=growth_row,
                 col=1,
             )
@@ -3125,8 +3293,11 @@ def plot_inversion_result(result):
     fig.update_yaxes(title_text="Zn/Zp", row=ion_ratio_row, col=1)
     fig.update_xaxes(title_text="Time", tickformat="%H:%M", row=ion_ratio_row, col=1)
     if growth_row is not None:
-        fig.update_yaxes(type="log", title_text="Event mode dp (nm)", row=growth_row, col=1)
-        fig.update_xaxes(title_text="Time", tickformat="%H:%M", row=growth_row, col=1)
+        fig.update_yaxes(
+            title_text="Growth rate (nm/h); whiskers: pairwise-slope P10-P90",
+            row=growth_row, col=1,
+        )
+        fig.update_xaxes(title_text="Banana-track model", row=growth_row, col=1)
     if formation_row is not None:
         fig.update_yaxes(title_text="N in event range", row=formation_row, col=1)
         fig.update_xaxes(title_text="Time", tickformat="%H:%M", row=formation_row, col=1)
@@ -4014,6 +4185,8 @@ def run_inversion(event=None):
                     smps_timing_fig=smps_timing_fig,
                     difference_fig=diff_fig,
                     difference_diagnostics=latest_difference_diagnostics,
+                    growth_diagnostics=latest_growth_diagnostics,
+                    growth_settings=latest_growth_settings,
                     inversion_result=result,
                     status_text=status_text,
                 )
@@ -4114,6 +4287,8 @@ def run_auto_worker():
                     smps_timing_fig=smps_timing_fig,
                     difference_fig=diff_fig,
                     difference_diagnostics=latest_difference_diagnostics,
+                    growth_diagnostics=latest_growth_diagnostics,
+                    growth_settings=latest_growth_settings,
                     inversion_result=result,
                     status_text=str(status.object),
                 )
@@ -4161,10 +4336,13 @@ for w in [
     ntot_plot_max,
     heatmap_clip,
     raw_uncertainty,
-    growth_method,
+    growth_models,
     growth_min_size_nm,
     growth_max_size_nm,
     growth_threshold_fraction,
+    growth_max_gap_minutes,
+    growth_min_event_scans,
+    growth_max_rate_nm_h,
     difference_peak_min_size_nm,
     smallest_size,
     scan_inversion_type,
@@ -4216,7 +4394,12 @@ inversion_controls = pn.Column(
 
 diagnostic_controls = pn.Column(
     pn.Row(ntot_plot_max, heatmap_clip, raw_uncertainty),
-    pn.Row(growth_method, growth_min_size_nm, growth_max_size_nm, growth_threshold_fraction),
+    pn.Row(growth_models),
+    pn.Row(
+        growth_min_size_nm, growth_max_size_nm, growth_threshold_fraction,
+        growth_max_gap_minutes, growth_min_event_scans,
+        growth_max_rate_nm_h,
+    ),
     pn.Row(difference_peak_min_size_nm),
     pn.Row(smps_timing_offset_min_sec, smps_timing_offset_max_sec, smps_timing_offset_step_sec, smps_timing_match_tolerance_min),
 )

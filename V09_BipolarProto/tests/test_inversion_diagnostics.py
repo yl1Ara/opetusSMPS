@@ -1,15 +1,394 @@
 import unittest
 
 import numpy as np
+import pandas as pd
 
 from DMPS_inversion_gui.diagnostics import (
+    build_growth_rate_diagnostics,
+    growth_models_from_settings,
     integrate_number_distribution,
     range_overlap_metrics,
+    weighted_log_diameter_quantile,
 )
 from inv_funcs.cpc_loss import cpc_loss1
 
 
 class InversionDiagnosticTests(unittest.TestCase):
+    def test_log_diameter_quantile_is_exact_for_uniform_log_distribution(self):
+        sizes = np.geomspace(10.0, 100.0, 6)
+
+        self.assertAlmostEqual(
+            weighted_log_diameter_quantile(sizes, np.ones(len(sizes)), 0.5),
+            np.sqrt(1000.0),
+        )
+
+    def test_growth_model_settings_migrate_and_preserve_empty_selection(self):
+        options = ["Center D50", "Ridge peak", "Appearance time"]
+        defaults = ["Center D50", "Ridge peak"]
+
+        self.assertEqual(growth_models_from_settings({"growth_models": []}, options, defaults), [])
+        self.assertEqual(
+            growth_models_from_settings({"growth_method": "peak size"}, options, defaults),
+            ["Ridge peak"],
+        )
+        self.assertEqual(
+            growth_models_from_settings({"growth_method": "weighted centroid"}, options, defaults),
+            ["Center D50"],
+        )
+        self.assertEqual(
+            growth_models_from_settings({"growth_models": "bad"}, options, defaults),
+            defaults,
+        )
+
+    def test_banana_tracks_recover_known_growth_rate(self):
+        sizes = np.geomspace(5.0, 40.0, 100)
+        times = pd.date_range("2026-08-01T00:00:00Z", periods=12, freq="30min")
+        columns = []
+        for index in range(len(times)):
+            if index < 3:
+                columns.append(np.full(len(sizes), 0.1))
+                continue
+            hours_since_event = 0.5 * (index - 3)
+            center = 8.0 + 3.0 * hours_since_event
+            columns.append(0.1 + 100.0 * np.exp(-0.5 * ((sizes - center) / 2.0) ** 2))
+        result = [{
+            "kind": "heatmap",
+            "method": "test",
+            "polarity": "positive",
+            "x": times,
+            "y": sizes,
+            "Z": np.column_stack(columns),
+        }]
+
+        diagnostics = build_growth_rate_diagnostics(
+            result,
+            growth_min_size_nm=6.0,
+            growth_max_size_nm=30.0,
+            growth_threshold_fraction=0.2,
+            growth_models=[
+                "Lower edge D25", "Center D50", "Upper edge D75",
+                "Ridge peak", "Appearance time",
+            ],
+            method_label=lambda value: value,
+        )
+
+        by_model = {row["model"]: row for row in diagnostics}
+        self.assertTrue({
+            "Lower edge D25", "Center D50", "Upper edge D75", "Ridge peak",
+        }.issubset(by_model))
+        self.assertAlmostEqual(by_model["Ridge peak"]["growth_rate"], 3.0, delta=0.35)
+        self.assertAlmostEqual(by_model["Center D50"]["growth_rate"], 3.0, delta=0.6)
+        self.assertAlmostEqual(by_model["Appearance time"]["growth_rate"], 3.0, delta=0.6)
+        self.assertGreater(by_model["Appearance time"]["time"].min(), times[3])
+        self.assertTrue(any(
+            timestamp not in times for timestamp in by_model["Appearance time"]["time"]
+        ))
+        self.assertGreater(by_model["Ridge peak"]["r2"], 0.95)
+        self.assertLess(
+            np.nanmedian(by_model["Lower edge D25"]["dp"]),
+            np.nanmedian(by_model["Center D50"]["dp"]),
+        )
+        self.assertLess(
+            np.nanmedian(by_model["Center D50"]["dp"]),
+            np.nanmedian(by_model["Upper edge D75"]["dp"]),
+        )
+
+    def test_flat_heatmap_does_not_claim_growth_event(self):
+        result = [{
+            "kind": "heatmap",
+            "method": "test",
+            "polarity": "positive",
+            "x": pd.date_range("2026-08-01", periods=8, freq="1h"),
+            "y": np.geomspace(5, 30, 20),
+            "Z": np.ones((20, 8)),
+        }]
+
+        self.assertEqual(
+            build_growth_rate_diagnostics(
+                result,
+                growth_min_size_nm=6,
+                growth_max_size_nm=30,
+                growth_threshold_fraction=0.3,
+                growth_models=["Center D50", "Ridge peak"],
+                method_label=lambda value: value,
+            ),
+            [],
+        )
+
+    def test_growth_events_are_split_across_large_time_gap(self):
+        sizes = np.geomspace(5.0, 50.0, 120)
+        early = pd.date_range("2026-08-01T00:00:00Z", periods=8, freq="1h")
+        late = pd.date_range("2026-08-02T06:00:00Z", periods=5, freq="1h")
+        times = early.append(late)
+        columns = []
+        for index in range(len(times)):
+            if index < 3:
+                columns.append(np.full(len(sizes), 0.1))
+                continue
+            event_index = index - 3
+            center = 8.0 + 3.0 * event_index
+            columns.append(0.1 + 100.0 * np.exp(-0.5 * ((sizes - center) / 2.0) ** 2))
+
+        diagnostics = build_growth_rate_diagnostics(
+            [{
+                "kind": "heatmap", "method": "test", "polarity": "positive",
+                "x": times, "y": sizes, "Z": np.column_stack(columns),
+            }],
+            growth_min_size_nm=6,
+            growth_max_size_nm=50,
+            growth_threshold_fraction=0.2,
+            growth_models=["Ridge peak"],
+            method_label=lambda value: value,
+            growth_max_gap_minutes=90,
+            growth_min_event_scans=4,
+        )
+
+        self.assertEqual([row["event_number"] for row in diagnostics], [1, 2])
+        for row in diagnostics:
+            self.assertAlmostEqual(row["growth_rate"], 3.0, delta=0.5)
+
+    def test_low_activity_scan_separates_distinct_events(self):
+        sizes = np.geomspace(5.0, 35.0, 100)
+        times = pd.date_range("2026-08-01T00:00:00Z", periods=12, freq="1h")
+        columns = []
+        for index in range(len(times)):
+            if index < 3 or index == 7:
+                columns.append(np.full(len(sizes), 0.1))
+            elif index < 7:
+                center = 8.0 + 2.0 * (index - 3)
+                columns.append(0.1 + 100 * np.exp(-0.5 * ((sizes - center) / 1.5) ** 2))
+            else:
+                center = 9.0 + 2.0 * (index - 8)
+                columns.append(0.1 + 100 * np.exp(-0.5 * ((sizes - center) / 1.5) ** 2))
+
+        diagnostics = build_growth_rate_diagnostics(
+            [{
+                "kind": "heatmap", "method": "test", "polarity": "positive",
+                "x": times, "y": sizes, "Z": np.column_stack(columns),
+            }],
+            growth_min_size_nm=6,
+            growth_max_size_nm=30,
+            growth_threshold_fraction=0.2,
+            growth_models=["Ridge peak"],
+            method_label=lambda value: value,
+            growth_min_event_scans=4,
+        )
+
+        self.assertEqual([row["event_number"] for row in diagnostics], [1, 2])
+
+    def test_ridge_tracker_does_not_jump_to_second_enhanced_mode(self):
+        sizes = np.geomspace(5.0, 35.0, 140)
+        times = pd.date_range("2026-08-01T00:00:00Z", periods=11, freq="1h")
+        columns = [np.full(len(sizes), 0.1) for _ in range(3)]
+        for index in range(8):
+            low_center = 8.0 + index
+            low_mode = 40 * np.exp(-0.5 * ((sizes - low_center) / 1.0) ** 2)
+            high_mode = (
+                100 * np.exp(-0.5 * ((sizes - 24.0) / 1.2) ** 2)
+                if index >= 4 else 0.0
+            )
+            columns.append(0.1 + low_mode + high_mode)
+
+        diagnostics = build_growth_rate_diagnostics(
+            [{
+                "kind": "heatmap", "method": "test", "polarity": "positive",
+                "x": times, "y": sizes, "Z": np.column_stack(columns),
+            }],
+            growth_min_size_nm=6,
+            growth_max_size_nm=30,
+            growth_threshold_fraction=0.2,
+            growth_models=["Ridge peak"],
+            method_label=lambda value: value,
+        )
+
+        self.assertEqual(len(diagnostics), 1)
+        self.assertLess(np.max(diagnostics[0]["dp"]), 17.0)
+        self.assertAlmostEqual(diagnostics[0]["growth_rate"], 1.0, delta=0.3)
+
+    def test_minimum_event_scans_applies_to_valid_track_points(self):
+        sizes = np.geomspace(5.0, 30.0, 80)
+        times = pd.date_range("2026-08-01T00:00:00Z", periods=10, freq="1h")
+        columns = [np.full(len(sizes), 0.1) for _ in range(3)]
+        for index in range(7):
+            center = 8.0 + 2.0 * index
+            column = 0.1 + 100 * np.exp(-0.5 * ((sizes - center) / 1.5) ** 2)
+            if index >= 3:
+                column[:] = np.nan
+                column[:10] = 0.1
+            columns.append(column)
+
+        diagnostics = build_growth_rate_diagnostics(
+            [{
+                "kind": "heatmap", "method": "test", "polarity": "positive",
+                "x": times, "y": sizes, "Z": np.column_stack(columns),
+            }],
+            growth_min_size_nm=6,
+            growth_max_size_nm=30,
+            growth_threshold_fraction=0.2,
+            growth_models=["Ridge peak"],
+            method_label=lambda value: value,
+            growth_min_event_scans=6,
+        )
+
+        self.assertEqual(diagnostics, [])
+
+    def test_ridge_survives_component_truncation_at_size_boundary(self):
+        sizes = np.geomspace(5.0, 30.0, 120)
+        times = pd.date_range("2026-08-01T00:00:00Z", periods=10, freq="1h")
+        columns = [np.full(len(sizes), 0.1) for _ in range(3)]
+        for index in range(7):
+            center = 8.0 + index
+            columns.append(
+                0.1 + 100 * np.exp(-0.5 * ((sizes - center) / 5.0) ** 2)
+            )
+
+        diagnostics = build_growth_rate_diagnostics(
+            [{
+                "kind": "heatmap", "method": "test", "polarity": "positive",
+                "x": times, "y": sizes, "Z": np.column_stack(columns),
+            }],
+            growth_min_size_nm=8,
+            growth_max_size_nm=24,
+            growth_threshold_fraction=0.2,
+            growth_models=["Ridge peak", "Center D50"],
+            method_label=lambda value: value,
+        )
+
+        ridge = [row for row in diagnostics if row["model"] == "Ridge peak"]
+        self.assertEqual(len(ridge), 1)
+        self.assertGreaterEqual(ridge[0]["n_points"], 4)
+        self.assertFalse(any(row["model"] == "Center D50" for row in diagnostics))
+
+    def test_weaker_event_is_not_hidden_by_stronger_event(self):
+        sizes = np.geomspace(5.0, 35.0, 100)
+        times = pd.date_range("2026-08-01T00:00:00Z", periods=14, freq="1h")
+        columns = [np.full(len(sizes), 0.1) for _ in range(3)]
+        for amplitude in (100.0, 25.0):
+            for index in range(4):
+                center = 8.0 + 2.0 * index
+                columns.append(
+                    0.1 + amplitude * np.exp(-0.5 * ((sizes - center) / 1.5) ** 2)
+                )
+            if amplitude == 100.0:
+                columns.extend([np.full(len(sizes), 0.1) for _ in range(3)])
+
+        diagnostics = build_growth_rate_diagnostics(
+            [{
+                "kind": "heatmap", "method": "test", "polarity": "positive",
+                "x": times, "y": sizes, "Z": np.column_stack(columns),
+            }],
+            growth_min_size_nm=6,
+            growth_max_size_nm=30,
+            growth_threshold_fraction=0.35,
+            growth_models=["Ridge peak"],
+            method_label=lambda value: value,
+            growth_min_event_scans=4,
+        )
+
+        self.assertEqual([row["event_number"] for row in diagnostics], [1, 2])
+
+    def test_configured_maximum_growth_rate_rejects_fast_fit(self):
+        sizes = np.geomspace(5.0, 20.0, 180)
+        times = pd.date_range("2026-08-01T00:00:00Z", periods=12, freq="1min")
+        columns = [np.full(len(sizes), 0.1) for _ in range(3)]
+        for index in range(9):
+            center = 8.0 + 0.5 * index
+            columns.append(
+                0.1 + 100 * np.exp(-0.5 * ((sizes - center) / 0.4) ** 2)
+            )
+
+        diagnostics = build_growth_rate_diagnostics(
+            [{
+                "kind": "heatmap", "method": "test", "polarity": "positive",
+                "x": times, "y": sizes, "Z": np.column_stack(columns),
+            }],
+            growth_min_size_nm=6,
+            growth_max_size_nm=18,
+            growth_threshold_fraction=0.2,
+            growth_models=["Ridge peak"],
+            method_label=lambda value: value,
+            growth_max_rate_nm_h=5.0,
+        )
+
+        self.assertEqual(diagnostics, [])
+
+    def test_stationary_measurement_noise_does_not_create_growth(self):
+        rng = np.random.default_rng(20260904)
+        sizes = np.geomspace(5.0, 35.0, 80)
+        times = pd.date_range("2026-08-01T00:00:00Z", periods=24, freq="10min")
+        for _ in range(50):
+            noisy_flat = np.maximum(
+                100.0 + rng.normal(0.0, 2.0, (len(sizes), len(times))), 0.01
+            )
+            diagnostics = build_growth_rate_diagnostics(
+                [{
+                    "kind": "heatmap", "method": "test", "polarity": "positive",
+                    "x": times, "y": sizes, "Z": noisy_flat,
+                }],
+                growth_min_size_nm=6,
+                growth_max_size_nm=30,
+                growth_threshold_fraction=0.2,
+                growth_models=["Center D50", "Ridge peak"],
+                method_label=lambda value: value,
+            )
+            self.assertEqual(diagnostics, [])
+
+    def test_short_cadence_track_below_rate_limit_is_retained(self):
+        sizes = np.geomspace(5.0, 20.0, 220)
+        times = pd.date_range("2026-08-01T00:00:00Z", periods=65, freq="1min")
+        columns = [np.full(len(sizes), 0.1) for _ in range(5)]
+        for index in range(60):
+            center = 8.0 + 3.0 * index / 60.0
+            columns.append(
+                0.1 + 100 * np.exp(-0.5 * ((sizes - center) / 0.35) ** 2)
+            )
+
+        diagnostics = build_growth_rate_diagnostics(
+            [{
+                "kind": "heatmap", "method": "test", "polarity": "positive",
+                "x": times, "y": sizes, "Z": np.column_stack(columns),
+            }],
+            growth_min_size_nm=6,
+            growth_max_size_nm=15,
+            growth_threshold_fraction=0.2,
+            growth_models=["Ridge peak"],
+            method_label=lambda value: value,
+            growth_max_rate_nm_h=5.0,
+        )
+
+        self.assertEqual(len(diagnostics), 1)
+        self.assertAlmostEqual(diagnostics[0]["growth_rate"], 3.0, delta=0.2)
+
+    def test_background_subtraction_tracks_npf_mode_not_stationary_aitken_mode(self):
+        sizes = np.geomspace(5.0, 40.0, 120)
+        times = pd.date_range("2026-08-01T00:00:00Z", periods=12, freq="30min")
+        stationary = 300.0 * np.exp(-0.5 * ((sizes - 25.0) / 3.0) ** 2)
+        columns = []
+        for index in range(len(times)):
+            event = 0.0
+            if index >= 3:
+                center = 8.0 + 2.5 * 0.5 * (index - 3)
+                event = 100.0 * np.exp(-0.5 * ((sizes - center) / 1.5) ** 2)
+            column = 0.1 + stationary + event
+            column[index % len(sizes)] = np.nan
+            columns.append(column)
+
+        diagnostics = build_growth_rate_diagnostics(
+            [{
+                "kind": "heatmap", "method": "test", "polarity": "positive",
+                "x": times, "y": sizes, "Z": np.column_stack(columns),
+            }],
+            growth_min_size_nm=6,
+            growth_max_size_nm=35,
+            growth_threshold_fraction=0.2,
+            growth_models=["Ridge peak", "Center D50"],
+            method_label=lambda value: value,
+        )
+
+        by_model = {row["model"]: row for row in diagnostics}
+        self.assertAlmostEqual(by_model["Ridge peak"]["growth_rate"], 2.5, delta=0.5)
+        self.assertAlmostEqual(by_model["Center D50"]["growth_rate"], 2.5, delta=0.7)
+
     def test_unknown_3771_efficiency_is_not_silently_replaced_with_3010_curve(self):
         np.testing.assert_allclose(
             cpc_loss1(np.array([5e-9, 10e-9, 20e-9]), 293.15, 101325, cpc_type="3771"),
