@@ -50,7 +50,7 @@ fi
 cd "${app_dir}"
 uv sync --locked
 uv pip install --python "${app_dir}/.venv/bin/python" -r requirements-hardware.txt
-"${app_dir}/.venv/bin/python" deploy/compile-check.py gui.py DmpsControl deploy/force-safe.py deploy/check-health.py
+"${app_dir}/.venv/bin/python" deploy/compile-check.py gui.py DmpsControl deploy/force-safe.py deploy/zero-bipolar.py deploy/check-health.py
 
 config_tmp="$(mktemp)"
 trap 'rm -f "${config_tmp}"' EXIT
@@ -61,6 +61,7 @@ sudo install -d -o root -g root -m 0755 /etc/dmps /usr/local/libexec
 sudo install -o root -g root -m 0644 "${config_tmp}" "/etc/dmps/${user_name}.env"
 sudo install -o root -g root -m 0755 "${script_dir}/run-panel.sh" /usr/local/libexec/dmps-run-panel
 sudo install -o root -g root -m 0755 "${script_dir}/run-force-safe.sh" /usr/local/libexec/dmps-force-safe
+sudo install -o root -g root -m 0755 "${script_dir}/run-zero-bipolar.sh" /usr/local/libexec/dmps-zero-bipolar
 sudo install -o root -g root -m 0644 "${script_dir}/tdmps@.service" /etc/systemd/system/tdmps@.service
 sudo install -o root -g root -m 0644 "${script_dir}/tdmps-serve@.service" /etc/systemd/system/tdmps-serve@.service
 install -d -m 0755 "${HOME}/bin"

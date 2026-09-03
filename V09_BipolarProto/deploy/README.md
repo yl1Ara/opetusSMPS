@@ -60,7 +60,7 @@ deploy/install-services.sh --origin customer-host.tailnet-name.ts.net --state-di
 
 The services then load code and dependencies from the Git checkout but retain `settings.json`, `settings_inversion.json`, `logs/`, and viewer state under the state directory.
 
-The installer creates `.venv`, synchronizes locked application dependencies plus Raspberry Pi hardware dependencies, syntax-checks only the instrument application and hardware modules, installs `dmps`, enables only the hardware service, and verifies both its localhost endpoint and fresh `health.json` heartbeat. Inversion code is not executed on the instrument.
+The installer creates `.venv`, synchronizes locked application dependencies plus Raspberry Pi hardware dependencies, syntax-checks only the instrument application and hardware modules, installs `dmps`, enables only the hardware service, and verifies both its localhost endpoint and fresh `health.json` heartbeat. Before Panel starts, systemd writes calibrated midpoint code `32705` to the bipolar DAC; a failed midpoint write prevents the GUI from starting. Inversion code is not executed on the instrument.
 
 ## Operations and updates
 

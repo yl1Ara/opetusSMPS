@@ -68,6 +68,7 @@ DEFAULT_SETTINGS = {
     "Bipolar_toggle": True,
     "Ntot_time": 60,
     "CPC_type": "3010",
+    "cpc_profile_version": 2,
 }
 
 hardware_executor = ThreadPoolExecutor(max_workers=1)
@@ -137,7 +138,7 @@ pn.state.cache[TUNING_CANCEL_EVENT_KEY] = tuning_cancel_event
 
 #### Widgets ####
 cpc_com_port = pn.widgets.TextInput(name="CPC COM port", value="/dev/ttyAMA0")
-cpc_type = pn.widgets.Select(name="CPC Type", options=["3010", "HY09"], value="3010")
+cpc_type = pn.widgets.Select(name="CPC Type", options=["3010", "3771", "HY09"], value="3010")
 hv_source = pn.widgets.Select(
     name="HV source",
     options=["Bipolar DAC", "Monopolar Spellman"],
@@ -293,6 +294,19 @@ CPC_DIAGNOSTIC_COMMANDS = {
         "Read concentration (RD)": "RD",
         "Read temperature difference (RT)": "RT",
         "Read vacuum status (RV)": "RV",
+        "Custom": "",
+    },
+    "3771": {
+        "Read concentration (RD)": "RD",
+        "Read error bitmap (RIE)": "RIE",
+        "Read all diagnostics (RALL)": "RALL",
+        "Read model (RMN)": "RMN",
+        "Read serial number (RSN)": "RSN",
+        "Read firmware (RFV)": "RFV",
+        "Read full version (RV)": "RV",
+        "Read aerosol flow (RSF)": "RSF",
+        "Read saturator temperature (RTS)": "RTS",
+        "Read condenser temperature (RTC)": "RTC",
         "Custom": "",
     },
     "HY09": {
@@ -467,6 +481,7 @@ def save_settings():
         "Bipolar_toggle": bool(Bipolar_toggle.value),
         "Ntot_time": int(Ntot_time.value),
         "CPC_type": str(cpc_type.value),
+        "cpc_profile_version": 2,
     }
 
     with settings_file_lock:
@@ -495,9 +510,15 @@ def load_settings():
         settings.update({key: DEFAULT_SETTINGS[key] for key in new_setting_keys if key not in settings})
         settings_changed = True
 
-    # Earlier releases mislabeled the 3010's 9600/7-E-1 protocol as "3771".
-    if settings.get("CPC_type") == "3771":
-        settings["CPC_type"] = "3010"
+    # Before profile version 2, the 3771 label actually selected a 3010 profile.
+    try:
+        cpc_profile_version = int(settings.get("cpc_profile_version", 1))
+    except (TypeError, ValueError):
+        cpc_profile_version = 1
+    if cpc_profile_version < 2:
+        if settings.get("CPC_type") == "3771":
+            settings["CPC_type"] = "3010"
+        settings["cpc_profile_version"] = 2
         settings_changed = True
 
     if settings_changed:
@@ -679,6 +700,7 @@ def current_scan_settings():
         "range2": np.array(range2.value, dtype=float).tolist(), "sheath2": float(sheath2.value), "steps2": int(steps2.value),
         "meas_time": float(meas_time.value), "cpc_poll_interval": float(cpc_poll_interval.value),
         "settling_time": float(settling_time.value), "final_point_extra_hold": float(final_point_extra_hold.value),
+        "smps_plot_step_shift": int(smps_plot_step_shift.value),
         "polarity_switch_time": float(polarity_switch_time.value), "bipolar": bool(Bipolar_toggle.value),
         "hv_source": str(hv_source.value), "spellman_port": str(spellman_port.value),
         "spellman_baud": int(spellman_baud.value), "spellman_max_voltage": float(spellman_max_voltage.value),
@@ -753,6 +775,18 @@ def set_status_threadsafe(text):
         doc.add_next_tick_callback(lambda: setattr(status_text, "object", text))
     else:
         status_text.object = text
+
+
+def set_cpc_controls_disabled(disabled):
+    def apply():
+        cpc_com_port.disabled = disabled
+        cpc_type.disabled = disabled
+
+    doc = pn.state.curdoc
+    if doc is not None:
+        doc.add_next_tick_callback(apply)
+    else:
+        apply()
 
 
 def setup_hv_source(settings=None):
@@ -936,6 +970,7 @@ def init_done_callback(fut, start_after=False):
 
     try:
         fut.result()
+        set_cpc_controls_disabled(True)
         set_status_threadsafe("Status: hardware initialized")
         if start_after and start_button.value:
             ensure_measurement_thread()
@@ -945,6 +980,7 @@ def init_done_callback(fut, start_after=False):
         _traceback.print_exc()
         record_runtime_error(e)
         measurement_running.clear()
+        set_cpc_controls_disabled(False)
         set_status_threadsafe(f"Hardware init failed: {e}")
     finally:
         init_running = False
@@ -958,6 +994,7 @@ def init(start_after=False):
         return
 
     if flow_controller is not None:
+        set_cpc_controls_disabled(True)
         ensure_cpc_reader_thread()
         settings = active_scan_settings or current_scan_settings()
         setup_hv_source(settings)
@@ -976,6 +1013,7 @@ def init(start_after=False):
         return
 
     init_running = True
+    set_cpc_controls_disabled(True)
     status_text.object = "Status: initializing hardware..."
     fut = hardware_executor.submit(init_hardware_blocking)
     fut.add_done_callback(lambda future: init_done_callback(future, start_after=start_after))

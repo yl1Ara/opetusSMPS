@@ -7,6 +7,7 @@ Wants=network-online.target
 Type=simple
 User=%i
 EnvironmentFile=/etc/dmps/%i.env
+ExecStartPre=/usr/local/libexec/dmps-zero-bipolar
 ExecStart=/usr/bin/env /usr/local/libexec/dmps-run-panel main
 ExecStopPost=/usr/local/libexec/dmps-force-safe
 Restart=on-failure

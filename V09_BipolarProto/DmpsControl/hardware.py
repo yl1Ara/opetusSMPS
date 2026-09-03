@@ -8,7 +8,7 @@ from gpiozero import OutputDevice, PWMOutputDevice
 
 class CPC:
     def __init__(self, port, CPC_type="3010"):
-        self.type = "3010" if CPC_type == "3771" else CPC_type
+        self.type = CPC_type
         self.lock = threading.Lock()
         self.terminator = b"\r"
         if self.type == "3010":
@@ -17,6 +17,17 @@ class CPC:
                 baudrate=9600,
                 bytesize=serial.SEVENBITS,
                 parity=serial.PARITY_EVEN,
+                stopbits=serial.STOPBITS_ONE,
+                timeout=1,
+                write_timeout=0.2,
+            )
+            self.concentration_command = "RD"
+        elif self.type == "3771":
+            self.ser = serial.Serial(
+                port=port,
+                baudrate=115200,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
                 stopbits=serial.STOPBITS_ONE,
                 timeout=1,
                 write_timeout=0.2,

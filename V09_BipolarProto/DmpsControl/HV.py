@@ -10,6 +10,7 @@ import threading
 pin_sclk = 23
 pin_mosi = 19
 pin_sync = 24
+BIPOLAR_ZERO_CODE = 32705
 
 class HVController:
     def __init__(self, HVsource="Bipolar"):
@@ -95,7 +96,7 @@ class HVController:
             raise ValueError(f"Unknown HV source: {self.hv_source}")
         
     def zeroDac(self):
-        self.write_dac8551(32705)  # 0 V
+        self.write_dac8551(BIPOLAR_ZERO_CODE)
         
     
     
@@ -204,7 +205,7 @@ def test():
         time.sleep(1)
 
 def zero():
-    write_dac8551(32705)  # 0 V
+    write_dac8551(BIPOLAR_ZERO_CODE)
 
 
 class SpellmanHV:

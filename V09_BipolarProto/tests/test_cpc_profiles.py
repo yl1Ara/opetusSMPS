@@ -60,7 +60,7 @@ hardware = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(hardware)
 
 
-class CPC3010Tests(unittest.TestCase):
+class CPCProfileTests(unittest.TestCase):
     def test_uses_documented_serial_profile_and_cr_delimiter(self):
         cpc = hardware.CPC("/dev/test", "3010")
         cpc.ser.responses = [b"1234.5\r"]
@@ -73,11 +73,15 @@ class CPC3010Tests(unittest.TestCase):
         self.assertEqual(cpc.ser.writes, [b"RD\r"])
         self.assertEqual(cpc.ser.read_terminators, [b"\r"])
 
-    def test_old_mislabeled_profile_normalizes_to_3010(self):
+    def test_3771_uses_its_documented_serial_profile(self):
         cpc = hardware.CPC("/dev/test", "3771")
 
-        self.assertEqual(cpc.type, "3010")
+        self.assertEqual(cpc.type, "3771")
         self.assertEqual(cpc.concentration_command, "RD")
+        self.assertEqual(cpc.ser.settings["baudrate"], 115200)
+        self.assertEqual(cpc.ser.settings["bytesize"], 8)
+        self.assertEqual(cpc.ser.settings["parity"], "N")
+        self.assertEqual(cpc.ser.settings["stopbits"], 1)
 
     def test_skips_optional_echo_and_reports_protocol_error(self):
         cpc = hardware.CPC("/dev/test", "3010")
