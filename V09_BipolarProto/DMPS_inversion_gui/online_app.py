@@ -22,7 +22,14 @@ _GL_NODES, _GL_WEIGHTS = leggauss(5)
 
 import inv_funcs as inv
 from DMPS_inversion_gui import diagnostics as diag
-from DMPS_inversion_gui.cpc_delay import assign_cpc_samples_to_setpoints
+from DMPS_inversion_gui.cpc_delay import (
+    assign_cpc_samples_to_setpoints,
+    build_response_kernel,
+    deduplicate_cpc_rows,
+    response_kernel_ill_conditioned,
+    response_kernel_rejection_reason,
+    solve_response_kernel_nnls,
+)
 from inv_funcs.cpc_loss import cpc_loss1
 from inv_funcs.dmps_loss import dmps_loss1
 from inv_funcs.ltubefl import ltubefl
@@ -75,6 +82,10 @@ DEFAULT_SETTINGS = {
     "smps_settling_time_sec": 30.0,
     "smps_correction_mode": "Transport delay",
     "smps_transport_delay_sec": 30.0,
+    "smps_response_window_sec": 1.0,
+    "smps_dwell_sec": 30.0,
+    "smps_kernel_timing_override": False,
+    "smps_kernel_smoothness": 0.1,
     "smps_size_step_shift": 0,
     "smps_timing_offset_min_sec": -300.0,
     "smps_timing_offset_max_sec": 300.0,
@@ -201,6 +212,10 @@ def save_settings():
         "smps_settling_time_sec": float(smps_settling_time_sec.value),
         "smps_correction_mode": smps_correction_mode.value,
         "smps_transport_delay_sec": float(smps_transport_delay_sec.value),
+        "smps_response_window_sec": float(smps_response_window_sec.value),
+        "smps_dwell_sec": float(smps_dwell_sec.value),
+        "smps_kernel_timing_override": bool(smps_kernel_timing_override.value),
+        "smps_kernel_smoothness": float(smps_kernel_smoothness.value),
         "smps_size_step_shift": int(smps_size_step_shift.value),
         "smps_timing_offset_min_sec": float(smps_timing_offset_min_sec.value),
         "smps_timing_offset_max_sec": float(smps_timing_offset_max_sec.value),
@@ -366,6 +381,20 @@ def save_data(event=None):
             })
             ion_ratio_df = ion_ratio_df.set_index("time").sort_index()
             ion_ratio_df.to_csv(outdir / f"estimated_z_ratio_{stamp}.csv")
+        elif tr["kind"] in {
+            "cpc_assignment_diagnostics",
+            "range_overlap_diagnostics",
+            "ntot_closure_diagnostics",
+            "kernel_sample_residuals",
+        }:
+            diagnostic_rows = tr.get("rows", [])
+            if diagnostic_rows:
+                pd.DataFrame(diagnostic_rows).to_csv(
+                    outdir / f"{tr['kind']}_{stamp}.csv", index=False
+                )
+                (outdir / f"{tr['kind']}_{stamp}.json").write_text(
+                    json.dumps(_json_safe(diagnostic_rows), indent=2)
+                )
     if ntot_tables:
         ntot_df = ntot_tables[0]
         for d in ntot_tables[1:]:
@@ -734,7 +763,9 @@ def method_label(method):
     return INVERSION_METHODS.get(method, method)
 
 
-def dmps_loss_correction_factor_from_distribution(dp_nm, n_inv, tube_segments, qa, temp, press):
+def dmps_loss_correction_factor_from_distribution(
+    dp_nm, n_inv, tube_segments, qa, temp, press, cpc_type="3010"
+):
     dp_nm = np.asarray(dp_nm, dtype=float)
     n_inv = np.asarray(n_inv, dtype=float)
     mask = np.isfinite(dp_nm) & np.isfinite(n_inv) & (dp_nm > 0) & (n_inv > 0)
@@ -751,7 +782,7 @@ def dmps_loss_correction_factor_from_distribution(dp_nm, n_inv, tube_segments, q
     for _, length, flow, *_ in tube_segments:
         tube_loss *= ltubefl(dp_m, length, flow, temp, press)
 
-    loss = tube_loss * cpc_loss1(dp_m, temp, press, cpc_type=3010) * dmps_loss1(dp_m, qa, temp, press)
+    loss = tube_loss * cpc_loss1(dp_m, temp, press, cpc_type=cpc_type) * dmps_loss1(dp_m, qa, temp, press)
     if len(n) == 1:
         if not np.isfinite(loss[0]) or loss[0] <= 0:
             return 1.0
@@ -1373,11 +1404,11 @@ smps_settling_time_sec = pn.widgets.FloatInput(
 )
 smps_correction_mode = pn.widgets.Select(
     name="SMPS CPC correction",
-    options=["Transport delay", "Integer step shift", "None"],
+    options=["Transport delay", "Response kernel (experimental)", "Integer step shift", "None"],
     value=(
         settings.get("smps_correction_mode", DEFAULT_SETTINGS["smps_correction_mode"])
         if settings.get("smps_correction_mode", DEFAULT_SETTINGS["smps_correction_mode"])
-        in ["Transport delay", "Integer step shift", "None"]
+        in ["Transport delay", "Response kernel (experimental)", "Integer step shift", "None"]
         else DEFAULT_SETTINGS["smps_correction_mode"]
     ),
     width=180,
@@ -1390,6 +1421,38 @@ smps_transport_delay_sec = pn.widgets.FloatInput(
     )),
     step=1.0,
     width=180,
+)
+smps_response_window_sec = pn.widgets.FloatInput(
+    name="CPC response window fallback (s)",
+    value=float(settings.get(
+        "smps_response_window_sec",
+        DEFAULT_SETTINGS["smps_response_window_sec"],
+    )),
+    step=0.1,
+    width=220,
+)
+smps_dwell_sec = pn.widgets.FloatInput(
+    name="DMA dwell fallback (s)",
+    value=float(settings.get("smps_dwell_sec", DEFAULT_SETTINGS["smps_dwell_sec"])),
+    step=1.0,
+    width=180,
+)
+smps_kernel_timing_override = pn.widgets.Checkbox(
+    name="Override scan-row CPC timing",
+    value=bool(settings.get(
+        "smps_kernel_timing_override",
+        DEFAULT_SETTINGS["smps_kernel_timing_override"],
+    )),
+)
+smps_kernel_smoothness = pn.widgets.FloatInput(
+    name="Kernel smoothness",
+    value=float(settings.get(
+        "smps_kernel_smoothness",
+        DEFAULT_SETTINGS["smps_kernel_smoothness"],
+    )),
+    start=0.0,
+    step=0.05,
+    width=170,
 )
 smps_size_step_shift = pn.widgets.IntInput(
     name="SMPS size step shift",
@@ -2035,6 +2098,7 @@ def invert_one_scan(
     inversion_method="gunn woessner mod",
     cpc_series_override=None,
     assignment_diagnostics=None,
+    response_kernel=None,
 ):
     d = d.copy()
     d = d[d["Ntot"] == False]
@@ -2045,27 +2109,42 @@ def invert_one_scan(
     d = d[d["abs_size_nm"] > smallest_size.value]
     d = d.sort_values("abs_size_nm")
 
-    y_series = (
-        build_cpc_series_for_inversion(d)
-        if cpc_series_override is None
-        else cpc_series_override.copy()
-    )
-    if assignment_diagnostics is None:
-        assignment_diagnostics = y_series.attrs.get("assignment_diagnostics")
-    if cpc_gap_interpolation_enabled.value:
-        dp_meas_nm, y = interpolate_cpc_gaps_for_inversion(
-            y_series.index.to_numpy(dtype=float),
-            y_series.to_numpy(dtype=float),
-        )
+    if response_kernel is not None:
+        dp_meas_nm = response_kernel.sizes_nm.copy()
+        y = response_kernel.sample_values.copy()
+        kernel_smoothness = float(smps_kernel_smoothness.value)
+        rejection_reason = response_kernel_rejection_reason(response_kernel)
+        if rejection_reason:
+            result = pd.DataFrame(columns=["abs_size_nm", "N_GWalpha"])
+            result.attrs["assignment_diagnostics"] = {
+                **(assignment_diagnostics or {}),
+                **response_kernel.diagnostics,
+                "kernel_usable": False,
+                "kernel_rejection_reason": rejection_reason,
+            }
+            return result
     else:
-        if smps_correction_mode.value == "Transport delay":
-            y_series = y_series[np.isfinite(y_series)]
+        y_series = (
+            build_cpc_series_for_inversion(d)
+            if cpc_series_override is None
+            else cpc_series_override.copy()
+        )
+        if assignment_diagnostics is None:
+            assignment_diagnostics = y_series.attrs.get("assignment_diagnostics")
+        if cpc_gap_interpolation_enabled.value:
+            dp_meas_nm, y = interpolate_cpc_gaps_for_inversion(
+                y_series.index.to_numpy(dtype=float),
+                y_series.to_numpy(dtype=float),
+            )
         else:
-            y_series = y_series[y_series > 0]
-        dp_meas_nm = y_series.index.to_numpy(dtype=float)
-        y = y_series.to_numpy(dtype=float)
+            if smps_correction_mode.value == "Transport delay":
+                y_series = y_series[np.isfinite(y_series)]
+            else:
+                y_series = y_series[y_series > 0]
+            dp_meas_nm = y_series.index.to_numpy(dtype=float)
+            y = y_series.to_numpy(dtype=float)
 
-    if len(dp_meas_nm) < 2:
+    if len(dp_meas_nm) < 2 or len(y) == 0:
         return pd.DataFrame(columns=["abs_size_nm", "N_GWalpha"])
 
     dp_grid_nm = dp_meas_nm.copy()
@@ -2087,6 +2166,8 @@ def invert_one_scan(
     qa = float(qa_lpm.value) / 60000.0
     qs = float(qs_lpm.value) / 60000.0
     q_sheath_lpm = float(d["sheath_setpoint"].median())
+    cpc_type_values = d.get("cpc_type", pd.Series("3010", index=d.index)).dropna().astype(str)
+    scan_cpc_type = cpc_type_values.mode().iloc[0] if len(cpc_type_values) else "3010"
     qc = q_sheath_lpm / 60000.0
     qm = qc + qa - qs
     parsed_tube_segments = parse_tube_segments(tube_segments.value, qa=qa, qs=qs, qc=qc, qm=qm)
@@ -2122,13 +2203,66 @@ def invert_one_scan(
             inversion_method,
             0,
             parsed_tube_segments,
+            scan_cpc_type,
         )
 
         vals = inv.intfun(gl_pts, *args).reshape(len(dp_grid_nm), len(_GL_NODES))
         A[i, :] = halfs * (vals @ _GL_WEIGHTS)
 
-    x, _ = nnls(A, y)
-    y_fit = A @ x
+    if response_kernel is not None:
+        x, sample_fit, solve_diagnostics = solve_response_kernel_nnls(
+            response_kernel.matrix,
+            A,
+            y,
+            smoothness=kernel_smoothness,
+            correlation=response_kernel.correlation,
+        )
+        if solve_diagnostics["rank"] < len(dp_meas_nm):
+            result = pd.DataFrame(columns=["abs_size_nm", "N_GWalpha"])
+            result.attrs["assignment_diagnostics"] = {
+                **(assignment_diagnostics or {}),
+                **response_kernel.diagnostics,
+                "kernel_usable": False,
+                "kernel_rejection_reason": (
+                    f"observational kernel/transfer rank {solve_diagnostics['rank']} "
+                    f"is below {len(dp_meas_nm)} bins"
+                ),
+            }
+            return result
+        coverage = response_kernel.matrix.sum(axis=0)
+        sample_residual = y - sample_fit
+        y_binned = np.divide(
+            response_kernel.matrix.T @ y,
+            coverage,
+            out=np.full(len(dp_meas_nm), np.nan),
+            where=coverage > 0,
+        )
+        y_fit = np.divide(
+            response_kernel.matrix.T @ sample_fit,
+            coverage,
+            out=np.full(len(dp_meas_nm), np.nan),
+            where=coverage > 0,
+        )
+        y = y_binned
+        assignment_diagnostics = {
+            **(assignment_diagnostics or {}),
+            **response_kernel.diagnostics,
+            "rank": solve_diagnostics["rank"],
+            "condition_number": solve_diagnostics["condition_number"],
+            "minimum_singular_value": solve_diagnostics["minimum_singular_value"],
+            "augmented_rank": solve_diagnostics["augmented_rank"],
+            "augmented_condition_number": solve_diagnostics["augmented_condition_number"],
+            "residual_norm": solve_diagnostics["residual_norm"],
+            "kernel_smoothness": solve_diagnostics["smoothness"],
+            "solution_roughness": solve_diagnostics["solution_roughness"],
+            "sample_residual_rmse": float(np.sqrt(np.mean(sample_residual ** 2))),
+            "sample_residual_bias": float(np.mean(sample_residual)),
+            "sample_residual_max_abs": float(np.max(np.abs(sample_residual))),
+            "ill_conditioned": response_kernel_ill_conditioned(solve_diagnostics),
+        }
+    else:
+        x, _ = nnls(A, y)
+        y_fit = A @ x
     residual = y - y_fit
     residual_rel = np.divide(
         residual,
@@ -2147,6 +2281,27 @@ def invert_one_scan(
     })
     if assignment_diagnostics is not None:
         result.attrs["assignment_diagnostics"] = assignment_diagnostics
+    if response_kernel is not None:
+        result.attrs["sample_residual_rows"] = [
+            {
+                "cpc_sample_id": sample_id,
+                "sample_time": pd.to_datetime(sample_time, unit="s", utc=True).isoformat(),
+                "support_start": pd.to_datetime(support_start, unit="s", utc=True).isoformat(),
+                "support_end": pd.to_datetime(support_end, unit="s", utc=True).isoformat(),
+                "measured_cpc": float(measured),
+                "fitted_cpc": float(fitted),
+                "residual_cpc": float(measured - fitted),
+            }
+            for sample_id, sample_time, support_start, support_end, measured, fitted
+            in zip(
+                response_kernel.sample_ids,
+                response_kernel.sample_times,
+                response_kernel.support_starts,
+                response_kernel.support_ends,
+                response_kernel.sample_values,
+                sample_fit,
+            )
+        ]
     return result
 
 
@@ -2161,9 +2316,13 @@ def run_inversion_calculation(df):
     output = []
     ion_points = []
     assignment_diagnostics = []
+    kernel_sample_residuals = []
+    range_overlap_diagnostics = []
+    ntot_closure_diagnostics = []
 
     group_key = "scan_id" if "scan_id" in df.columns else "scan_number"
     transport_assignments = {}
+    response_kernel_result = None
     if scan_inversion_type.value == "SMPS" and smps_correction_mode.value == "Transport delay":
         for scan_id, full_scan in df.groupby(group_key):
             assignment_rows = full_scan[full_scan["Ntot"] == False].copy()
@@ -2181,7 +2340,23 @@ def run_inversion_calculation(df):
                 delay_seconds=float(smps_transport_delay_sec.value),
                 settling_seconds=float(smps_settling_time_sec.value),
                 group_columns=("polarity", "scan_range"),
+                override_timing=bool(smps_kernel_timing_override.value),
             )
+    if scan_inversion_type.value == "SMPS" and smps_correction_mode.value == "Response kernel (experimental)":
+        kernel_rows = df[df["Ntot"] == False].copy()
+        kernel_rows["cpc_float"] = pd.to_numeric(kernel_rows["cpc_count"], errors="coerce")
+        kernel_rows["abs_size_nm"] = merged_abs_size_nm(
+            kernel_rows[inversion_size_column(kernel_rows)]
+        )
+        kernel_rows = kernel_rows[kernel_rows["abs_size_nm"] > smallest_size.value]
+        response_kernel_result = build_response_kernel(
+            kernel_rows,
+            delay_seconds=float(smps_transport_delay_sec.value),
+            response_window_seconds=float(smps_response_window_sec.value),
+            dwell_seconds=float(smps_dwell_sec.value),
+            group_columns=(group_key, "polarity", "scan_range"),
+            override_timing=bool(smps_kernel_timing_override.value),
+        )
 
     zratios = {}
     for scan_id, g_scan in df.groupby(group_key):
@@ -2232,11 +2407,17 @@ def run_inversion_calculation(df):
 
                 ntot_rows = g_scan[g_scan["Ntot"] == True].copy()
                 ntot_rows["cpc_float"] = pd.to_numeric(ntot_rows["cpc_count"], errors="coerce")
-                measured_ntot = ntot_rows["cpc_float"].mean()
+                ntot_rows, ntot_duplicates, ntot_duplicate_scope = deduplicate_cpc_rows(ntot_rows)
+                measured_ntot_raw = ntot_rows["cpc_float"].mean()
+                cpc_type_values = g_scan.get(
+                    "cpc_type", pd.Series("3010", index=g_scan.index)
+                ).dropna().astype(str)
+                scan_cpc_type = cpc_type_values.mode().iloc[0] if len(cpc_type_values) else "3010"
 
                 for _, g_range in g_scan.groupby("scan_range"):
                     cpc_series_override = None
                     group_assignment_diagnostics = None
+                    response_kernel = None
                     if scan_id in transport_assignments:
                         assignment = transport_assignments[scan_id]
                         range_value = g_range["scan_range"].iloc[0]
@@ -2253,6 +2434,19 @@ def run_inversion_calculation(df):
                             }
                         except KeyError:
                             cpc_series_override = pd.Series(dtype=float)
+                    if response_kernel_result is not None:
+                        range_value = g_range["scan_range"].iloc[0]
+                        response_kernel = response_kernel_result.groups.get(
+                            (scan_id, polarity, range_value)
+                        )
+                        if response_kernel is None:
+                            continue
+                        group_assignment_diagnostics = {
+                            **response_kernel_result.diagnostics,
+                            "scan_id": str(scan_id),
+                            "scan_range": range_value,
+                            "polarity": polarity,
+                        }
                     invdf = invert_one_scan(
                         g_range,
                         polarity=polarity,
@@ -2262,12 +2456,17 @@ def run_inversion_calculation(df):
                         inversion_method=inversion_method,
                         cpc_series_override=cpc_series_override,
                         assignment_diagnostics=group_assignment_diagnostics,
+                        response_kernel=response_kernel,
                     )
-
-                    if invdf.empty:
-                        continue
-
                     assignment = invdf.attrs.get("assignment_diagnostics")
+                    for sample_row in invdf.attrs.get("sample_residual_rows", []):
+                        kernel_sample_residuals.append({
+                            **sample_row,
+                            "scan_id": str(scan_id),
+                            "scan_range": g_range["scan_range"].iloc[0],
+                            "method": inversion_method,
+                            "polarity": polarity,
+                        })
                     if assignment is not None and inversion_method == inversion_method_values[0]:
                         assignment = {
                             **assignment,
@@ -2277,6 +2476,9 @@ def run_inversion_calculation(df):
                         }
                         assignment_diagnostics.append(assignment)
                         print(f"SMPS CPC assignment: {assignment}", flush=True)
+
+                    if invdf.empty:
+                        continue
 
                     dp_inv = invdf["abs_size_nm"].to_numpy(dtype=float)
                     n_inv = invdf["N_GWalpha"].to_numpy(dtype=float)
@@ -2298,7 +2500,6 @@ def run_inversion_calculation(df):
                         })
 
                     order = np.argsort(dp_inv)
-                    ntot_scan += np.trapezoid(n_inv[order], np.log10(dp_inv[order]))
                     scan_parts.append((dp_inv[order], n_inv[order]))
 
                 if not scan_parts:
@@ -2306,6 +2507,7 @@ def run_inversion_calculation(df):
 
                 full_sum = np.zeros(len(size_axis), dtype=float)
                 full_count = np.zeros(len(size_axis), dtype=float)
+                part_columns = []
 
                 for dp_inv, n_inv in scan_parts:
                     mask = (size_axis >= np.nanmin(dp_inv)) & (size_axis <= np.nanmax(dp_inv))
@@ -2318,6 +2520,9 @@ def run_inversion_calculation(df):
                     mask_indices = np.flatnonzero(mask)
                     full_sum[mask_indices[valid_interp]] += interpolated[valid_interp]
                     full_count[mask_indices[valid_interp]] += 1
+                    part_column = np.full(len(size_axis), np.nan)
+                    part_column[mask_indices[valid_interp]] = interpolated[valid_interp]
+                    part_columns.append(part_column)
 
                 full_col = np.divide(
                     full_sum,
@@ -2328,14 +2533,47 @@ def run_inversion_calculation(df):
                 if low_value_lift_enabled.value:
                     full_col = one_sided_low_value_lift(full_col)
 
-                measured_ntot *= dmps_loss_correction_factor_from_distribution(
+                ntot_scan = diag.integrate_number_distribution(
+                    size_axis, full_col, part_columns=part_columns
+                )
+
+                if len(part_columns) >= 2 and inversion_method == inversion_method_values[0]:
+                    overlap_metrics = diag.range_overlap_metrics(part_columns)
+                    if overlap_metrics is not None:
+                        range_overlap_diagnostics.append({
+                            "scan_id": str(scan_id),
+                            "polarity": polarity,
+                            **overlap_metrics,
+                        })
+
+                measured_ntot = measured_ntot_raw * dmps_loss_correction_factor_from_distribution(
                     size_axis,
                     full_col,
                     parsed_tube_segments,
                     qa,
                     temp,
                     press,
+                    cpc_type=scan_cpc_type,
                 )
+                ntot_closure_diagnostics.append({
+                    "scan_id": str(scan_id),
+                    "method": inversion_method,
+                    "polarity": polarity,
+                    "inverted_ntot": ntot_scan,
+                    "measured_ntot_raw": measured_ntot_raw,
+                    "measured_ntot": measured_ntot,
+                    "cpc_type": scan_cpc_type,
+                    "cpc_efficiency_model": (
+                        scan_cpc_type if scan_cpc_type in {"3010", "HY09"} else "unity (no validated curve)"
+                    ),
+                    "ntot_duplicate_samples_ignored": ntot_duplicates,
+                    "ntot_duplicate_scope": ntot_duplicate_scope,
+                    "closure_ratio": (
+                        float(ntot_scan / measured_ntot)
+                        if np.isfinite(ntot_scan) and np.isfinite(measured_ntot) and measured_ntot > 0
+                        else np.nan
+                    ),
+                })
 
                 heat_cols.append(full_col)
                 heat_times.append(g_scan["time"].median())
@@ -2389,6 +2627,18 @@ def run_inversion_calculation(df):
     output.append({
         "kind": "cpc_assignment_diagnostics",
         "rows": assignment_diagnostics,
+    })
+    output.append({
+        "kind": "range_overlap_diagnostics",
+        "rows": range_overlap_diagnostics,
+    })
+    output.append({
+        "kind": "ntot_closure_diagnostics",
+        "rows": ntot_closure_diagnostics,
+    })
+    output.append({
+        "kind": "kernel_sample_residuals",
+        "rows": kernel_sample_residuals,
     })
 
     return output
@@ -2966,9 +3216,12 @@ def plot_inversion_result(result):
 
 def plot_residual_diagnostics(result):
     residual_rows = []
+    sample_residual_rows = []
     for tr in result:
         if tr.get("kind") == "residuals" and tr.get("rows"):
             residual_rows.extend(tr["rows"])
+        elif tr.get("kind") == "kernel_sample_residuals" and tr.get("rows"):
+            sample_residual_rows.extend(tr["rows"])
 
     if not residual_rows:
         residual_plot.object = None
@@ -3010,6 +3263,37 @@ def plot_residual_diagnostics(result):
     )
 
     scatter_max = float(np.nanmax(df[["measured_cpc", "fitted_cpc"]].to_numpy(dtype=float)))
+    sample_df = pd.DataFrame(sample_residual_rows)
+    if not sample_df.empty:
+        for column in ["measured_cpc", "fitted_cpc", "residual_cpc"]:
+            sample_df[column] = pd.to_numeric(sample_df[column], errors="coerce")
+        sample_df["sample_time"] = pd.to_datetime(sample_df["sample_time"], errors="coerce")
+        sample_df = sample_df.dropna(subset=["sample_time", "measured_cpc", "fitted_cpc"])
+        if not sample_df.empty:
+            scatter_max = max(
+                scatter_max,
+                float(np.nanmax(sample_df[["measured_cpc", "fitted_cpc"]].to_numpy(dtype=float))),
+            )
+            for (method, polarity), g in sample_df.groupby(["method", "polarity"]):
+                fig.add_scatter(
+                    x=g["measured_cpc"],
+                    y=g["fitted_cpc"],
+                    mode="markers",
+                    marker=dict(symbol="x", size=8),
+                    name=f"{method_label(method)} {polarity} sample-domain fit",
+                    customdata=diag.plotly_customdata(
+                        g["sample_time"], g["scan_id"], g["cpc_sample_id"], g["residual_cpc"]
+                    ),
+                    hovertemplate=(
+                        "sample=%{customdata[2]}<br>"
+                        "time=%{customdata[0]|%Y-%m-%d %H:%M:%S}<br>"
+                        "scan=%{customdata[1]}<br>"
+                        "measured=%{x:.2f}<br>fitted=%{y:.2f}<br>"
+                        "sample residual=%{customdata[3]:.2f}<extra></extra>"
+                    ),
+                    row=1,
+                    col=1,
+                )
     for (method, polarity), g in df.groupby(["method", "polarity"]):
         label = f"{method_label(method)} {polarity}"
         fig.add_scatter(
@@ -3668,16 +3952,60 @@ def run_inversion(event=None):
                 )
                 if assignment_rows:
                     fallback_bins = sum(
-                        len(row["source_fallback_bins"])
-                        + len(row["interpolated_bins"])
-                        + len(row["edge_fallback_bins"])
+                        len(row.get("source_fallback_bins", []))
+                        + len(row.get("interpolated_bins", []))
+                        + len(row.get("edge_fallback_bins", []))
                         for row in assignment_rows
                     )
-                    duplicate_ids = sum(row["duplicate_cpc_ids_ignored"] for row in assignment_rows)
+                    kernel_rows = [
+                        row for row in assignment_rows
+                        if row.get("mode") == "Response kernel (experimental)"
+                    ]
+                    duplicate_ids = (
+                        max(row.get("duplicate_cpc_ids_ignored", 0) for row in kernel_rows)
+                        if kernel_rows
+                        else sum(row.get("duplicate_cpc_ids_ignored", 0) for row in assignment_rows)
+                    )
+                    boundary_discards = (
+                        max(row.get("mixed_boundary_discards", 0) for row in kernel_rows)
+                        if kernel_rows
+                        else 0
+                    )
+                    rejected_kernels = sum(
+                        row.get("kernel_usable") is False for row in kernel_rows
+                    )
+                    ill_conditioned = sum(
+                        bool(row.get("ill_conditioned", False)) for row in kernel_rows
+                    )
                     status_text += (
                         f" CPC assignment: {fallback_bins} fallback bins, "
-                        f"{duplicate_ids} duplicate sample IDs ignored."
+                        f"{duplicate_ids} duplicate sample IDs ignored, "
+                        f"{boundary_discards} mixed-boundary samples discarded, "
+                        f"{rejected_kernels} kernels rejected, "
+                        f"{ill_conditioned} conditioning warnings."
                     )
+
+                overlap_rows = next(
+                    (item["rows"] for item in result if item.get("kind") == "range_overlap_diagnostics"),
+                    [],
+                )
+                finite_seams = np.asarray([
+                    row.get("median_relative_seam", np.nan) for row in overlap_rows
+                ], dtype=float)
+                finite_seams = finite_seams[np.isfinite(finite_seams)]
+                if len(finite_seams):
+                    status_text += f" Median range seam {100 * np.median(finite_seams):.1f}%."
+
+                closure_rows = next(
+                    (item["rows"] for item in result if item.get("kind") == "ntot_closure_diagnostics"),
+                    [],
+                )
+                closure = np.asarray([
+                    row.get("closure_ratio", np.nan) for row in closure_rows
+                ], dtype=float)
+                closure = closure[np.isfinite(closure)]
+                if len(closure):
+                    status_text += f" Median Ntot closure {np.median(closure):.2f}."
 
                 status.object = status_text
                 publish_shared_state(
@@ -3843,6 +4171,10 @@ for w in [
     smps_settling_time_sec,
     smps_correction_mode,
     smps_transport_delay_sec,
+    smps_response_window_sec,
+    smps_dwell_sec,
+    smps_kernel_timing_override,
+    smps_kernel_smoothness,
     smps_size_step_shift,
     smps_timing_offset_min_sec,
     smps_timing_offset_max_sec,
@@ -3872,6 +4204,10 @@ inversion_controls = pn.Column(
     pn.Row(zratio_widget, zratio_min_widget, zratio_max_widget, zratio_smoothing_step),
     pn.Row(zratio_min_size_nm, zratio_estimate_offset, use_zratio_checkbox, smallest_size),
     pn.Row(scan_inversion_type, smps_settling_time_sec, smps_correction_mode, smps_transport_delay_sec),
+    pn.Row(
+        smps_response_window_sec, smps_dwell_sec,
+        smps_kernel_timing_override, smps_kernel_smoothness,
+    ),
     pn.Row(smps_size_step_shift, inversion_methods),
     pn.Row(inversion_size_bin_decimals, cpc_gap_interpolation_enabled, low_value_lift_enabled),
     pn.Row(low_value_lift_ratio, low_value_lift_alpha),

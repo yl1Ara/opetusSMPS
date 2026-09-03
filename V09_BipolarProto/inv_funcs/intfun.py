@@ -10,7 +10,7 @@ from .calChargeFracF import calChargeFracF
 
 def intfun(dp, t, press, p, volt, pituus, arkaksi, aryksi, qa, qc, qm, qs,
            pipelength, pipeflow, lsys, Zp, Zn, Mrp, Mrn, Np, Nn,
-           charging_efficiency, summed, tube_segments=None):
+           charging_efficiency, summed, tube_segments=None, cpc_type=3010):
     """
     Main function for transfer function calculations.
 
@@ -38,7 +38,7 @@ def intfun(dp, t, press, p, volt, pituus, arkaksi, aryksi, qa, qc, qm, qs,
     
 
     if lsys == 1:
-        cpcloss = cpc_loss1(dp, t, press, cpc_type=3010)
+        cpcloss = cpc_loss1(dp, t, press, cpc_type=cpc_type)
     else:
         cpcloss = cpc_loss2(dp, t, press)
 

@@ -16,6 +16,7 @@ import subprocess
 import atexit
 import shutil
 import signal
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timezone
 from DmpsControl.tuning import aerosol_factor_from_pressures
@@ -38,6 +39,10 @@ DEFAULT_SETTINGS = {
     "meas_time": 15,
     "sleep_time": 5,
     "cpc_poll_interval": 0.5,
+    "cpc_transport_delay_sec": 5.0,
+    "cpc_response_window_sec": 1.0,
+    "automatic_boundary_holds": False,
+    "initial_point_pre_hold": 0.0,
     "ntot_every_n_scans": 1,
     "ntot_rest_time": 10,
     "n_scans_plot": 5,
@@ -70,6 +75,89 @@ DEFAULT_SETTINGS = {
     "CPC_type": "3010",
     "cpc_profile_version": 2,
 }
+
+DAILY_MEASUREMENT_COLUMNS = (
+    "time", "scan_range", "size_nm", "cpc_count", "sheath_flow",
+    "sheath_setpoint", "scan_number", "Ntot", "sample_duration_sec",
+    "cpc_age_sec", "cpc_read_duration_sec", "cpc_error",
+    "point_elapsed_sec", "point_set_duration_sec", "phase",
+)
+CPC_NOMINAL_CADENCE_SEC = {"3010": 1.0, "3771": 1.0, "HY09": 1.0}
+ACQUISITION_SESSION_ID = uuid.uuid4().hex
+
+
+def cpc_response_window_seconds(cpc_type_value, cpc_count, fallback_sec):
+    """Return the response interval represented by one CPC sample."""
+    cpc_name = str(cpc_type_value)
+    try:
+        count = float(cpc_count)
+    except (TypeError, ValueError):
+        count = np.nan
+    if cpc_name == "3010" and np.isfinite(count):
+        return (1.0, "3010 concentration > 100") if count > 100 else (6.0, "3010 concentration <= 100")
+    if cpc_name == "3771":
+        return 1.0, "3771 documented 1 s average"
+    return max(0.0, float(fallback_sec)), "configured fallback"
+
+
+def robust_cpc_cadence_seconds(samples):
+    """Return the median cadence from unique successful (sample id, timestamp) pairs."""
+    unique = {}
+    for sample_id, timestamp in samples:
+        try:
+            sample_id = int(sample_id)
+            timestamp = float(timestamp)
+        except (TypeError, ValueError):
+            continue
+        if sample_id > 0 and np.isfinite(timestamp) and sample_id not in unique:
+            unique[sample_id] = timestamp
+    timestamps = sorted(set(unique.values()))
+    intervals = np.diff(timestamps)
+    intervals = intervals[np.isfinite(intervals) & (intervals > 0)]
+    return float(np.median(intervals)) if len(intervals) else np.nan
+
+
+def cpc_scan_timing_profile(
+    cpc_type_value, dwell_sec, poll_sec, transport_delay_sec,
+    response_window_sec, automatic_holds, initial_manual_hold_sec,
+    final_manual_hold_sec, measured_cadence_sec=np.nan,
+):
+    cpc_name = str(cpc_type_value)
+    measured = float(measured_cadence_sec)
+    nominal = CPC_NOMINAL_CADENCE_SEC.get(cpc_name, 1.0)
+    cadence = max(measured, nominal) if np.isfinite(measured) and measured > 0 else nominal
+    effective_cadence = max(cadence, max(0.05, float(poll_sec)))
+    sample_ratio = max(0.0, float(dwell_sec)) / effective_cadence
+    # Allow modest command/read overhead without claiming a sample at half cadence.
+    expected = max(0, int(np.floor(sample_ratio + 0.1)))
+    target = 2 if cpc_name == "3010" else 1
+    if automatic_holds:
+        boundary_response_window = {
+            "3010": 6.0,
+            "3771": 1.0,
+        }.get(cpc_name, max(0.0, float(response_window_sec)))
+        hold = (
+            max(0.0, float(transport_delay_sec))
+            + boundary_response_window
+            + effective_cadence
+        )
+        initial_hold = final_hold = hold
+        policy = "automatic"
+    else:
+        initial_hold = max(0.0, float(initial_manual_hold_sec))
+        final_hold = max(0.0, float(final_manual_hold_sec))
+        policy = "manual"
+    return {
+        "measured_cpc_cadence_sec": measured if np.isfinite(measured) and measured > 0 else np.nan,
+        "cadence_margin_sec": effective_cadence,
+        "boundary_response_window_sec": boundary_response_window if automatic_holds else np.nan,
+        "expected_unique_samples_per_point": expected,
+        "target_unique_samples_per_point": target,
+        "sample_count_warning": expected < target,
+        "hold_policy": policy,
+        "initial_pre_hold_sec": initial_hold,
+        "final_hold_sec": final_hold,
+    }
 
 hardware_executor = ThreadPoolExecutor(max_workers=1)
 cpc_diag_executor = ThreadPoolExecutor(max_workers=1)
@@ -237,6 +325,21 @@ cpc_poll_interval = pn.widgets.FloatInput(
     step=0.1,
     width=150,
 )
+cpc_transport_delay_sec = pn.widgets.FloatInput(
+    name="CPC transport delay (s)", value=DEFAULT_SETTINGS["cpc_transport_delay_sec"],
+    step=0.5, width=170,
+)
+cpc_response_window_sec = pn.widgets.FloatInput(
+    name="CPC response fallback (s)", value=DEFAULT_SETTINGS["cpc_response_window_sec"],
+    step=0.5, width=180,
+)
+automatic_boundary_holds = pn.widgets.Checkbox(
+    name="Automatic boundary holds", value=DEFAULT_SETTINGS["automatic_boundary_holds"],
+)
+initial_point_pre_hold = pn.widgets.FloatInput(
+    name="Manual initial pre-hold (s)", value=DEFAULT_SETTINGS["initial_point_pre_hold"],
+    step=0.5, width=190,
+)
 Ntot_time = pn.widgets.IntInput(name="Ntot measurement time (s)", value=60, step=1)
 ntot_every_n_scans = pn.widgets.IntInput(
     name="Ntot every N scans (0 off)",
@@ -254,7 +357,7 @@ settling_time = pn.widgets.IntInput(
     name="Settling time between size changes (s) ", value=10, step=1
 )
 final_point_extra_hold = pn.widgets.IntInput(
-    name="Final point extra hold (s)",
+    name="Manual final hold (s)",
     value=DEFAULT_SETTINGS["final_point_extra_hold"],
     step=1,
     width=170,
@@ -279,6 +382,7 @@ current_hv_pane = pn.pane.Markdown("Current HV: -")
 current_aerosol_flow_pane = pn.pane.Markdown("Current aerosol flow: disabled")
 latest_ntot_pane = pn.pane.Markdown("Latest Ntot: -")
 scan_progress_pane = pn.pane.Markdown("Scan progress: idle")
+cpc_timing_pane = pn.pane.Markdown("CPC timing: waiting for samples")
 pending_settings_pane = pn.pane.Markdown("Settings: current")
 last_row_pane = pn.pane.Str("Last measurement: -")
 scan_pane = pn.pane.Str("Scan program: -")
@@ -372,6 +476,8 @@ current_size_index = 0
 phase = "idle"
 phase_start_time = time.time()
 point_set_time = phase_start_time
+point_valid_from_time = phase_start_time
+point_measurement_start_time = phase_start_time
 scan_rows = []
 completed_scans = []
 scan_number = 0
@@ -402,7 +508,12 @@ latest_cpc = {
     "error": None,
     "sample_id": 0,
     "sample_time": None,
+    "query_start_time": None,
+    "query_end_time": None,
+    "timestamp_uncertainty_sec": np.nan,
+    "timestamp_basis": None,
 }
+cpc_sample_history = deque(maxlen=120)
 cpc_reader_thread = None
 cpc_reader_stop = threading.Event()
 ui_callback = None
@@ -451,6 +562,10 @@ def save_settings():
         "meas_time": int(meas_time.value),
         "sleep_time": int(sleep_time.value),
         "cpc_poll_interval": float(cpc_poll_interval.value),
+        "cpc_transport_delay_sec": float(cpc_transport_delay_sec.value),
+        "cpc_response_window_sec": float(cpc_response_window_sec.value),
+        "automatic_boundary_holds": bool(automatic_boundary_holds.value),
+        "initial_point_pre_hold": float(initial_point_pre_hold.value),
         "ntot_every_n_scans": int(ntot_every_n_scans.value),
         "ntot_rest_time": int(ntot_rest_time.value),
         "n_scans_plot": int(n_scans_plot.value),
@@ -505,6 +620,8 @@ def load_settings():
         "sheath_tune_output_low_v", "sheath_tune_output_high_v",
         "sheath_tune_settle_sec", "sheath_tune_step_sec",
         "sheath_tune_sample_interval_sec", "sheath_tune_min_response_lpm",
+        "cpc_transport_delay_sec", "cpc_response_window_sec",
+        "automatic_boundary_holds", "initial_point_pre_hold",
     )
     if any(key not in settings for key in new_setting_keys):
         settings.update({key: DEFAULT_SETTINGS[key] for key in new_setting_keys if key not in settings})
@@ -542,6 +659,18 @@ def load_settings():
     cpc_poll_interval.value = settings.get(
         "cpc_poll_interval",
         DEFAULT_SETTINGS["cpc_poll_interval"],
+    )
+    cpc_transport_delay_sec.value = settings.get(
+        "cpc_transport_delay_sec", DEFAULT_SETTINGS["cpc_transport_delay_sec"]
+    )
+    cpc_response_window_sec.value = settings.get(
+        "cpc_response_window_sec", DEFAULT_SETTINGS["cpc_response_window_sec"]
+    )
+    automatic_boundary_holds.value = settings.get(
+        "automatic_boundary_holds", DEFAULT_SETTINGS["automatic_boundary_holds"]
+    )
+    initial_point_pre_hold.value = settings.get(
+        "initial_point_pre_hold", DEFAULT_SETTINGS["initial_point_pre_hold"]
     )
     ntot_every_n_scans.value = settings.get(
         "ntot_every_n_scans",
@@ -699,6 +828,11 @@ def current_scan_settings():
         "range1": np.array(range1.value, dtype=float).tolist(), "sheath1": float(sheath1.value), "steps1": int(steps1.value),
         "range2": np.array(range2.value, dtype=float).tolist(), "sheath2": float(sheath2.value), "steps2": int(steps2.value),
         "meas_time": float(meas_time.value), "cpc_poll_interval": float(cpc_poll_interval.value),
+        "cpc_type": str(cpc_type.value),
+        "cpc_transport_delay_sec": float(cpc_transport_delay_sec.value),
+        "cpc_response_window_sec": float(cpc_response_window_sec.value),
+        "automatic_boundary_holds": bool(automatic_boundary_holds.value),
+        "initial_point_pre_hold": float(initial_point_pre_hold.value),
         "settling_time": float(settling_time.value), "final_point_extra_hold": float(final_point_extra_hold.value),
         "smps_plot_step_shift": int(smps_plot_step_shift.value),
         "polarity_switch_time": float(polarity_switch_time.value), "bipolar": bool(Bipolar_toggle.value),
@@ -767,6 +901,35 @@ def update_scan_preview():
         scan_pane.object = f"Scan points ({len(sizes)}): {sizes}"
     except Exception as e:
         scan_pane.object = f"Scan parse error: {e}"
+
+
+def update_cpc_timing_display():
+    cadence = measured_cpc_cadence_seconds()
+    if active_scan_settings is not None:
+        profile = active_scan_settings
+        prefix = "Active scan"
+    else:
+        profile = cpc_scan_timing_profile(
+            cpc_type.value, meas_time.value, cpc_poll_interval.value,
+            cpc_transport_delay_sec.value, cpc_response_window_sec.value,
+            automatic_boundary_holds.value, initial_point_pre_hold.value,
+            final_point_extra_hold.value, cadence,
+        )
+        prefix = "Next scan"
+    warning = (
+        " **WARNING: dwell is expected to provide too few unique CPC samples.**"
+        if profile["sample_count_warning"] else ""
+    )
+    measured_text = f"{cadence:.2f} s" if np.isfinite(cadence) else "not measured"
+    cpc_timing_pane.object = (
+        f"{prefix} CPC timing: measured cadence {measured_text}; expected unique samples/point "
+        f"**{profile['expected_unique_samples_per_point']}** (target >="
+        f"{profile['target_unique_samples_per_point']}); {profile['hold_policy']} boundary holds "
+        f"initial {profile['initial_pre_hold_sec']:.2f} s / final {profile['final_hold_sec']:.2f} s."
+        f"{warning} Dwell remains {float(meas_time.value):.2f} s."
+    )
+    initial_point_pre_hold.disabled = bool(automatic_boundary_holds.value)
+    final_point_extra_hold.disabled = bool(automatic_boundary_holds.value)
 
 
 def set_status_threadsafe(text):
@@ -1053,6 +1216,7 @@ def cpc_reader_loop(
     _globals=globals(),
     _np=np,
     _default_settings=DEFAULT_SETTINGS,
+    _sample_history=cpc_sample_history,
 ):
     import time as _time
 
@@ -1063,6 +1227,7 @@ def cpc_reader_loop(
             continue
 
         started = _time.monotonic()
+        query_start_epoch = _time.time()
         error = None
         got_response = False
         try:
@@ -1080,11 +1245,18 @@ def cpc_reader_loop(
             break
 
         finished = _time.monotonic()
-        wall_time = datetime.now().isoformat()
+        query_end_epoch = _time.time()
+        effective_epoch = 0.5 * (query_start_epoch + query_end_epoch)
+        wall_time = datetime.fromtimestamp(effective_epoch).isoformat()
         with _latest_cpc_lock:
             if got_response:
                 _latest_cpc["sample_id"] += 1
                 _latest_cpc["sample_time"] = wall_time
+                _latest_cpc["query_start_time"] = datetime.fromtimestamp(query_start_epoch).isoformat()
+                _latest_cpc["query_end_time"] = datetime.fromtimestamp(query_end_epoch).isoformat()
+                _latest_cpc["timestamp_uncertainty_sec"] = 0.5 * (query_end_epoch - query_start_epoch)
+                _latest_cpc["timestamp_basis"] = "serial query midpoint"
+                _sample_history.append((_latest_cpc["sample_id"], finished))
             _latest_cpc["value"] = value
             _latest_cpc["time"] = finished
             _latest_cpc["duration_sec"] = finished - started
@@ -1118,6 +1290,24 @@ def latest_cpc_snapshot():
 
     age = np.nan if sample_time is None else _time.monotonic() - sample_time
     return value, age, duration, error, sample_id, sample_wall_time
+
+
+def latest_cpc_query_timing(sample_id):
+    with latest_cpc_lock:
+        if latest_cpc["sample_id"] != sample_id:
+            return None, None, np.nan, "sample changed before timing snapshot"
+        return (
+            latest_cpc["query_start_time"],
+            latest_cpc["query_end_time"],
+            latest_cpc["timestamp_uncertainty_sec"],
+            latest_cpc["timestamp_basis"],
+        )
+
+
+def measured_cpc_cadence_seconds():
+    with latest_cpc_lock:
+        samples = tuple(cpc_sample_history)
+    return robust_cpc_cadence_seconds(samples)
 
 
 def aerosol_poll_loop(meter, _stop_event=app_stop_event):
@@ -1688,6 +1878,7 @@ def drain_ui_updates():
         current_aerosol_flow_pane.object = "Current aerosol flow: disabled"
 
     update_scan_progress()
+    update_cpc_timing_display()
 
     if rows_changed:
         refresh_live_plot()
@@ -1830,10 +2021,18 @@ def cpc_poll_interval_seconds():
 def append_measurement_row(point, scan_number_value, is_ntot=False, extra=None):
     sample_started = time.monotonic()
     cpc_count, cpc_age, cpc_read_duration, cpc_error, cpc_sample_id, cpc_sample_time = latest_cpc_snapshot()
+    cpc_query_start, cpc_query_end, cpc_timestamp_uncertainty, cpc_timestamp_basis = (
+        latest_cpc_query_timing(cpc_sample_id)
+    )
     flow = read_flow_value()
     aerosol_flow, aerosol_dp, aerosol_temp, _ = aerosol_snapshot()
     hv_cache = spellman_snapshot()
     extra = extra or {}
+    settings = active_scan_settings or current_scan_settings()
+    identity = software_identity()
+    response_window, response_window_rule = cpc_response_window_seconds(
+        settings["cpc_type"], cpc_count, settings["cpc_response_window_sec"]
+    )
 
     row = {
         "time": datetime.now().isoformat(),
@@ -1850,25 +2049,55 @@ def append_measurement_row(point, scan_number_value, is_ntot=False, extra=None):
         "cpc_error": cpc_error,
         "cpc_sample_id": cpc_sample_id,
         "cpc_sample_time": cpc_sample_time,
+        "cpc_query_start_time": cpc_query_start,
+        "cpc_query_end_time": cpc_query_end,
+        "cpc_timestamp_uncertainty_sec": cpc_timestamp_uncertainty,
+        "cpc_timestamp_basis": cpc_timestamp_basis,
+        "acquisition_session_id": ACQUISITION_SESSION_ID,
         "hv_target_v": 0.0 if is_ntot else point.get("hv_target_v", np.nan),
         "spellman_measured_v": hv_cache["voltage"] if active_hv_config and active_hv_config[0] == "Monopolar Spellman" else np.nan,
         "spellman_status": hv_cache["status"] if active_hv_config and active_hv_config[0] == "Monopolar Spellman" else None,
         "aerosol_flow_lpm": aerosol_flow,
         "aerosol_dp_pa": aerosol_dp,
         "aerosol_temp_c": aerosol_temp,
+        "cpc_type": settings["cpc_type"],
+        "point_dwell_sec": settings["meas_time"],
+        "cpc_poll_interval_sec": settings["cpc_poll_interval"],
+        "cpc_transport_delay_sec": settings["cpc_transport_delay_sec"],
+        "cpc_response_window_sec": response_window,
+        "cpc_response_window_rule": response_window_rule,
+        "configured_dwell_sec": settings["meas_time"],
+        "configured_cpc_poll_interval_sec": settings["cpc_poll_interval"],
+        "configured_cpc_transport_delay_sec": settings["cpc_transport_delay_sec"],
+        "configured_cpc_response_window_sec": settings["cpc_response_window_sec"],
+        "measured_cpc_cadence_sec": measured_cpc_cadence_seconds(),
+        "boundary_hold_policy": settings.get("hold_policy", "not_applicable" if is_ntot else "manual"),
+        "automatic_boundary_holds": settings["automatic_boundary_holds"],
+        "configured_manual_initial_hold_sec": settings["initial_point_pre_hold"],
+        "configured_manual_final_hold_sec": settings["final_point_extra_hold"],
+        "initial_pre_hold_sec": settings.get("initial_pre_hold_sec", 0.0),
+        "final_hold_sec": settings.get("final_hold_sec", 0.0),
+        "hold_cadence_margin_sec": settings.get("cadence_margin_sec", np.nan),
+        "expected_unique_samples_per_point": settings.get("expected_unique_samples_per_point", np.nan),
+        "target_unique_samples_per_point": settings.get("target_unique_samples_per_point", np.nan),
+        "sample_count_warning": settings.get("sample_count_warning", False),
+        "point_index": extra.get("point_index", np.nan),
+        "point_set_time": extra.get("point_set_time", extra.get("point_start_time")),
+        "point_valid_from": extra.get("point_valid_from"),
+        "point_valid_until": extra.get("point_valid_until"),
+        "app_version": settings.get("app_version", identity["version"]),
+        "git_commit": settings.get("git_commit", identity["commit"]),
         **extra,
     }
 
     rows.append(row)
     queue_ui_row(row)
     local_log = Path("logs") / f"measurement_{datetime.now().strftime('%Y%m%d')}.csv"
-    legacy_columns = [
-        "time", "scan_range", "size_nm", "cpc_count", "sheath_flow",
-        "sheath_setpoint", "scan_number", "Ntot", "sample_duration_sec",
-        "cpc_age_sec", "cpc_read_duration_sec", "cpc_error",
-        "point_elapsed_sec", "point_set_duration_sec", "phase",
-    ]
-    log_row({column: row.get(column) for column in legacy_columns}, local_log=local_log, cloud_log=None)
+    log_row(
+        {column: row.get(column) for column in DAILY_MEASUREMENT_COLUMNS},
+        local_log=local_log,
+        cloud_log=None,
+    )
     return row
 
 
@@ -1885,7 +2114,8 @@ def sample_due():
 def expected_scan_duration(settings, scan, include_ntot=False):
     switches = sum(np.sign(scan[i]["dp"]) != np.sign(scan[i - 1]["dp"]) for i in range(1, len(scan)))
     duration = len(scan) * (settings["settling_time"] + settings["meas_time"])
-    duration += switches * settings["polarity_switch_time"] + settings["final_point_extra_hold"]
+    duration += switches * settings["polarity_switch_time"]
+    duration += settings["initial_pre_hold_sec"] + settings["final_hold_sec"]
     if include_ntot:
         duration += settings["settling_time"] + settings["ntot_time"] + settings["ntot_rest_time"]
     return duration
@@ -1928,8 +2158,8 @@ def scan_qc(scan_data, settings, actual_duration, serial_errors):
     hold_ids = pd.to_numeric(hold_rows.get("cpc_sample_id", pd.Series(dtype=float)), errors="coerce")
     hold_unique_samples = int(hold_ids[hold_ids > 0].nunique())
     required_hold_samples = (
-        max(1, abs(int(settings["smps_plot_step_shift"])))
-        if settings["final_point_extra_hold"] > 0 else 0
+        max(settings["target_unique_samples_per_point"], abs(int(settings["smps_plot_step_shift"])))
+        if settings["final_hold_sec"] > 0 else 0
     )
     expected_duration = expected_scan_duration(settings, settings["scan"], include_ntot=settings.get("did_ntot", False))
     duration_ratio = actual_duration / expected_duration if expected_duration else np.nan
@@ -1954,6 +2184,20 @@ def scan_qc(scan_data, settings, actual_duration, serial_errors):
 def begin_scan():
     global active_scan_settings, scan_started_monotonic, scan_started_wall, scan_serial_error_start
     active_scan_settings = current_scan_settings()
+    active_scan_settings.update(cpc_scan_timing_profile(
+        active_scan_settings["cpc_type"],
+        active_scan_settings["meas_time"],
+        active_scan_settings["cpc_poll_interval"],
+        active_scan_settings["cpc_transport_delay_sec"],
+        active_scan_settings["cpc_response_window_sec"],
+        active_scan_settings["automatic_boundary_holds"],
+        active_scan_settings["initial_point_pre_hold"],
+        active_scan_settings["final_point_extra_hold"],
+        measured_cpc_cadence_seconds(),
+    ))
+    identity = software_identity()
+    active_scan_settings["app_version"] = identity["version"]
+    active_scan_settings["git_commit"] = identity["commit"]
     active_scan_settings["scan"] = build_scan_points(include_dac_codes=True, settings=active_scan_settings)
     setup_hv_source(active_scan_settings)
     setup_aerosol_flowmeter(active_scan_settings)
@@ -1967,6 +2211,11 @@ def complete_scan(do_ntot, last_point):
     global active_point_key, active_scan_settings, phase
     settings = active_scan_settings
     settings["did_ntot"] = do_ntot
+    final_valid_until = datetime.now().isoformat()
+    final_point_index = len(settings["scan"]) - 1
+    for row in scan_rows:
+        if row.get("point_index") == final_point_index and not row.get("Ntot", False):
+            row["point_valid_until"] = final_valid_until
     if do_ntot:
         scan_rows.extend(run_ntot_measurement(last_point["scan_range"], scan_number, last_point["sheath"], settings))
         active_point_key = None
@@ -2043,6 +2292,8 @@ def measurement_step(debug=True):
         next_sample_time, \
         last_point_set_duration_sec, \
         point_set_time, \
+        point_valid_from_time, \
+        point_measurement_start_time, \
         final_hold_start_sample_id
 
     if not start_button.value:
@@ -2078,8 +2329,8 @@ def measurement_step(debug=True):
             if measurement_finished:
                 new_sign = int(np.sign(dp))
                 point_set_started = time.monotonic()
-                point_set_time = time.time()
                 apply_scan_point(point)
+                point_set_time = time.time()
                 last_point_set_duration_sec = time.monotonic() - point_set_started
                 if polarity_switch != 0 and new_sign != polarity_switch:
                     if not interruptible_sleep(active_scan_settings["polarity_switch_time"]):
@@ -2087,8 +2338,14 @@ def measurement_step(debug=True):
                 polarity_switch = new_sign
                 if not interruptible_sleep(active_scan_settings["settling_time"]):
                     return
+                point_valid_from_time = point_set_time
+                if current_size_index == 0 and not interruptible_sleep(
+                    active_scan_settings["initial_pre_hold_sec"]
+                ):
+                    return
                 measurement_finished = False
                 phase_start_time = time.time()
+                point_measurement_start_time = phase_start_time
                 next_sample_time = 0.0
 
             if not sample_due():
@@ -2101,6 +2358,15 @@ def measurement_step(debug=True):
                 extra={
                     "point_index": current_size_index,
                     "point_start_time": datetime.fromtimestamp(point_set_time).isoformat(),
+                    "point_set_time": datetime.fromtimestamp(point_set_time).isoformat(),
+                    "point_valid_from": datetime.fromtimestamp(point_valid_from_time).isoformat(),
+                    "point_valid_until": (
+                        datetime.fromtimestamp(
+                            point_measurement_start_time + meas_sec
+                            + active_scan_settings["final_hold_sec"]
+                        ).isoformat()
+                        if current_size_index == len(scan) - 1 else None
+                    ),
                     "point_elapsed_sec": time.time() - phase_start_time,
                     "point_set_duration_sec": last_point_set_duration_sec,
                     "phase": "measuring",
@@ -2118,7 +2384,7 @@ def measurement_step(debug=True):
                 current_size_index += 1
                 measurement_finished = True
                 if current_size_index >= len(scan):
-                    hold_sec = max(0.0, active_scan_settings["final_point_extra_hold"])
+                    hold_sec = active_scan_settings["final_hold_sec"]
                     if hold_sec > 0:
                         phase = "final_hold"
                         phase_start_time = now
@@ -2153,6 +2419,11 @@ def measurement_step(debug=True):
                         extra={
                             "point_index": current_size_index,
                             "point_start_time": datetime.fromtimestamp(point_set_time).isoformat(),
+                            "point_set_time": datetime.fromtimestamp(point_set_time).isoformat(),
+                            "point_valid_from": datetime.fromtimestamp(point_valid_from_time).isoformat(),
+                            "point_valid_until": datetime.fromtimestamp(
+                                point_measurement_start_time + meas_sec + active_scan_settings["final_hold_sec"]
+                            ).isoformat(),
                             "point_elapsed_sec": time.time() - phase_start_time,
                             "point_set_duration_sec": last_point_set_duration_sec,
                             "phase": "final_hold",
@@ -2163,12 +2434,16 @@ def measurement_step(debug=True):
                         print(row, flush=True)
                     scan_rows.append(row)
 
-            hold_sec = max(0.0, active_scan_settings["final_point_extra_hold"])
-            required_samples = max(1, abs(int(active_scan_settings["smps_plot_step_shift"])))
+            hold_sec = active_scan_settings["final_hold_sec"]
             hold_elapsed = time.time() - phase_start_time
-            grace_sec = max(2.0, 2.0 * cpc_poll_interval_seconds())
+            required_samples = max(
+                active_scan_settings["target_unique_samples_per_point"],
+                abs(int(active_scan_settings["smps_plot_step_shift"])),
+            )
+            grace_sec = max(2.0, 2.0 * active_scan_settings["cadence_margin_sec"])
             if hold_elapsed < hold_sec or (
-                len(final_hold_sample_ids) < required_samples and hold_elapsed < hold_sec + grace_sec
+                len(final_hold_sample_ids) < required_samples
+                and hold_elapsed < hold_sec + grace_sec
             ):
                 return
 
@@ -2636,6 +2911,10 @@ for widget in [
     meas_time,
     sleep_time,
     cpc_poll_interval,
+    cpc_transport_delay_sec,
+    cpc_response_window_sec,
+    automatic_boundary_holds,
+    initial_point_pre_hold,
     n_scans_plot,
     ntot_rest_time,
     settling_time,
@@ -2677,6 +2956,7 @@ aerosol_calibration_button.on_click(start_aerosol_calibration)
 git_update_button.on_click(check_git_update_now)
 
 update_scan_preview()
+update_cpc_timing_display()
 
 #### Layout ####
 control_layout = pn.Column(
@@ -2693,8 +2973,10 @@ control_layout = pn.Column(
     "### Scan range 2",
     pn.Row(range2, sheath2, steps2),
     scan_pane,
+    cpc_timing_pane,
     pn.Row(meas_time, cpc_poll_interval, Ntot_time, ntot_every_n_scans, ntot_rest_time, n_scans_plot),
-    pn.Row(settling_time, final_point_extra_hold, smps_plot_step_shift, polarity_switch_time),
+    pn.Row(cpc_transport_delay_sec, cpc_response_window_sec, automatic_boundary_holds),
+    pn.Row(settling_time, initial_point_pre_hold, final_point_extra_hold, smps_plot_step_shift, polarity_switch_time),
     pn.Row(current_cpc_pane, current_flow_pane, current_hv_pane, current_aerosol_flow_pane, latest_ntot_pane),
     "### Sheath flow PID step tuner",
     "Runs only while measurement is stopped. HV is zeroed/disabled first. Set low/high DAC values to bracket the normal steady blower output; flow above 25 L/min aborts the test. Gains are not changed until **Apply result**.",

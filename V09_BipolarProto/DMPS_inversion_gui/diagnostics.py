@@ -83,6 +83,52 @@ def sheath_flow_relative_rmse(scan_rows):
     return float(flow_rmse), float(abs(flow_rmse / setpoint_median))
 
 
+def integrate_number_distribution(size_nm, concentration, part_columns=None):
+    size_nm = np.asarray(size_nm, dtype=float)
+    concentration = np.asarray(concentration, dtype=float)
+    valid = np.isfinite(size_nm) & (size_nm > 0) & np.isfinite(concentration)
+    if valid.sum() < 2:
+        return np.nan
+    order = np.argsort(size_nm)
+    size_nm = size_nm[order]
+    concentration = concentration[order]
+    valid = valid[order]
+    if part_columns is None:
+        connected = valid[:-1] & valid[1:]
+    else:
+        parts = np.vstack([np.asarray(column, dtype=float)[order] for column in part_columns])
+        connected = valid[:-1] & valid[1:] & np.any(
+            np.isfinite(parts[:, :-1]) & np.isfinite(parts[:, 1:]), axis=0
+        )
+    widths = np.diff(np.log10(size_nm))
+    trapezoids = 0.5 * (concentration[:-1] + concentration[1:]) * widths
+    return float(np.sum(trapezoids[connected]))
+
+
+def range_overlap_metrics(part_columns):
+    if len(part_columns) < 2:
+        return None
+    values = np.vstack([np.asarray(column, dtype=float) for column in part_columns])
+    overlap = np.sum(np.isfinite(values), axis=0) >= 2
+    if not overlap.any():
+        return None
+    overlap_values = values[:, overlap]
+    span = np.nanmax(overlap_values, axis=0) - np.nanmin(overlap_values, axis=0)
+    scale = np.nanmean(np.abs(overlap_values), axis=0)
+    relative = np.divide(
+        span,
+        scale,
+        out=np.full(len(span), np.nan),
+        where=scale > 0,
+    )
+    finite = relative[np.isfinite(relative)]
+    return {
+        "overlap_bin_count": int(overlap.sum()),
+        "median_relative_seam": float(np.median(finite)) if len(finite) else np.nan,
+        "p90_relative_seam": float(np.percentile(finite, 90)) if len(finite) else np.nan,
+    }
+
+
 def guard_diagnostic_values(values, ntot_limit, *, use_ntot_limit=True, multiplier=8.0):
     values = np.asarray(values, dtype=float).copy()
     if use_ntot_limit and np.isfinite(ntot_limit) and ntot_limit > 0:

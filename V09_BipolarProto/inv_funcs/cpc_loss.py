@@ -27,7 +27,9 @@ def cpc_loss1(dp, temp, press, cpc_type=3010):
     # For TSI3010 you can give two elevated temperatures 25degC and 21degC
     TD = 21
     
-    if cpc_type == 3772:
+    cpc_type = str(cpc_type)
+
+    if cpc_type == "3772":
         # Ift calibration Td=29degC
         a = 98.68119
         b = 712.62942
@@ -44,12 +46,12 @@ def cpc_loss1(dp, temp, press, cpc_type=3010):
         if res.size == 1:
             res = res[0]
     
-    elif cpc_type == 3022:
+    elif cpc_type == "3022":
         # TSI3022
         X = dp / 0.01e-6
         res = 0.5 + 0.5 * (X - 1.0 / X) / (X + 1.0 / X)
     
-    elif cpc_type == 3010:
+    elif cpc_type == "3010":
         # TSI3010
         if TD == 25:
             a = 1.86
@@ -74,7 +76,7 @@ def cpc_loss1(dp, temp, press, cpc_type=3010):
         iis = np.where(Dpp < D0)
         res[iis] = 0
     
-    elif cpc_type == 3025:
+    elif cpc_type == "3025":
         # TSI3025
         pipel = 0.1881
         pipef = 5.0 / 1e6
@@ -92,8 +94,10 @@ def cpc_loss1(dp, temp, press, cpc_type=3010):
     
     elif cpc_type == "HY09":
         res = cpc_loss_curve(dp)
-        if dp > 20e-9:
-            res = 1.0
+        res = np.where(dp > 20e-9, 1.0, res)
+    else:
+        # No validated counting-efficiency curve is available for this CPC.
+        res = np.ones(np.shape(dp), dtype=float)
     
     return res
 
