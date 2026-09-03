@@ -4,11 +4,18 @@ import numpy as np
 import pandas as pd
 
 from DMPS_inversion_gui.diagnostics import (
+    brownian_coagulation_kernel,
+    brownian_coagulation_sink,
+    build_mcc_growth_cross_checks,
     build_growth_rate_diagnostics,
     distribution_bin_coverage,
+    distribution_moments,
+    fit_lognormal_modes,
     growth_models_from_settings,
     integrate_number_distribution,
     range_overlap_metrics,
+    select_lognormal_mode_fit,
+    sulfuric_acid_condensation_sink,
     weighted_log_diameter_quantile,
 )
 from inv_funcs.cpc_loss import cpc_loss1
@@ -489,6 +496,187 @@ class InversionDiagnosticTests(unittest.TestCase):
             distribution_bin_coverage(sizes, concentration),
             np.sum(widths[[0, 2, 3]]) / np.sum(widths),
         )
+
+    def test_lognormal_mode_fit_recovers_two_modes_deterministically(self):
+        sizes = np.geomspace(5.0, 300.0, 180)
+        log_sizes = np.log10(sizes)
+        concentration = (
+            800 / (0.08 * np.sqrt(2 * np.pi))
+            * np.exp(-0.5 * ((log_sizes - np.log10(18.0)) / 0.08) ** 2)
+            + 1200 / (0.11 * np.sqrt(2 * np.pi))
+            * np.exp(-0.5 * ((log_sizes - np.log10(95.0)) / 0.11) ** 2)
+        )
+
+        fitted = fit_lognormal_modes(sizes, concentration, 2)
+        repeated = fit_lognormal_modes(sizes, concentration, 2)
+
+        self.assertEqual(fitted["status"], "ok")
+        np.testing.assert_allclose(
+            [mode["mode_diameter_nm"] for mode in fitted["components"]],
+            [18.0, 95.0],
+            rtol=0.01,
+        )
+        self.assertGreater(fitted["r2"], 0.999)
+        np.testing.assert_allclose(fitted["curve_total"], repeated["curve_total"])
+
+    def test_automatic_modal_fit_uses_bic(self):
+        sizes = np.geomspace(5.0, 100.0, 120)
+        log_sizes = np.log10(sizes)
+        concentration = 500 / (0.1 * np.sqrt(2 * np.pi)) * np.exp(
+            -0.5 * ((log_sizes - np.log10(25.0)) / 0.1) ** 2
+        )
+
+        fitted = select_lognormal_mode_fit(sizes, concentration, 3)
+
+        self.assertEqual(fitted["status"], "ok")
+        self.assertEqual(fitted["number_of_modes"], 1)
+
+    def test_automatic_modal_fit_does_not_add_poisson_noise_modes(self):
+        rng = np.random.default_rng(20260904)
+        sizes = np.geomspace(5.0, 150.0, 100)
+        log_sizes = np.log10(sizes)
+        expected = 1000 / (0.11 * np.sqrt(2 * np.pi)) * np.exp(
+            -0.5 * ((log_sizes - np.log10(30.0)) / 0.11) ** 2
+        )
+
+        for _ in range(10):
+            fitted = select_lognormal_mode_fit(
+                sizes, rng.poisson(np.maximum(expected, 0)), 3
+            )
+            self.assertEqual(fitted["number_of_modes"], 1)
+        for seed in (15, 72):
+            fitted = select_lognormal_mode_fit(
+                sizes,
+                np.random.default_rng(seed).poisson(np.maximum(expected, 0)),
+                3,
+            )
+            self.assertEqual(fitted["number_of_modes"], 1)
+
+    def test_particle_moments_match_per_bin_fixture(self):
+        sizes = np.array([10.0, 20.0, 40.0])
+        width = np.log10(2.0)
+        concentration = np.array([100.0, 200.0, 300.0]) / width
+
+        moments = distribution_moments(sizes, concentration)
+
+        self.assertAlmostEqual(moments["number_cm3"], 600.0)
+        self.assertAlmostEqual(moments["number_mean_nm"], 17000.0 / 600.0)
+        self.assertAlmostEqual(moments["geometric_mean_nm"], 25.1984209979)
+        self.assertAlmostEqual(moments["surface_um2_cm3"], 1.79070781255)
+        self.assertAlmostEqual(moments["volume_um3_cm3"], 0.0109432144100)
+
+    def test_properties_do_not_bridge_disconnected_measurement_ranges(self):
+        sizes = np.array([10.0, 20.0, 1000.0, 2000.0])
+        concentration = np.full(4, 100.0)
+        parts = [
+            np.array([100.0, 100.0, np.nan, np.nan]),
+            np.array([np.nan, np.nan, 100.0, 100.0]),
+        ]
+
+        moments = distribution_moments(sizes, concentration, parts)
+        cs = sulfuric_acid_condensation_sink(
+            sizes, concentration, part_columns=parts
+        )
+        coags = brownian_coagulation_sink(
+            sizes, concentration, 10.0, part_columns=parts
+        )
+
+        self.assertAlmostEqual(
+            moments["number_cm3"], 200.0 * np.log10(2.0)
+        )
+        self.assertLess(moments["bin_coverage"], 0.25)
+        self.assertLess(
+            cs,
+            sulfuric_acid_condensation_sink(sizes, concentration),
+        )
+        self.assertLess(
+            coags,
+            brownian_coagulation_sink(sizes, concentration, 10.0),
+        )
+
+    def test_condensation_and_coagulation_sinks_scale_with_concentration(self):
+        sizes = np.array([10.0, 20.0, 40.0, 100.0])
+        concentration = np.array([100.0, 200.0, 300.0, 400.0])
+        cs = sulfuric_acid_condensation_sink(sizes, concentration)
+        coags = brownian_coagulation_sink(sizes, concentration, 10.0)
+
+        self.assertGreater(cs, 0)
+        self.assertGreater(coags, 0)
+        self.assertAlmostEqual(
+            sulfuric_acid_condensation_sink(sizes, 2 * concentration), 2 * cs
+        )
+        self.assertAlmostEqual(
+            brownian_coagulation_sink(sizes, 2 * concentration, 10.0), 2 * coags
+        )
+        self.assertAlmostEqual(
+            brownian_coagulation_kernel(10.0, 100.0),
+            brownian_coagulation_kernel(100.0, 10.0),
+        )
+
+    def test_mcc_cross_check_recovers_known_growth(self):
+        sizes = np.geomspace(5.0, 35.0, 160)
+        times = pd.date_range("2026-08-01T00:00:00Z", periods=28, freq="15min")
+        hours = np.arange(len(times)) * 0.25
+        track_dp = 7.0 + 3.0 * hours
+        z = np.column_stack([
+            100 * np.exp(-0.5 * ((sizes - center) / 1.0) ** 2)
+            for center in track_dp
+        ])
+        growth = [{
+            "source_method": "test",
+            "polarity": "positive",
+            "event_id": "test:positive:event-1",
+            "event_number": 1,
+            "event_start": times[0],
+            "event_end": times[-1],
+            "dp": track_dp,
+            "growth_rate": 3.0,
+            "model": "Ridge peak",
+            "background_quality": "adequate",
+        }]
+
+        checks = build_mcc_growth_cross_checks(
+            [{
+                "kind": "heatmap", "method": "test", "polarity": "positive",
+                "x": times, "y": sizes, "Z": z,
+            }],
+            growth,
+            method_label=lambda value: value,
+            maximum_growth_rate_nm_h=10.0,
+            minimum_correlation=0.6,
+        )
+
+        self.assertEqual(len(checks), 1)
+        self.assertAlmostEqual(checks[0]["growth_rate"], 3.0, delta=0.2)
+        self.assertGreater(checks[0]["correlation"], 0.95)
+        self.assertEqual(checks[0]["agreement"], "supportive")
+
+    def test_mcc_does_not_claim_growth_for_stationary_mode(self):
+        sizes = np.geomspace(5.0, 35.0, 120)
+        times = pd.date_range("2026-08-01T00:00:00Z", periods=28, freq="15min")
+        pulse = np.exp(-0.5 * ((np.arange(len(times)) - 14) / 3.0) ** 2)
+        stationary = np.exp(-0.5 * ((sizes - 15.0) / 2.0) ** 2)
+        z = 100 * np.outer(stationary, pulse)
+        growth = [{
+            "source_method": "test", "polarity": "positive",
+            "event_id": "test:positive:event-1", "event_number": 1,
+            "event_start": times[0], "event_end": times[-1],
+            "dp": np.linspace(9.0, 21.0, len(times)), "growth_rate": 3.0,
+            "model": "Ridge peak", "background_quality": "adequate",
+        }]
+
+        checks = build_mcc_growth_cross_checks(
+            [{
+                "kind": "heatmap", "method": "test", "polarity": "positive",
+                "x": times, "y": sizes, "Z": z,
+            }],
+            growth,
+            method_label=lambda value: value,
+            maximum_growth_rate_nm_h=15.0,
+            minimum_correlation=0.6,
+        )
+
+        self.assertEqual(checks, [])
 
 
 if __name__ == "__main__":

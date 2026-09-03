@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import pandas as pd
 import panel as pn
+import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from scipy.integrate import trapezoid
 from scipy.optimize import nnls
@@ -79,6 +80,13 @@ DEFAULT_SETTINGS = {
     "growth_max_gap_minutes": 90.0,
     "growth_min_event_scans": 4,
     "growth_max_rate_nm_h": 15.0,
+    "mcc_cross_check_enabled": False,
+    "mcc_min_correlation": 0.6,
+    "coagulation_targets_nm": "3, 10",
+    "particle_density_kg_m3": 1000.0,
+    "modal_fit_modes": "Auto (1-3)",
+    "modal_fit_min_nm": 6.5,
+    "modal_fit_max_nm": 300.0,
     "difference_peak_min_size_nm": 30.0,
     "smallest_size": 6.5,
     "scan_inversion_type": "DMPS",
@@ -119,6 +127,9 @@ latest_inversion = None
 latest_difference_diagnostics = None
 latest_growth_diagnostics = []
 latest_growth_settings = {}
+latest_aerosol_properties = []
+latest_modal_analysis = None
+_UNSET = object()
 auto_pending_signature = None
 AUTO_STATE_FILE = APP_ROOT / "auto_inversion_state.json"
 scan_time_cache = {}
@@ -132,18 +143,22 @@ shared_state = pn.state.cache.setdefault(
         "inversion_fig": None,
         "residual_fig": None,
         "smps_timing_fig": None,
+        "aerosol_fig": None,
         "difference_fig": None,
         "difference_diagnostics": None,
         "growth_diagnostics": [],
         "growth_settings": {},
+        "aerosol_properties": [],
         "latest_inversion": None,
         "status": "Status: idle",
     },
 )
 shared_state.setdefault("residual_fig", None)
 shared_state.setdefault("smps_timing_fig", None)
+shared_state.setdefault("aerosol_fig", None)
 shared_state.setdefault("growth_diagnostics", [])
 shared_state.setdefault("growth_settings", {})
+shared_state.setdefault("aerosol_properties", [])
 with shared_state["lock"]:
     local_shared_version = (
         shared_state["version"]
@@ -218,6 +233,13 @@ def save_settings():
         "growth_max_gap_minutes": float(growth_max_gap_minutes.value),
         "growth_min_event_scans": int(growth_min_event_scans.value),
         "growth_max_rate_nm_h": float(growth_max_rate_nm_h.value),
+        "mcc_cross_check_enabled": bool(mcc_cross_check_enabled.value),
+        "mcc_min_correlation": float(mcc_min_correlation.value),
+        "coagulation_targets_nm": coagulation_targets_nm.value,
+        "particle_density_kg_m3": float(particle_density_kg_m3.value),
+        "modal_fit_modes": modal_fit_modes.value,
+        "modal_fit_min_nm": float(modal_fit_min_nm.value),
+        "modal_fit_max_nm": float(modal_fit_max_nm.value),
         "difference_peak_min_size_nm": float(difference_peak_min_size_nm.value),
         "smallest_size": float(smallest_size.value),
         "scan_inversion_type": scan_inversion_type.value,
@@ -246,15 +268,16 @@ def save_settings():
 
 def _json_safe(value):
     if isinstance(value, np.ndarray):
-        return value.tolist()
+        return [_json_safe(v) for v in value.tolist()]
     if isinstance(value, (pd.Index, pd.Series)):
         return [_json_safe(v) for v in value.tolist()]
     if isinstance(value, (pd.Timestamp,)):
         return value.isoformat()
     if isinstance(value, (np.integer,)):
         return int(value)
-    if isinstance(value, (np.floating,)):
-        return float(value)
+    if isinstance(value, (float, np.floating)):
+        numeric = float(value)
+        return numeric if np.isfinite(numeric) else None
     if isinstance(value, list):
         return [_json_safe(v) for v in value]
     if isinstance(value, dict):
@@ -356,6 +379,8 @@ def save_data(event=None):
         difference_plot.object.write_html(outdir / f"difference_diagnostics_{stamp}.html")
     if smps_timing_plot.object is not None:
         smps_timing_plot.object.write_html(outdir / f"smps_timing_diagnostics_{stamp}.html")
+    if aerosol_plot.object is not None:
+        aerosol_plot.object.write_html(outdir / f"aerosol_properties_{stamp}.html")
     ntot_tables = []
     measured_ntot_saved = False
     for tr in latest_inversion:
@@ -373,6 +398,22 @@ def save_data(event=None):
             heatmap_df.to_csv(
                 outdir / f"heatmap_{method_name}_{tr['polarity']}_{stamp}.csv"
             )
+            support_by_scan = tr.get("part_columns", [])
+            if support_by_scan:
+                support_widths = np.column_stack([
+                    diag.distribution_support_widths(tr["y"], columns)
+                    for columns in support_by_scan
+                ])
+                support_df = pd.DataFrame(
+                    support_widths.T,
+                    index=pd.to_datetime(tr["x"]),
+                    columns=np.asarray(tr["y"], dtype=float),
+                )
+                support_df.index.name = "time"
+                support_df.columns.name = "size_nm"
+                support_df.to_csv(
+                    outdir / f"heatmap_support_dlog10dp_{method_name}_{tr['polarity']}_{stamp}.csv"
+                )
         elif tr["kind"] == "ntot":
             polarity = tr["polarity"]
             method = tr.get("method", "gunn woessner mod")
@@ -477,6 +518,48 @@ def save_data(event=None):
             f"npf_growth_model_summary_{stamp}.csv",
             f"npf_growth_model_tracks_{stamp}.csv",
             f"npf_growth_models_{stamp}.json",
+        ):
+            (outdir / filename).unlink(missing_ok=True)
+    if latest_aerosol_properties:
+        property_rows = []
+        for item in latest_aerosol_properties:
+            metadata = {key: value for key, value in item.items() if key != "rows"}
+            property_rows.extend({**metadata, **row} for row in item["rows"])
+        pd.DataFrame(property_rows).to_csv(
+            outdir / f"aerosol_properties_{stamp}.csv", index=False
+        )
+        (outdir / f"aerosol_properties_{stamp}.json").write_text(
+            json.dumps(_json_safe(latest_aerosol_properties), indent=2)
+        )
+    elif daily_overwrite_checkbox.value:
+        for filename in (
+            f"aerosol_properties_{stamp}.html",
+            f"aerosol_properties_{stamp}.csv",
+            f"aerosol_properties_{stamp}.json",
+        ):
+            (outdir / filename).unlink(missing_ok=True)
+    if latest_modal_analysis is not None:
+        pd.DataFrame(latest_modal_analysis.get("components", [])).to_csv(
+            outdir / f"clicked_modal_fit_{stamp}.csv", index=False
+        )
+        if latest_modal_analysis.get("status") == "ok":
+            curve_frame = pd.DataFrame({
+                "diameter_nm": latest_modal_analysis["curve_diameter_nm"],
+                "fitted_total": latest_modal_analysis["curve_total"],
+            })
+            for index, curve in enumerate(latest_modal_analysis["curve_components"], start=1):
+                curve_frame[f"component_{index}"] = curve
+            curve_frame.to_csv(outdir / f"clicked_modal_fit_curves_{stamp}.csv", index=False)
+        else:
+            (outdir / f"clicked_modal_fit_curves_{stamp}.csv").unlink(missing_ok=True)
+        (outdir / f"clicked_modal_fit_{stamp}.json").write_text(
+            json.dumps(_json_safe(latest_modal_analysis), indent=2)
+        )
+    elif daily_overwrite_checkbox.value:
+        for filename in (
+            f"clicked_modal_fit_{stamp}.csv",
+            f"clicked_modal_fit_curves_{stamp}.csv",
+            f"clicked_modal_fit_{stamp}.json",
         ):
             (outdir / filename).unlink(missing_ok=True)
     status.object = f"Saved plots and data to `{outdir}`."
@@ -1388,8 +1471,8 @@ dma_r2 = pn.widgets.FloatInput(name="DMA r2 (m)", value=float(settings.get("dma_
 qa_lpm = pn.widgets.FloatInput(name="Aerosol flow qa (L/min)", value=float(settings.get("qa_lpm", 1.0)), step=0.1)
 qs_lpm = pn.widgets.FloatInput(name="Sample flow qs (L/min)", value=float(settings.get("qs_lpm", 1.0)), step=0.1)
 
-temp_K = pn.widgets.FloatInput(name="T (K)", value=float(settings.get("temp_K", 293.15)), step=1)
-press_Pa = pn.widgets.FloatInput(name="P (Pa)", value=float(settings.get("press_Pa", 101325)), step=100)
+temp_K = pn.widgets.FloatInput(name="T (K)", value=float(settings.get("temp_K", 293.15)), step=1, start=1)
+press_Pa = pn.widgets.FloatInput(name="P (Pa)", value=float(settings.get("press_Pa", 101325)), step=100, start=1)
 
 zratio_widget = pn.widgets.FloatInput(
     name="Zn/Zp",
@@ -1623,6 +1706,7 @@ GROWTH_MODEL_COLORS = {
     "Upper edge D75": "#e76f51",
     "Ridge peak": "#7b2cbf",
     "Appearance time": "#277da1",
+    "MCC cross-check (experimental)": "#264653",
 }
 saved_growth_models = diag.growth_models_from_settings(
     settings, GROWTH_MODEL_OPTIONS, DEFAULT_SETTINGS["growth_models"]
@@ -1676,6 +1760,48 @@ growth_max_rate_nm_h = pn.widgets.FloatInput(
     step=1.0,
     width=220,
 )
+mcc_cross_check_enabled = pn.widgets.Checkbox(
+    name="MCC growth cross-check (experimental)",
+    value=bool(settings.get(
+        "mcc_cross_check_enabled", DEFAULT_SETTINGS["mcc_cross_check_enabled"]
+    )),
+)
+mcc_min_correlation = pn.widgets.FloatInput(
+    name="MCC minimum correlation",
+    value=float(settings.get("mcc_min_correlation", DEFAULT_SETTINGS["mcc_min_correlation"])),
+    step=0.05,
+    width=190,
+)
+coagulation_targets_nm = pn.widgets.TextInput(
+    name="CoagS target diameters (nm)",
+    value=str(settings.get("coagulation_targets_nm", DEFAULT_SETTINGS["coagulation_targets_nm"])),
+    width=220,
+)
+particle_density_kg_m3 = pn.widgets.FloatInput(
+    name="Particle density for CoagS (kg/m3)",
+    value=float(settings.get("particle_density_kg_m3", DEFAULT_SETTINGS["particle_density_kg_m3"])),
+    step=50.0,
+    start=1.0,
+    width=240,
+)
+modal_fit_modes = pn.widgets.Select(
+    name="Clicked distribution modes",
+    options=["Auto (1-3)", "1", "2", "3"],
+    value=str(settings.get("modal_fit_modes", DEFAULT_SETTINGS["modal_fit_modes"])),
+    width=200,
+)
+modal_fit_min_nm = pn.widgets.FloatInput(
+    name="Modal fit min dp (nm)",
+    value=float(settings.get("modal_fit_min_nm", DEFAULT_SETTINGS["modal_fit_min_nm"])),
+    step=0.5,
+    width=180,
+)
+modal_fit_max_nm = pn.widgets.FloatInput(
+    name="Modal fit max dp (nm)",
+    value=float(settings.get("modal_fit_max_nm", DEFAULT_SETTINGS["modal_fit_max_nm"])),
+    step=5.0,
+    width=180,
+)
 difference_peak_min_size_nm = pn.widgets.FloatInput(
     name="Diff peak min dp (nm)",
     value=float(settings.get(
@@ -1712,6 +1838,11 @@ inversion_plot = pn.pane.Plotly(width=1300)
 residual_plot = pn.pane.Plotly(width=1300, height=1200)
 difference_plot = pn.pane.Plotly(width=1300)
 smps_timing_plot = pn.pane.Plotly(width=1300, height=1100)
+aerosol_plot = pn.pane.Plotly(width=1300, height=2000)
+modal_fit_plot = pn.pane.Plotly(width=1000, height=650)
+modal_fit_status = pn.pane.Markdown(
+    "Click an inverted heatmap to inspect and fit that scan's size distribution."
+)
 
 
 def publish_shared_state(
@@ -1720,10 +1851,12 @@ def publish_shared_state(
     inversion_fig=None,
     residual_fig=None,
     smps_timing_fig=None,
+    aerosol_fig=_UNSET,
     difference_fig=None,
     difference_diagnostics=None,
     growth_diagnostics=None,
     growth_settings=None,
+    aerosol_properties=None,
     inversion_result=None,
     status_text=None,
 ):
@@ -1736,6 +1869,8 @@ def publish_shared_state(
             shared_state["residual_fig"] = residual_fig
         if smps_timing_fig is not None:
             shared_state["smps_timing_fig"] = smps_timing_fig
+        if aerosol_fig is not _UNSET:
+            shared_state["aerosol_fig"] = aerosol_fig
         if difference_fig is not None:
             shared_state["difference_fig"] = difference_fig
         if difference_diagnostics is not None:
@@ -1744,6 +1879,8 @@ def publish_shared_state(
             shared_state["growth_diagnostics"] = copy.deepcopy(growth_diagnostics)
         if growth_settings is not None:
             shared_state["growth_settings"] = copy.deepcopy(growth_settings)
+        if aerosol_properties is not None:
+            shared_state["aerosol_properties"] = copy.deepcopy(aerosol_properties)
         if inversion_result is not None:
             shared_state["latest_inversion"] = inversion_result
         if status_text is not None:
@@ -1753,7 +1890,8 @@ def publish_shared_state(
 
 def sync_shared_state():
     global latest_inversion, latest_difference_diagnostics
-    global latest_growth_diagnostics, latest_growth_settings, local_shared_version
+    global latest_growth_diagnostics, latest_growth_settings
+    global latest_aerosol_properties, local_shared_version
 
     with shared_state["lock"]:
         version = shared_state["version"]
@@ -1763,10 +1901,12 @@ def sync_shared_state():
         inversion_fig = shared_state["inversion_fig"]
         residual_fig = shared_state["residual_fig"]
         smps_timing_fig = shared_state["smps_timing_fig"]
+        aerosol_fig = shared_state["aerosol_fig"]
         difference_fig = shared_state["difference_fig"]
         difference_diagnostics = shared_state["difference_diagnostics"]
         growth_diagnostics = copy.deepcopy(shared_state["growth_diagnostics"])
         growth_settings = copy.deepcopy(shared_state["growth_settings"])
+        aerosol_properties = copy.deepcopy(shared_state["aerosol_properties"])
         inversion_result = shared_state["latest_inversion"]
         status_text = shared_state["status"]
 
@@ -1778,12 +1918,14 @@ def sync_shared_state():
         residual_plot.object = copy.deepcopy(residual_fig)
     if smps_timing_fig is not None:
         smps_timing_plot.object = copy.deepcopy(smps_timing_fig)
+    aerosol_plot.object = copy.deepcopy(aerosol_fig)
     if difference_fig is not None:
         difference_plot.object = copy.deepcopy(difference_fig)
     if difference_diagnostics is not None:
         latest_difference_diagnostics = difference_diagnostics
     latest_growth_diagnostics = growth_diagnostics
     latest_growth_settings = growth_settings
+    latest_aerosol_properties = aerosol_properties
     if inversion_result is not None:
         latest_inversion = inversion_result
     if status_text is not None:
@@ -2479,6 +2621,7 @@ def run_inversion_calculation(df):
             dd = df[df["polarity"] == polarity].copy()
 
             heat_cols = []
+            heat_part_columns = []
             heat_times = []
             heat_flow_rel_rmse = []
             ntot_vals = []
@@ -2680,6 +2823,9 @@ def run_inversion_calculation(df):
                 })
 
                 heat_cols.append(full_col)
+                heat_part_columns.append([
+                    np.asarray(column, dtype=float).copy() for column in part_columns
+                ])
                 heat_times.append(g_scan["time"].median())
                 heat_flow_rel_rmse.append(flow_rel_rmse)
                 ntot_limit = float(ntot_plot_max.value)
@@ -2697,6 +2843,7 @@ def run_inversion_calculation(df):
                     "x": heat_times,
                     "y": size_axis,
                     "flow_rel_rmse": heat_flow_rel_rmse,
+                    "part_columns": heat_part_columns,
                 })
 
                 output.append({
@@ -2764,8 +2911,201 @@ def fitLinearFit(x, y):
 def linear(x, m, c):
     return m * x + c
 
+def parsed_coagulation_targets():
+    targets = []
+    for value in str(coagulation_targets_nm.value).replace(";", ",").split(","):
+        try:
+            target = float(value.strip())
+        except ValueError:
+            continue
+        if np.isfinite(target) and target > 0:
+            targets.append(target)
+    return tuple(dict.fromkeys(targets))
+
+
+def scan_polarity_label(polarity):
+    return f"{polarity}-voltage scan"
+
+
+def plot_aerosol_property_diagnostics(result):
+    global latest_aerosol_properties
+    latest_aerosol_properties = diag.build_aerosol_property_diagnostics(
+        result,
+        temperature_k=float(temp_K.value),
+        pressure_pa=float(press_Pa.value),
+        coagulation_targets_nm=parsed_coagulation_targets(),
+        particle_density_kg_m3=float(particle_density_kg_m3.value),
+    )
+    if not latest_aerosol_properties:
+        aerosol_plot.object = None
+        return None
+    fig = make_subplots(
+        rows=6, cols=1, shared_xaxes=True, vertical_spacing=0.04,
+        subplot_titles=(
+            "Measured-range number concentration",
+            "Measured-range mean diameters",
+            "Measured-range geometric standard deviation",
+            "Measured-range particle surface concentration",
+            "Measured-range particle volume concentration",
+            "Size-range-truncated H2SO4 condensation and neutral Brownian coagulation sinks",
+        ),
+    )
+    targets = parsed_coagulation_targets()
+    for item in latest_aerosol_properties:
+        frame = pd.DataFrame(item["rows"])
+        label = f"{method_label(item['method'])} {scan_polarity_label(item['polarity'])}"
+        fig.add_scatter(x=frame["time"], y=frame["number_cm3"], mode="lines+markers", name=f"N {label}", row=1, col=1)
+        fig.add_scatter(x=frame["time"], y=frame["geometric_mean_nm"], mode="lines+markers", name=f"Dg {label}", row=2, col=1)
+        fig.add_scatter(x=frame["time"], y=frame["number_mean_nm"], mode="lines", name=f"Dmean {label}", row=2, col=1)
+        fig.add_scatter(x=frame["time"], y=frame["geometric_std"], mode="lines+markers", name=f"GSD {label}", row=3, col=1)
+        fig.add_scatter(x=frame["time"], y=frame["surface_um2_cm3"], mode="lines+markers", name=f"S {label}", row=4, col=1)
+        fig.add_scatter(x=frame["time"], y=frame["volume_um3_cm3"], mode="lines+markers", name=f"V {label}", row=5, col=1)
+        fig.add_scatter(x=frame["time"], y=frame["condensation_sink_s1"], mode="lines", name=f"CS {label}", row=6, col=1)
+        for target in targets:
+            key = f"coagulation_sink_{target:g}nm_s1"
+            if key in frame:
+                fig.add_scatter(x=frame["time"], y=frame[key], mode="lines", name=f"CoagS({target:g} nm) {label}", row=6, col=1)
+    fig.update_yaxes(title_text="N (cm-3)", type="log", row=1, col=1)
+    fig.update_yaxes(title_text="Diameter (nm)", type="log", row=2, col=1)
+    fig.update_yaxes(title_text="GSD", row=3, col=1)
+    fig.update_yaxes(title_text="S (um2 cm-3)", type="log", row=4, col=1)
+    fig.update_yaxes(title_text="V (um3 cm-3)", type="log", row=5, col=1)
+    fig.update_yaxes(title_text="Sink (s-1)", type="log", row=6, col=1)
+    fig.update_xaxes(title_text="Time", tickformat="%Y-%m-%d %H:%M", row=6, col=1)
+    fig.update_layout(
+        height=2000, width=1300,
+        title=(f"Measured-range aerosol properties at configured T={float(temp_K.value):.2f} K, "
+               f"P={float(press_Pa.value):.0f} Pa; no size extrapolation"),
+        margin=dict(l=70, r=260, t=80, b=50), legend=dict(x=1.02, y=1.0),
+    )
+    aerosol_plot.object = fig
+    return fig
+
+
+def analyze_heatmap_click(click_data, figure, result, mode_setting, min_nm, max_nm):
+    if not click_data or figure is None or not click_data.get("points"):
+        return None
+    point = click_data["points"][0]
+    curve_number = point.get("curveNumber")
+    if curve_number is None or curve_number < 0 or curve_number >= len(figure.data):
+        return None
+    metadata = figure.data[curve_number].meta
+    if not isinstance(metadata, dict) or metadata.get("kind") != "inversion_heatmap":
+        return None
+    trace = next((item for item in result if item.get("kind") == "heatmap"
+                  and item.get("method", "gunn woessner mod") == metadata["method"]
+                  and item.get("polarity") == metadata["polarity"]), None)
+    if trace is None:
+        return None
+    times = pd.DatetimeIndex(pd.to_datetime(trace["x"], errors="coerce"))
+    if len(times) == 0 or times.isna().all():
+        return None
+    clicked_time = pd.Timestamp(point.get("x"))
+    if pd.isna(clicked_time) and not isinstance(
+        point.get("pointNumber", point.get("pointIndex")),
+        (list, tuple, np.ndarray),
+    ):
+        return None
+    if times.tz is not None and clicked_time.tz is None:
+        clicked_time = clicked_time.tz_localize(times.tz)
+    elif times.tz is None and clicked_time.tz is not None:
+        clicked_time = clicked_time.tz_localize(None)
+    point_number = point.get("pointNumber", point.get("pointIndex"))
+    if isinstance(point_number, (list, tuple, np.ndarray)) and len(point_number) == 2:
+        time_index = int(point_number[1])
+    else:
+        time_index = int(np.nanargmin(np.abs((times - clicked_time).total_seconds())))
+    if time_index < 0 or time_index >= len(times):
+        return None
+    sizes = np.asarray(trace["y"], dtype=float)
+    concentration = np.asarray(trace["Z"], dtype=float)[:, time_index]
+    support_by_scan = trace.get("part_columns", [])
+    part_columns = support_by_scan[time_index] if time_index < len(support_by_scan) else None
+    lower, upper = sorted((float(min_nm), float(max_nm)))
+    selected = np.isfinite(sizes) & (sizes >= lower) & (sizes <= upper)
+    selected_parts = (
+        [np.asarray(column, dtype=float)[selected] for column in part_columns]
+        if part_columns is not None else None
+    )
+    fitted = (
+        diag.select_lognormal_mode_fit(
+            sizes[selected], concentration[selected], 3, selected_parts
+        )
+        if str(mode_setting).startswith("Auto")
+        else diag.fit_lognormal_modes(
+            sizes[selected], concentration[selected], int(mode_setting), selected_parts
+        )
+    )
+    fitted.update({
+        "time": times[time_index], "method": metadata["method"],
+        "polarity": metadata["polarity"], "fit_min_nm": lower,
+        "fit_max_nm": upper, "clicked_diameter_nm": float(point.get("y", np.nan)),
+        "moments": diag.distribution_moments(sizes, concentration, part_columns),
+        "condensation_sink_s1": diag.sulfuric_acid_condensation_sink(
+            sizes, concentration, float(temp_K.value), float(press_Pa.value),
+            part_columns),
+        "coagulation_sinks_s1": {
+            f"{target:g}nm": diag.brownian_coagulation_sink(
+                sizes, concentration, target, float(temp_K.value),
+                float(press_Pa.value), float(particle_density_kg_m3.value),
+                part_columns)
+            for target in parsed_coagulation_targets()
+        },
+        "temperature_k": float(temp_K.value),
+        "pressure_pa": float(press_Pa.value),
+        "particle_density_kg_m3": float(particle_density_kg_m3.value),
+        "range_semantics": "observations and moments are measured-range; modal full area is model-extrapolated",
+    })
+    return fitted
+
+
+def render_modal_analysis(analysis, plot_pane=None, status_pane=None):
+    global latest_modal_analysis
+    update_export_cache = plot_pane is None and status_pane is None
+    plot_pane = modal_fit_plot if plot_pane is None else plot_pane
+    status_pane = modal_fit_status if status_pane is None else status_pane
+    if analysis is None:
+        return
+    if update_export_cache:
+        latest_modal_analysis = analysis
+    if analysis.get("status") != "ok":
+        plot_pane.object = None
+        status_pane.object = f"Modal fit failed: {analysis.get('reason', 'unknown reason')}"
+        return
+    fig = go.Figure()
+    fig.add_scatter(x=analysis["diameter_nm"], y=analysis["observed"], mode="markers", name="Observed dN/dlog10Dp")
+    for component, curve in zip(analysis["components"], analysis["curve_components"]):
+        fig.add_scatter(x=analysis["curve_diameter_nm"], y=curve, mode="lines", name=f"Mode {component['component']}: {component['mode_diameter_nm']:.1f} nm")
+    fig.add_scatter(x=analysis["curve_diameter_nm"], y=analysis["curve_total"], mode="lines", line=dict(color="black", width=3, dash="dash"), name="Total modal fit")
+    fig.update_xaxes(type="log", title="Particle diameter (nm)")
+    fig.update_yaxes(title="dN/dlog10Dp (cm-3)")
+    fig.update_layout(title=(f"{method_label(analysis['method'])} {scan_polarity_label(analysis['polarity'])} at "
+                             f"{pd.Timestamp(analysis['time']):%Y-%m-%d %H:%M}; "
+                             f"{analysis['number_of_modes']} mode(s), R2={analysis['r2']:.3f}"), height=650)
+    plot_pane.object = fig
+    moments = analysis.get("moments") or {}
+    mode_text = ", ".join(
+        f"Mode {item['component']}: Dg={item['mode_diameter_nm']:.1f} nm, GSD={item['geometric_std']:.2f}, measured-support fitted N={item['fit_range_area_cm3']:.1f} cm-3"
+        for item in analysis["components"])
+    status_pane.object = (
+        f"**Selected scan:** `{pd.Timestamp(analysis['time'])}`  |  {mode_text}  |  "
+        f"Measured-range N={moments.get('number_cm3', np.nan):.1f} cm-3, "
+        f"S={moments.get('surface_um2_cm3', np.nan):.3g} um2 cm-3, "
+        f"V={moments.get('volume_um3_cm3', np.nan):.3g} um3 cm-3, "
+        f"CS={analysis['condensation_sink_s1']:.3g} s-1.")
+
+
+def on_inversion_heatmap_click(event):
+    if latest_inversion is not None:
+        render_modal_analysis(analyze_heatmap_click(
+            event.new, inversion_plot.object, latest_inversion,
+            modal_fit_modes.value, modal_fit_min_nm.value, modal_fit_max_nm.value))
+
 def plot_inversion_result(result):
-    global latest_growth_diagnostics, latest_growth_settings
+    global latest_growth_diagnostics, latest_growth_settings, latest_modal_analysis
+    latest_modal_analysis = None
+    modal_fit_plot.object = None
+    modal_fit_status.object = "Click an inverted heatmap to inspect and fit that scan's size distribution."
     heatmaps = [tr for tr in result if tr["kind"] == "heatmap"]
     heatmap_keys = [(tr.get("method", "gunn woessner mod"), tr["polarity"]) for tr in heatmaps]
     comparisons = build_scan_smeariii_comparison_heatmaps(result)
@@ -2782,6 +3122,14 @@ def plot_inversion_result(result):
         growth_min_event_scans=int(growth_min_event_scans.value),
         growth_max_rate_nm_h=float(growth_max_rate_nm_h.value),
     )
+    if mcc_cross_check_enabled.value:
+        growth_diagnostics.extend(diag.build_mcc_growth_cross_checks(
+            result,
+            growth_diagnostics,
+            method_label=method_label,
+            maximum_growth_rate_nm_h=float(growth_max_rate_nm_h.value),
+            minimum_correlation=float(mcc_min_correlation.value),
+        ))
     latest_growth_diagnostics = growth_diagnostics
     latest_growth_settings = {
         "models": list(growth_models.value),
@@ -2791,6 +3139,8 @@ def plot_inversion_result(result):
         "max_gap_minutes": float(growth_max_gap_minutes.value),
         "min_event_scans": int(growth_min_event_scans.value),
         "max_rate_nm_h": float(growth_max_rate_nm_h.value),
+        "mcc_enabled": bool(mcc_cross_check_enabled.value),
+        "mcc_min_correlation": float(mcc_min_correlation.value),
         "app_version": APP_VERSION,
     }
     formation_diagnostics = diag.build_formation_rate_diagnostics(
@@ -2888,6 +3238,11 @@ def plot_inversion_result(result):
                 zmin=0,
                 zmax=float(heatmap_clip.value),
                 name=f"{method_label(method)} {tr['polarity']} heatmap",
+                meta={
+                    "kind": "inversion_heatmap",
+                    "method": method,
+                    "polarity": tr["polarity"],
+                },
                 colorbar=dict(title="dN/dlog10Dp", len=0.35),
                 hovertemplate=(
                     "time=%{x|%Y-%m-%d %H:%M}<br>"
@@ -2904,6 +3259,24 @@ def plot_inversion_result(result):
                     and growth_diag["polarity"] == tr["polarity"]
                 ):
                     track_color = GROWTH_MODEL_COLORS[growth_diag["model"]]
+                    if growth_diag["model"].startswith("MCC"):
+                        fig.add_scatter(
+                            x=growth_diag["time"], y=growth_diag["dp"],
+                            mode="lines+markers",
+                            marker=dict(size=7, color=track_color, symbol="diamond"),
+                            line=dict(width=2, dash="dot", color=track_color),
+                            name=f"Event {growth_diag['event_number']} experimental MCC transit",
+                            hovertemplate=(
+                                "observed channel peak time=%{x|%Y-%m-%d %H:%M}<br>"
+                                "channel dp=%{y:.2f} nm<br>"
+                                f"MCC GR={growth_diag['growth_rate']:.2f} nm/h<br>"
+                                f"correlation={growth_diag['correlation']:.3f}<br>"
+                                f"permutation p={growth_diag['permutation_p_value']:.3f}<br>"
+                                f"agreement={growth_diag['agreement']}<extra></extra>"
+                            ),
+                            row=row, col=1,
+                        )
+                        continue
                     fig.add_scatter(
                         x=growth_diag["time"],
                         y=growth_diag["dp"],
@@ -3128,6 +3501,39 @@ def plot_inversion_result(result):
 
     if growth_row is not None:
         for growth_diag in growth_diagnostics:
+            is_mcc = growth_diag["model"].startswith("MCC")
+            if is_mcc:
+                error_y = None
+                customdata = [[
+                    growth_diag["correlation"], growth_diag["permutation_p_value"],
+                    growth_diag["lag_hours"], growth_diag["overlap_fraction"],
+                    growth_diag["agreement"], growth_diag["relative_difference"],
+                ]]
+                hovertemplate = (
+                    "model=%{x}<br>GR=%{y:.2f} nm/h<br>"
+                    "correlation=%{customdata[0]:.3f}<br>permutation p=%{customdata[1]:.3f}<br>"
+                    "lag=%{customdata[2]:.2f} h<br>overlap=%{customdata[3]:.1%}<br>"
+                    "agreement=%{customdata[4]}<br>relative difference=%{customdata[5]:.1%}"
+                    "<extra></extra>"
+                )
+            else:
+                error_y = dict(
+                    type="data", symmetric=False,
+                    array=[max(0.0, growth_diag["slope_p90"] - growth_diag["growth_rate"])],
+                    arrayminus=[max(0.0, growth_diag["growth_rate"] - growth_diag["slope_p10"])],
+                )
+                customdata = [[
+                    growth_diag["r2"], growth_diag["rmse_nm"], growth_diag["n_points"],
+                    growth_diag["duration_hours"], growth_diag["fit_quality"],
+                    growth_diag["background_quality"],
+                ]]
+                hovertemplate = (
+                    "model=%{x}<br>GR=%{y:.2f} nm/h<br>"
+                    "R2=%{customdata[0]:.3f}<br>RMSE=%{customdata[1]:.2f} nm<br>"
+                    "fit points=%{customdata[2]:.0f}<br>duration=%{customdata[3]:.2f} h<br>"
+                    "fit quality=%{customdata[4]}<br>background=%{customdata[5]}<br>"
+                    "whisker=pairwise-slope P10-P90 (not confidence)<extra></extra>"
+                )
             fig.add_scatter(
                 x=[
                     f"Event {growth_diag['event_number']} {growth_diag['model']}<br>"
@@ -3136,28 +3542,13 @@ def plot_inversion_result(result):
                 y=[growth_diag["growth_rate"]],
                 mode="markers",
                 marker=dict(size=12, color=GROWTH_MODEL_COLORS[growth_diag["model"]]),
-                error_y=dict(
-                    type="data",
-                    symmetric=False,
-                    array=[max(0.0, growth_diag["slope_p90"] - growth_diag["growth_rate"])],
-                    arrayminus=[max(0.0, growth_diag["growth_rate"] - growth_diag["slope_p10"])],
-                ),
+                error_y=error_y,
                 name=(
                     f"Event {growth_diag['event_number']} "
                     f"{growth_diag['label']} {growth_diag['model']}"
                 ),
-                customdata=[[
-                    growth_diag["r2"], growth_diag["rmse_nm"], growth_diag["n_points"],
-                    growth_diag["duration_hours"], growth_diag["fit_quality"],
-                    growth_diag["background_quality"],
-                ]],
-                hovertemplate=(
-                    "model=%{x}<br>GR=%{y:.2f} nm/h<br>"
-                    "R2=%{customdata[0]:.3f}<br>RMSE=%{customdata[1]:.2f} nm<br>"
-                    "fit points=%{customdata[2]:.0f}<br>duration=%{customdata[3]:.2f} h<br>"
-                    "fit quality=%{customdata[4]}<br>background=%{customdata[5]}<br>"
-                    "whisker=pairwise-slope P10-P90 (not confidence)<extra></extra>"
-                ),
+                customdata=customdata,
+                hovertemplate=hovertemplate,
                 row=growth_row,
                 col=1,
             )
@@ -4111,6 +4502,7 @@ def run_inversion(event=None):
                 residual_fig = plot_residual_diagnostics(result)
                 diff_fig = plot_difference_diagnostics(result)
                 smps_timing_fig = plot_smps_timing_diagnostics(result)
+                aerosol_fig = plot_aerosol_property_diagnostics(result)
 
                 if auto_checkbox.value:
                     save_data()
@@ -4193,10 +4585,12 @@ def run_inversion(event=None):
                     inversion_fig=fig,
                     residual_fig=residual_fig,
                     smps_timing_fig=smps_timing_fig,
+                    aerosol_fig=aerosol_fig,
                     difference_fig=diff_fig,
                     difference_diagnostics=latest_difference_diagnostics,
                     growth_diagnostics=latest_growth_diagnostics,
                     growth_settings=latest_growth_settings,
+                    aerosol_properties=latest_aerosol_properties,
                     inversion_result=result,
                     status_text=status_text,
                 )
@@ -4289,16 +4683,19 @@ def run_auto_worker():
                 residual_fig = plot_residual_diagnostics(result)
                 diff_fig = plot_difference_diagnostics(result)
                 smps_timing_fig = plot_smps_timing_diagnostics(result)
+                aerosol_fig = plot_aerosol_property_diagnostics(result)
                 save_data()
                 save_auto_state({"last_saved_signature": signature})
                 publish_shared_state(
                     inversion_fig=fig,
                     residual_fig=residual_fig,
                     smps_timing_fig=smps_timing_fig,
+                    aerosol_fig=aerosol_fig,
                     difference_fig=diff_fig,
                     difference_diagnostics=latest_difference_diagnostics,
                     growth_diagnostics=latest_growth_diagnostics,
                     growth_settings=latest_growth_settings,
+                    aerosol_properties=latest_aerosol_properties,
                     inversion_result=result,
                     status_text=str(status.object),
                 )
@@ -4315,6 +4712,7 @@ def run_auto_worker():
 save_button.on_click(save_data)
 invert_button.on_click(run_inversion)
 smps_timing_button.on_click(update_smps_timing_plot)
+inversion_plot.param.watch(on_inversion_heatmap_click, "click_data")
 
 
 for w in [
@@ -4353,6 +4751,13 @@ for w in [
     growth_max_gap_minutes,
     growth_min_event_scans,
     growth_max_rate_nm_h,
+    mcc_cross_check_enabled,
+    mcc_min_correlation,
+    coagulation_targets_nm,
+    particle_density_kg_m3,
+    modal_fit_modes,
+    modal_fit_min_nm,
+    modal_fit_max_nm,
     difference_peak_min_size_nm,
     smallest_size,
     scan_inversion_type,
@@ -4411,6 +4816,9 @@ diagnostic_controls = pn.Column(
         growth_max_rate_nm_h,
     ),
     pn.Row(difference_peak_min_size_nm),
+    pn.Row(mcc_cross_check_enabled, mcc_min_correlation),
+    pn.Row(coagulation_targets_nm, particle_density_kg_m3),
+    pn.Row(modal_fit_modes, modal_fit_min_nm, modal_fit_max_nm),
     pn.Row(smps_timing_offset_min_sec, smps_timing_offset_max_sec, smps_timing_offset_step_sec, smps_timing_match_tolerance_min),
 )
 
@@ -4433,6 +4841,8 @@ controls = pn.Column(
 plot_tabs = pn.Tabs(
     ("Raw Data", pn.Column(raw_plot)),
     ("Inversion", pn.Column(inversion_plot)),
+    ("Clicked Distribution", pn.Column(modal_fit_status, modal_fit_plot)),
+    ("Aerosol Properties", pn.Column(aerosol_plot)),
     ("Residuals", pn.Column(residual_plot)),
     ("SMPS Timing", pn.Column(smps_timing_plot)),
     ("Difference Diagnostics", pn.Column(difference_plot)),
