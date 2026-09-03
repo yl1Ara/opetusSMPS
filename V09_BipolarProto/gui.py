@@ -2701,7 +2701,7 @@ health_thread.start()
 
 def _termination_handler(signum, frame):
     safe_shutdown(signal.Signals(signum).name)
-    raise SystemExit(128 + signum)
+    raise SystemExit(0)
 
 
 if threading.current_thread() is threading.main_thread():

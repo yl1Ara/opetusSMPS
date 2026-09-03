@@ -61,10 +61,11 @@ def main():
             max_voltage=settings.get("spellman_max_voltage", 30000),
         )
 
-    attempt("Spellman connect", connect_spellman)
-    if spellman is not None:
-        attempt("Spellman zero", spellman.zero)
-        attempt("Spellman disable", spellman.disable)
+    if settings.get("hv_source") == "Monopolar Spellman":
+        attempt("Spellman connect", connect_spellman)
+        if spellman is not None:
+            attempt("Spellman zero", spellman.zero)
+            attempt("Spellman disable", spellman.disable)
 
     if errors:
         print("Force-safe completed with errors: " + "; ".join(errors), flush=True)
