@@ -2,17 +2,15 @@
 set -euo pipefail
 
 usage() {
-    printf 'Usage: %s --origin HOST[:PORT] [--viewer-origin HOST:PORT] [--state-dir PATH] [--user USER]\n' "$0"
+    printf 'Usage: %s --origin HOST[:PORT] [--state-dir PATH] [--user USER]\n' "$0"
 }
 
 user_name="${SUDO_USER:-$USER}"
 main_origin=""
-viewer_origin=""
 state_dir=""
 while (($#)); do
     case "$1" in
         --origin) main_origin="${2:?missing origin}"; shift 2 ;;
-        --viewer-origin) viewer_origin="${2:?missing viewer origin}"; shift 2 ;;
         --state-dir) state_dir="${2:?missing state directory}"; shift 2 ;;
         --user) user_name="${2:?missing user}"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
@@ -24,16 +22,6 @@ if [[ ! "${main_origin}" =~ ^([A-Za-z0-9-]+\.)*[A-Za-z0-9-]+(:[0-9]{1,5})?$ ]]; 
     printf 'Use an exact websocket origin such as host.example.ts.net (no scheme, path, or wildcard).\n' >&2
     exit 2
 fi
-if [[ -z "${viewer_origin}" && "${main_origin}" == *:* ]]; then
-    printf -- '--viewer-origin is required when --origin includes a port.\n' >&2
-    exit 2
-fi
-viewer_origin="${viewer_origin:-${main_origin}:8443}"
-if [[ ! "${viewer_origin}" =~ ^([A-Za-z0-9-]+\.)*[A-Za-z0-9-]+(:[0-9]{1,5})?$ ]]; then
-    printf 'Invalid viewer websocket origin.\n' >&2
-    exit 2
-fi
-
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 app_dir="$(cd -- "${script_dir}/.." && pwd)"
 repo_root="$(git -C "${app_dir}" rev-parse --show-toplevel)"
@@ -66,14 +54,13 @@ uv pip install --python "${app_dir}/.venv/bin/python" -r requirements-hardware.t
 
 config_tmp="$(mktemp)"
 trap 'rm -f "${config_tmp}"' EXIT
-printf 'APP_DIR="%s"\nDMPS_STATE_DIR="%s"\nDMPS_WEBSOCKET_ORIGIN_MAIN="%s"\nDMPS_WEBSOCKET_ORIGIN_VIEWER="%s"\n' \
-    "${app_dir}" "${state_dir}" "${main_origin}" "${viewer_origin}" >"${config_tmp}"
+printf 'APP_DIR="%s"\nDMPS_STATE_DIR="%s"\nDMPS_WEBSOCKET_ORIGIN_MAIN="%s"\n' \
+    "${app_dir}" "${state_dir}" "${main_origin}" >"${config_tmp}"
 
 sudo install -d -o root -g root -m 0755 /etc/dmps /usr/local/libexec
 sudo install -o root -g root -m 0644 "${config_tmp}" "/etc/dmps/${user_name}.env"
 sudo install -o root -g root -m 0755 "${script_dir}/run-panel.sh" /usr/local/libexec/dmps-run-panel
 sudo install -o root -g root -m 0644 "${script_dir}/tdmps@.service" /etc/systemd/system/tdmps@.service
-sudo install -o root -g root -m 0644 "${script_dir}/tdmps-viewer@.service" /etc/systemd/system/tdmps-viewer@.service
 sudo install -o root -g root -m 0644 "${script_dir}/tdmps-serve@.service" /etc/systemd/system/tdmps-serve@.service
 install -d -m 0755 "${HOME}/bin"
 install -m 0755 "${script_dir}/dmps" "${HOME}/bin/dmps"
@@ -83,10 +70,9 @@ if ! command grep -qxF 'source ~/.dmps-complete' "${HOME}/.bashrc"; then
 fi
 
 sudo systemctl daemon-reload
-sudo systemctl enable --now "tdmps@${user_name}.service" "tdmps-viewer@${user_name}.service"
+sudo systemctl disable --now "tdmps-viewer@${user_name}.service" >/dev/null 2>&1 || true
+sudo systemctl enable --now "tdmps@${user_name}.service"
 "${HOME}/bin/dmps" health
-"${HOME}/bin/dmps" viewer health
 
 printf 'Installed TDMPS from %s\n' "${app_dir}"
 printf 'Main:   http://127.0.0.1:5006/gui\n'
-printf 'Viewer: http://127.0.0.1:5007/offline_inversion_viewer\n'

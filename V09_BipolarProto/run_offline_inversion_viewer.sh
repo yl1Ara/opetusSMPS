@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-config="/etc/dmps/${USER}.env"
-if [[ ! -r "${config}" ]]; then
-    printf 'Missing %s; run deploy/install-services.sh first.\n' "${config}" >&2
-    exit 1
-fi
-source "${config}"
-exec "${APP_DIR}/deploy/run-panel.sh" viewer
+app_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+origin="${OFFLINE_VIEWER_ORIGIN:-localhost:5007}"
+
+cd "${app_dir}"
+exec uv run panel serve offline_inversion_viewer.py \
+    --address 127.0.0.1 \
+    --port 5007 \
+    --allow-websocket-origin "127.0.0.1:5007" \
+    --allow-websocket-origin "${origin}"

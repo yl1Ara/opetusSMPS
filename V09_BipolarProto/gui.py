@@ -11,6 +11,8 @@ from collections import deque
 from plotly.subplots import make_subplots
 import threading
 import traceback
+import os
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from DmpsControl.tuning import aerosol_factor_from_pressures
 
@@ -66,6 +68,7 @@ cpc_diag_executor = ThreadPoolExecutor(max_workers=1)
 spellman_executor = ThreadPoolExecutor(max_workers=1)
 tuning_executor = ThreadPoolExecutor(max_workers=1)
 calibration_executor = ThreadPoolExecutor(max_workers=1)
+git_executor = ThreadPoolExecutor(max_workers=1)
 
 # Run manually or from a service with panel serve, for example:
 # uv run panel serve gui.py --address 0.0.0.0 --port 5006
@@ -92,6 +95,9 @@ tuning_result_lock = threading.Lock()
 pending_tuning_result = None
 tool_ui_updates = deque()
 calibration_running = threading.Event()
+git_check_running = threading.Event()
+last_git_check_time = 0.0
+GIT_CHECK_INTERVAL_SEC = 15 * 60
 
 pn.extension("plotly")
 
@@ -247,6 +253,10 @@ polarity_switch_time = pn.widgets.IntInput(
     name="Polarity switch time (s) ", value=0, step=1
 )
 status_text = pn.pane.Markdown("Status: idle")
+git_update_status = pn.pane.Alert(
+    "Software update: checking Git...", alert_type="info", sizing_mode="stretch_width"
+)
+git_update_button = pn.widgets.Button(name="Check updates", button_type="light", width=130)
 current_cpc_pane = pn.pane.Markdown("Current CPC: -")
 current_flow_pane = pn.pane.Markdown("Current sheath flow: -")
 current_hv_pane = pn.pane.Markdown("Current HV: -")
@@ -1311,6 +1321,10 @@ def drain_ui_updates():
             aerosol_calibration_status.object = f"Aerosol calibration failed: {update['message']}"
         elif kind == "calibration_finished":
             aerosol_calibration_button.disabled = False
+        elif kind == "git_status":
+            git_update_status.object = update["message"]
+            git_update_status.alert_type = update["alert_type"]
+            git_update_button.disabled = False
 
     value, age, duration, error, sample_id, _ = latest_cpc_snapshot()
     cpc_value = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
@@ -1375,6 +1389,75 @@ def drain_ui_updates():
         refresh_live_plot()
 
     maybe_run_auto_cpc_diagnostics()
+    maybe_check_git_update()
+
+
+def git_output(*arguments):
+    environment = os.environ.copy()
+    environment["GIT_TERMINAL_PROMPT"] = "0"
+    environment["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes -o ConnectTimeout=10"
+    result = subprocess.run(
+        ["git", "-C", str(Path(__file__).resolve().parent), *arguments],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=environment,
+    )
+    return result.stdout.strip()
+
+
+def check_git_update_blocking():
+    try:
+        git_output("fetch", "--quiet", "--prune", "origin")
+        branch = git_output("branch", "--show-current") or "main"
+        local_revision = git_output("rev-parse", "--short", "HEAD")
+        remote_ref = f"origin/{branch}"
+        remote_revision = git_output("rev-parse", "--short", remote_ref)
+        ahead, behind = [
+            int(value)
+            for value in git_output("rev-list", "--left-right", "--count", f"HEAD...{remote_ref}").split()
+        ]
+        if behind:
+            message = (
+                f"**Software update available:** `{local_revision}` -> `{remote_revision}` "
+                f"({behind} commit{'s' if behind != 1 else ''}). Stop measurement and use "
+                "**Stop and zero HV**, then run `dmps update` and refresh this page."
+            )
+            alert_type = "warning"
+        elif ahead:
+            message = f"Software: local `{local_revision}` is {ahead} commit(s) ahead of `{remote_ref}`."
+            alert_type = "warning"
+        else:
+            message = f"Software is up to date: `{local_revision}`."
+            alert_type = "success"
+        tool_ui_updates.append({"kind": "git_status", "message": message, "alert_type": alert_type})
+    except Exception as error:
+        tool_ui_updates.append({
+            "kind": "git_status",
+            "message": f"Software update check unavailable: `{error}`",
+            "alert_type": "light",
+        })
+    finally:
+        git_check_running.clear()
+
+
+def maybe_check_git_update(force=False):
+    global last_git_check_time
+
+    now = time.monotonic()
+    if git_check_running.is_set() or (not force and now - last_git_check_time < GIT_CHECK_INTERVAL_SEC):
+        return
+    last_git_check_time = now
+    git_check_running.set()
+    git_update_button.disabled = True
+    git_executor.submit(check_git_update_blocking)
+
+
+def check_git_update_now(event=None):
+    git_update_status.object = "Software update: checking Git..."
+    git_update_status.alert_type = "info"
+    maybe_check_git_update(force=True)
 
 
 def ensure_measurement_thread():
@@ -2206,6 +2289,7 @@ def startup_load():
         print("No startup scans found", flush=True)
 
     refresh_live_plot(force=True)
+    maybe_check_git_update(force=True)
 
     if ui_callback is None:
         ui_callback = pn.state.add_periodic_callback(drain_ui_updates, period=500, start=True)
@@ -2274,12 +2358,14 @@ sheath_tune_start_button.on_click(start_sheath_tuning)
 sheath_tune_cancel_button.on_click(cancel_sheath_tuning)
 sheath_tune_apply_button.on_click(apply_sheath_tuning_result)
 aerosol_calibration_button.on_click(start_aerosol_calibration)
+git_update_button.on_click(check_git_update_now)
 
 update_scan_preview()
 
 #### Layout ####
 control_layout = pn.Column(
     "# DMA / CPC Control GUI",
+    pn.Row(git_update_status, git_update_button, sizing_mode="stretch_width"),
     pn.Row(cpc_com_port, cpc_type),
     pn.Row(hv_source, spellman_port, spellman_baud, spellman_max_voltage),
     pn.Row(aerosol_flow_enabled, aerosol_flow_i2c_bus, aerosol_flow_i2c_address, aerosol_flow_calibration),

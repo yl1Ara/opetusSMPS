@@ -1,11 +1,11 @@
 # Customer deployment
 
-This deployment keeps both applications in one SSH-cloned monorepo checkout:
+This deployment keeps all source files in one SSH-cloned monorepo checkout, but runs only the hardware GUI on an instrument Raspberry Pi:
 
 - Hardware GUI: `gui.py`, systemd `tdmps@USER.service`, localhost port 5006
-- Offline viewer: `offline_inversion_viewer.py`, systemd `tdmps-viewer@USER.service`, localhost port 5007
+- Offline inversion files remain available for deployment on a separate analysis computer; they are not started on the Pi.
 
-Both services restart after process failures so their web interfaces remain available. Restarting the hardware web process does not automatically initialize hardware or resume a scan. Both servers bind only to localhost and accept only their configured exact websocket origins; wildcards are not used.
+The hardware service restarts after process failures so its web interface remains available. Restarting the web process does not automatically initialize hardware or resume a scan. The server binds only to localhost and accepts only its configured exact websocket origin; wildcards are not used.
 
 ## SSH deploy key
 
@@ -60,29 +60,25 @@ deploy/install-services.sh --origin customer-host.tailnet-name.ts.net --state-di
 
 The services then load code and dependencies from the Git checkout but retain `settings.json`, `settings_inversion.json`, `logs/`, and viewer state under the state directory.
 
-The default viewer origin is the same host on port 8443. Override it with `--viewer-origin HOST:PORT` if the proxy uses another exact origin. The installer creates `.venv`, synchronizes locked application dependencies plus Raspberry Pi hardware dependencies, syntax-checks both applications, installs the units and `dmps`, enables both application services, and verifies both localhost health endpoints.
+The installer creates `.venv`, synchronizes locked application dependencies plus Raspberry Pi hardware dependencies, syntax-checks the sources, installs `dmps`, enables only the hardware service, and verifies its localhost health endpoint.
 
 ## Operations and updates
 
 ```bash
 dmps status
 dmps health
-dmps viewer status
-dmps viewer health
-dmps viewer stop
-dmps viewer start
 dmps update
 ```
 
-`dmps update` operates on the complete monorepo. It refuses a dirty tree, refuses a non-fast-forward pull, and repeatedly inspects the shared live Panel document to refuse an active measurement. If measurement state cannot be verified, it fails closed. It then runs `git fetch --prune origin`, `git pull --ff-only`, dependency synchronization, and Python syntax checks before restarting only services that were already running. Every restarted service must pass its localhost HTTP health check. A failed dependency or syntax check leaves existing service processes running and does not restart them. If a measurement is started during the update, the final guard leaves the updated main service process running without restarting it and reports failure.
+`dmps update` operates on the complete monorepo. It refuses a dirty tree, refuses a non-fast-forward pull, and repeatedly inspects the shared live Panel document to refuse an active measurement. If measurement state cannot be verified, it fails closed. It then runs `git fetch --prune origin`, `git pull --ff-only`, dependency synchronization, and Python syntax checks before restarting the hardware service if it was already running. The restarted service must pass its localhost HTTP health check. A failed dependency or syntax check leaves the existing process running and does not restart it. If a measurement is started during the update, the final guard leaves the updated main service process running without restarting it and reports failure.
 
 Stop a measurement in the GUI and confirm it is idle before updating. Do not schedule `dmps update` from cron or a systemd timer. Do not manually run a second hardware GUI beside `tdmps@USER.service`.
 
-Service logs are available with `dmps log` and `dmps viewer log`. The existing `tdmps@USER.service` name is retained for compatibility; the viewer follows it as `tdmps-viewer@USER.service`.
+Service logs are available with `dmps log`. The existing `tdmps@USER.service` name is retained for compatibility.
 
 ## Tailscale exposure
 
-The application services remain localhost-only. To expose them to the tailnet, install and authenticate Tailscale, then enable the supplied proxy unit:
+The hardware service remains localhost-only. To expose it to the tailnet, install and authenticate Tailscale, then enable the supplied proxy unit:
 
 ```bash
 sudo tailscale up
@@ -91,11 +87,10 @@ tailscale serve status
 dmps url
 ```
 
-The default routes are:
+The route is:
 
 ```text
 https://customer-host.tailnet-name.ts.net/gui
-https://customer-host.tailnet-name.ts.net:8443/offline_inversion_viewer
 ```
 
 Use Tailscale ACLs/grants to limit customer access. Do not open ports 5006 or 5007 in the host firewall and do not bind Panel to `0.0.0.0`.
@@ -117,3 +112,14 @@ deploy/install-services.sh --origin "$(tailscale status --json | python3 -c 'imp
 The installer intentionally refuses to proceed while the legacy service is active, preventing two hardware controllers from binding the same port or opening the same devices. Keep the old directory as a backup until the new main GUI, offline viewer, settings, and historical logs have been verified.
 
 The repository no longer tracks Python bytecode. Commit the accompanying `__pycache__` deletions and `.gitignore` update before cloning customer systems; otherwise imported bytecode can make future pulls dirty.
+
+## Offline inversion computer
+
+Run inversion on a separate analysis computer, not on the instrument Pi. The repository still includes `offline_inversion_viewer.py`, `DMPS_inversion_gui/`, and `run_offline_inversion_viewer.sh`. On the analysis computer:
+
+```bash
+cd ~/opetusSMPS/V09_BipolarProto
+./run_offline_inversion_viewer.sh
+```
+
+Set `OFFLINE_VIEWER_ORIGIN=analysis-host.example:5007` when accessing it through another exact hostname. The launcher binds only to localhost by default; use a separate authenticated proxy or SSH forwarding for remote access.
