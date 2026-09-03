@@ -1,0 +1,17 @@
+[Unit]
+Description=TDMPS offline inversion viewer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+EnvironmentFile=/etc/dmps/%i.env
+ExecStart=/usr/bin/env /usr/local/libexec/dmps-run-panel viewer
+Restart=on-failure
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,15 @@
+[Unit]
+Description=Tailscale Serve for TDMPS applications
+After=tailscaled.service tdmps@%i.service tdmps-viewer@%i.service
+Wants=tailscaled.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/tailscale serve --bg --https=443 http://127.0.0.1:5006
+ExecStart=/usr/bin/tailscale serve --bg --https=8443 http://127.0.0.1:5007
+ExecStop=/usr/bin/tailscale serve --https=443 off
+ExecStop=/usr/bin/tailscale serve --https=8443 off
+
+[Install]
+WantedBy=multi-user.target

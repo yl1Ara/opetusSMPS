@@ -3,6 +3,8 @@ from .hardware import HaukeDMA
 import time
 import spidev
 import RPi.GPIO as GPIO
+import serial
+import threading
 
 
 pin_sclk = 23
@@ -203,6 +205,111 @@ def test():
 
 def zero():
     write_dac8551(32705)  # 0 V
+
+
+class SpellmanHV:
+    STATUS_BITS = {
+        0: "Enabled",
+        1: "Fault",
+        2: "Over voltage",
+        3: "Over current",
+        4: "Over temperature",
+        5: "Supply rail out of range",
+        6: "HW enable",
+        7: "SW enable",
+    }
+
+    def __init__(self, port="/dev/ttyUSB0", baud=9600, max_voltage=30000.0):
+        self.port = port
+        self.baud = int(baud)
+        self.max_voltage = float(max_voltage)
+        self.lock = threading.Lock()
+        self.voltage = 0.0
+
+    def checksum(self, body):
+        total = 0
+        for char in body:
+            total += ord(char)
+        total = 0x200 - total
+        total = total | 0x40
+        total = total & 0x7F
+        return total
+
+    def command(self, body):
+        cmd = chr(2) + body + f"{self.checksum(body):X}" + chr(10)
+        with self.lock:
+            ser = None
+            try:
+                ser = serial.Serial(
+                    self.port,
+                    self.baud,
+                    timeout=1,
+                    write_timeout=1,
+                    bytesize=serial.EIGHTBITS,
+                    parity=serial.PARITY_NONE,
+                    stopbits=serial.STOPBITS_ONE,
+                )
+                ser.write(cmd.encode("ascii"))
+                ser.flush()
+                return ser.readline()
+            finally:
+                if ser is not None:
+                    time.sleep(0.1)
+                    ser.close()
+
+    def clear_faults(self):
+        return self.command("0106CF=1")
+
+    def enable(self):
+        return self.command("0106EN=1")
+
+    def disable(self):
+        return self.command("0106EN=0")
+
+    def set_voltage(self, voltage):
+        voltage = max(0.0, min(self.max_voltage, abs(float(voltage))))
+        body = "0106V1=" + f"{voltage:07.1f}"
+        self.command(body)
+        self.voltage = voltage
+
+    def voltage_set(self, dp, Q_sh_lpm=10.0):
+        self.set_voltage(voltage_from_size(abs(float(dp)), Q_sh_lpm=Q_sh_lpm))
+
+    def zero(self):
+        self.set_voltage(0.0)
+
+    def get_voltage(self):
+        try:
+            res = self.command("0106M0?")
+            text = res.decode("ascii", errors="ignore") if isinstance(res, bytes) else str(res)
+            idx = text.find("M0=")
+            if idx < 0:
+                return self.voltage
+            value = ""
+            for char in text[idx + 3:]:
+                if char in "0123456789.-":
+                    value += char
+                else:
+                    break
+            return float(value) if value else self.voltage
+        except Exception:
+            return self.voltage
+
+    def get_status(self):
+        res = self.command("0106SR?")
+        text = res.decode("ascii", errors="ignore") if isinstance(res, bytes) else str(res)
+        idx = text.find("SR=")
+        if idx < 0:
+            return None
+        raw = text[idx + 3: idx + 7]
+        if len(raw) < 4:
+            return None
+        value = int(raw, 16) & 0xFF
+        return {
+            "raw": raw,
+            "value": value,
+            "bits": {name: bool(value & (1 << bit)) for bit, name in self.STATUS_BITS.items()},
+        }
 
 def hv():
     write_dac8551(32000)  # -137 V

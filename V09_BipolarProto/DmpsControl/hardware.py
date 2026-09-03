@@ -1,5 +1,4 @@
 from GP8XXX_IIC import GP8403
-from GP8XXX_IIC import GP8403
 import serial
 import time
 import smbus2
@@ -41,6 +40,31 @@ class CPC:
                 self.ser.write(b"RB\r")
             line = self.ser.readline().decode("utf-8", errors="replace").strip()
         return line if line else "nan"
+
+    def query(self, command, read_lines=1, reset_input=True):
+        cmd = str(command).strip()
+        if not cmd:
+            raise ValueError("CPC command is empty")
+
+        with self.lock:
+            if reset_input:
+                self.ser.reset_input_buffer()
+            payload = cmd.encode("ascii", errors="replace")
+            if not payload.endswith((b"\r", b"\n")):
+                payload += b"\r"
+            self.ser.write(payload)
+            self.ser.flush()
+
+            lines = []
+            for _ in range(max(1, int(read_lines))):
+                line = self.ser.readline().decode("utf-8", errors="replace").strip()
+                lines.append(line)
+                if not line:
+                    break
+
+        return "\n".join(lines).strip()
+
+
 class HaukeDMA:
     def __init__(self):
         self.r1 = 0.025
@@ -72,6 +96,7 @@ class Flowmeter:
     def __init__(self):
         self.bus = smbus2.SMBus(I2C_BUS)
         self.flow = 0.0
+        self.sample_monotonic = None
 
         self.start_measurement()
 
@@ -113,9 +138,70 @@ class Flowmeter:
     def step(self):
         raw = self.read_word()
         self.flow = (raw - OFFSET) / SCALE_FACTOR
+        self.sample_monotonic = time.monotonic()
 
     def get_flow(self):
         return self.flow
+
+    def get_sample(self):
+        return self.flow, self.sample_monotonic
+
+
+class AerosolFlowmeter:
+    """Cached SDP8xx pressure, temperature, and calibrated aerosol flow."""
+
+    def __init__(self, bus=1, address=0x25, calibration_lpm_per_pa=0.15228426395939088):
+        # Keep this optional hardware dependency out of normal startup/imports.
+        from sensirion_i2c_driver import I2cConnection, LinuxI2cTransceiver
+        from sensirion_i2c_sdp import SdpI2cDevice
+
+        transceiver = LinuxI2cTransceiver(f"/dev/i2c-{int(bus)}")
+        connection = I2cConnection(transceiver)
+        self.device = SdpI2cDevice(connection, slave_address=int(address))
+        self.calibration = float(calibration_lpm_per_pa)
+        self.lock = threading.Lock()
+        self.io_lock = threading.Lock()
+        self.pressure_pa = float("nan")
+        self.temperature_c = float("nan")
+        try:
+            self.device.stop_continuous_measurement()
+        except Exception:
+            pass
+        self.device.start_continuous_measurement_with_mass_flow_t_comp()
+        time.sleep(0.01)
+        self.step()
+
+    def step(self):
+        with self.io_lock:
+            pressure, temperature = self.device.read_measurement()
+        with self.lock:
+            self.pressure_pa = float(pressure.pascal)
+            self.temperature_c = float(temperature.degrees_celsius)
+
+    def snapshot(self):
+        with self.lock:
+            pressure = self.pressure_pa
+            temperature = self.temperature_c
+        return self.calibration * pressure, pressure, temperature
+
+    def read_pressure_samples(self, count=10, interval_sec=0.5, cancel_event=None):
+        pressures = []
+        for index in range(max(1, int(count))):
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("Aerosol calibration cancelled")
+            self.step()
+            _, pressure, _ = self.snapshot()
+            pressures.append(pressure)
+            if index + 1 < count:
+                time.sleep(max(0.05, float(interval_sec)))
+        return pressures
+
+    def close(self):
+        try:
+            with self.io_lock:
+                self.device.stop_continuous_measurement()
+        except Exception:
+            pass
 
 
 class PicoValve:

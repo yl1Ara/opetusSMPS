@@ -1,4 +1,10 @@
 V09_BipolarProto/logs/
+V09_BipolarProto/.venv/
+V09_BipolarProto/**/__pycache__/
+V09_BipolarProto/settings.json
+V09_BipolarProto/settings_broken.json
+V09_BipolarProto/.session_inversion_settings/
+V09_BipolarProto/auto_inversion_state.json
 V09_BipolarProto/settings_inversion.json
 V09_BipolarProto/saved_inversions/
 V09_BipolarProto/SMEARIII/

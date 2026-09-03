@@ -1,6 +1,7 @@
-panel 
-pandas 
-time
-DmpsControl 
+-r requirements-hardware.txt
 numpy
+pandas
+panel
 plotly
+requests
+scipy

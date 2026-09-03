@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+user_name="${USER}"
+config="/etc/dmps/${user_name}.env"
+if [[ ! -r "${config}" ]]; then
+    printf 'Missing %s; run deploy/install-services.sh first.\n' "${config}" >&2
+    exit 1
+fi
+# The root-owned installer config supplies APP_DIR and exact public origins.
+source "${config}"
+
+main_service="tdmps@${user_name}.service"
+viewer_service="tdmps-viewer@${user_name}.service"
+
+health_url() {
+    case "$1" in
+        main) printf 'http://127.0.0.1:5006/gui' ;;
+        viewer) printf 'http://127.0.0.1:5007/offline_inversion_viewer' ;;
+    esac
+}
+
+service_for() {
+    case "$1" in
+        main) printf '%s' "${main_service}" ;;
+        viewer) printf '%s' "${viewer_service}" ;;
+    esac
+}
+
+check_health() {
+    local kind="$1" service url attempt
+    service="$(service_for "${kind}")"
+    url="$(health_url "${kind}")"
+    systemctl is-active --quiet "${service}"
+    for attempt in {1..30}; do
+        if curl --fail --silent --show-error --output /dev/null "${url}"; then
+            printf '%s healthy: %s\n' "${kind}" "${url}"
+            return 0
+        fi
+        sleep 1
+    done
+    printf '%s failed its health check: %s\n' "${kind}" "${url}" >&2
+    return 1
+}
+
+control() {
+    local kind="$1" action="$2" service
+    service="$(service_for "${kind}")"
+    case "${action}" in
+        start|stop|restart) sudo systemctl "${action}" "${service}" ;;
+        status) systemctl --no-pager --full status "${service}" ;;
+        health) check_health "${kind}" ;;
+        log|logs) journalctl -u "${service}" -f ;;
+        *) printf 'Unknown %s command: %s\n' "${kind}" "${action}" >&2; exit 2 ;;
+    esac
+}
+
+measurement_is_idle() {
+    if ! systemctl is-active --quiet "${main_service}"; then
+        return 0
+    fi
+    "${APP_DIR}/.venv/bin/python" "${APP_DIR}/deploy/check-measurement-idle.py" \
+        "$(health_url main)"
+}
+
+sync_runtime_files() {
+    sudo install -o root -g root -m 0755 "${APP_DIR}/deploy/run-panel.sh" /usr/local/libexec/dmps-run-panel
+    sudo install -o root -g root -m 0644 "${APP_DIR}/deploy/tdmps@.service" /etc/systemd/system/tdmps@.service
+    sudo install -o root -g root -m 0644 "${APP_DIR}/deploy/tdmps-viewer@.service" /etc/systemd/system/tdmps-viewer@.service
+    sudo install -o root -g root -m 0644 "${APP_DIR}/deploy/tdmps-serve@.service" /etc/systemd/system/tdmps-serve@.service
+    install -m 0755 "${APP_DIR}/deploy/dmps" "${HOME}/bin/dmps"
+    install -m 0644 "${APP_DIR}/deploy/dmps-completion.bash" "${HOME}/.dmps-complete"
+    sudo systemctl daemon-reload
+}
+
+update_app() {
+    local repo_root main_was_active=false viewer_was_active=false
+    repo_root="$(git -C "${APP_DIR}" rev-parse --show-toplevel)"
+    if [[ -n "$(git -C "${repo_root}" status --porcelain --untracked-files=normal)" ]]; then
+        printf 'Refusing update: repository has tracked or untracked changes.\n' >&2
+        git -C "${repo_root}" status --short >&2
+        return 1
+    fi
+    if ! measurement_is_idle; then
+        printf 'Refusing update: measurement is active or its state could not be verified.\n' >&2
+        return 1
+    fi
+    systemctl is-active --quiet "${main_service}" && main_was_active=true
+    systemctl is-active --quiet "${viewer_service}" && viewer_was_active=true
+
+    git -C "${repo_root}" fetch --prune origin
+    if ! measurement_is_idle; then
+        printf 'Refusing update after fetch: measurement is active or its state could not be verified.\n' >&2
+        return 1
+    fi
+    git -C "${repo_root}" pull --ff-only
+    cd "${APP_DIR}"
+    uv sync --locked
+    uv pip install --python "${APP_DIR}/.venv/bin/python" -r requirements-hardware.txt
+    "${APP_DIR}/.venv/bin/python" deploy/compile-check.py gui.py offline_inversion_viewer.py DMPS_inversion_gui DmpsControl inv_funcs
+    sync_runtime_files
+
+    if [[ "${main_was_active}" == true ]]; then
+        if ! measurement_is_idle; then
+            printf 'Update installed but main service was not restarted: a measurement started during the update.\n' >&2
+            return 1
+        fi
+        sudo systemctl restart "${main_service}"
+        check_health main
+    fi
+    if [[ "${viewer_was_active}" == true ]]; then
+        sudo systemctl restart "${viewer_service}"
+        check_health viewer
+    fi
+    printf 'Update complete. Services that were stopped remain stopped.\n'
+}
+
+case "${1:-help}" in
+    start|stop|restart|status|health|log|logs) control main "$1" ;;
+    viewer) control viewer "${2:-status}" ;;
+    update) update_app ;;
+    process|ps) systemctl show "${main_service}" -p MainPID -p NRestarts -p ActiveState -p SubState ;;
+    url) printf 'Main: https://%s/gui\nViewer: https://%s/offline_inversion_viewer\n' "${DMPS_WEBSOCKET_ORIGIN_MAIN}" "${DMPS_WEBSOCKET_ORIGIN_VIEWER}" ;;
+    shell) cd "${APP_DIR}"; exec "${SHELL:-/bin/bash}" ;;
+    help|-help|--help|-h)
+        cat <<'EOF'
+Usage:
+  dmps start|stop|restart|status|health|log
+  dmps viewer start|stop|restart|status|health|log
+  dmps update       Fast-forward a clean, idle checkout and safely restart
+  dmps process      Show the main service process state
+  dmps url          Print configured Tailscale URLs
+  dmps shell        Open a shell in V09_BipolarProto
+EOF
+        ;;
+    *) printf "Unknown command. Run 'dmps help'.\n" >&2; exit 2 ;;
+esac

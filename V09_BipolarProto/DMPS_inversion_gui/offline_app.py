@@ -46,7 +46,7 @@ DEFAULT_SETTINGS = {
     "scan_end_time": "23:59",
     "loaded_time_window_min": [0, 1440],
     "auto_interval_min": 30,
-    "auto_file_age_sec": 120,
+    "auto_file_age_sec": 2,
     "daily_overwrite": True,
     "dma_L": 0.28,
     "dma_r1": 0.025,
@@ -557,22 +557,69 @@ def apply_smps_size_shift(df):
     return df
 
 
-def apply_smps_size_step_shift(y_series):
-    if scan_inversion_type.value != "SMPS":
-        return y_series
-
+def smps_size_step_shift_value():
     try:
-        shift = int(smps_size_step_shift.value)
+        return int(smps_size_step_shift.value)
     except Exception:
-        shift = int(DEFAULT_SETTINGS["smps_size_step_shift"])
+        return int(DEFAULT_SETTINGS["smps_size_step_shift"])
 
-    if shift == 0 or len(y_series) < 2:
-        return y_series
 
-    y_series = y_series.sort_index()
-    values = y_series.to_numpy(dtype=float)
-    source_indices = np.clip(np.arange(len(values)) + shift, 0, len(values) - 1)
-    return pd.Series(values[source_indices], index=y_series.index, name=y_series.name)
+def build_cpc_series_for_inversion(d):
+    if scan_inversion_type.value != "SMPS":
+        return d.groupby("abs_size_nm")["cpc_float"].mean()
+
+    shift = smps_size_step_shift_value()
+    if shift == 0:
+        return d.groupby("abs_size_nm")["cpc_float"].mean()
+
+    sizes = np.asarray(sorted(d["abs_size_nm"].dropna().unique()), dtype=float)
+    if len(sizes) < 2:
+        return d.groupby("abs_size_nm")["cpc_float"].mean()
+
+    size_to_index = {size: i for i, size in enumerate(sizes)}
+    parts = []
+
+    if "phase" in d.columns:
+        final_hold = d[d["phase"].astype(str).str.lower() == "final_hold"].copy()
+        normal = d.drop(index=final_hold.index)
+    else:
+        final_hold = d.iloc[0:0].copy()
+        normal = d
+
+    averaged = normal.groupby("abs_size_nm")["cpc_float"].mean()
+    for size, value in averaged.items():
+        source_index = size_to_index.get(float(size))
+        if source_index is None:
+            continue
+        target_index = int(np.clip(source_index - shift, 0, len(sizes) - 1))
+        parts.append({"abs_size_nm": sizes[target_index], "cpc_float": value})
+
+    if not final_hold.empty:
+        if "cpc_sample_id" in final_hold.columns:
+            hold_ids = pd.to_numeric(final_hold["cpc_sample_id"], errors="coerce")
+            final_hold = final_hold[hold_ids.notna() & (hold_ids > 0)].copy()
+            if "cpc_sample_id" in normal.columns:
+                normal_ids = set(pd.to_numeric(normal["cpc_sample_id"], errors="coerce").dropna())
+                hold_ids = pd.to_numeric(final_hold["cpc_sample_id"], errors="coerce")
+                final_hold = final_hold[~hold_ids.isin(normal_ids)]
+            final_hold = final_hold.drop_duplicates("cpc_sample_id", keep="first")
+        sort_column = "cpc_sample_time" if "cpc_sample_time" in final_hold.columns else "time"
+        final_hold = final_hold.sort_values(sort_column)
+        final_index = len(sizes) - 1
+        for hold_index, row in enumerate(final_hold.itertuples(index=False), start=1):
+            source_size = float(getattr(row, "abs_size_nm"))
+            source_index = size_to_index.get(source_size, final_index)
+            if shift > 0 and source_index == final_index:
+                applied_shift = max(0, shift - hold_index)
+            else:
+                applied_shift = shift
+            target_index = int(np.clip(source_index - applied_shift, 0, len(sizes) - 1))
+            parts.append({"abs_size_nm": sizes[target_index], "cpc_float": getattr(row, "cpc_float")})
+
+    if not parts:
+        return averaged
+
+    return pd.DataFrame(parts).groupby("abs_size_nm")["cpc_float"].mean()
 
 
 def normalize_inversion_methods(values):
@@ -1948,8 +1995,7 @@ def invert_one_scan(
     d = d[d["abs_size_nm"] > smallest_size.value]
     d = d.sort_values("abs_size_nm")
 
-    y_series = d.groupby("abs_size_nm")["cpc_float"].mean()
-    y_series = apply_smps_size_step_shift(y_series)
+    y_series = build_cpc_series_for_inversion(d)
     if cpc_gap_interpolation_enabled.value:
         dp_meas_nm, y = interpolate_cpc_gaps_for_inversion(
             y_series.index.to_numpy(dtype=float),
