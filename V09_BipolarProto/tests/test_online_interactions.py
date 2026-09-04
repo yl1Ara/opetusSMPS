@@ -204,6 +204,25 @@ class OnlineInteractionTests(unittest.TestCase):
         self.assertEqual(matched.loc[1, "condition_source"], "configured fallback")
         self.assertAlmostEqual(matched.loc[1, "temperature_k"], 293.15)
 
+    def test_ambient_fallback_always_includes_unmatched_timestamp(self):
+        times = ["2026-08-01T00:10:00Z"]
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            missing = Path(temporary_directory) / "missing.csv"
+            empty_observations = Path(temporary_directory) / "ambient.csv"
+            pd.DataFrame({
+                "time": ["not-a-time"],
+                "temperature_k": [293.15],
+                "pressure_pa": [101325.0],
+            }).to_csv(empty_observations, index=False)
+
+            for path in ("", str(missing), str(empty_observations)):
+                matched = online_app.load_timestamped_ambient_conditions(
+                    times, path, 293.15, 101325.0,
+                )
+                self.assertIn("ambient_time", matched.columns)
+                self.assertTrue(pd.isna(matched.loc[0, "ambient_time"]))
+                self.assertEqual(matched.loc[0, "condition_source"], "configured fallback")
+
     def test_ambient_matching_preserves_invalid_and_mixed_timezone_rows(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "ambient.csv"

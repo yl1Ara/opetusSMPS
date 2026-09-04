@@ -421,6 +421,9 @@ def load_timestamped_ambient_conditions(
     requested["temperature_k"] = float(fallback_temperature_k)
     requested["pressure_pa"] = float(fallback_pressure_pa)
     requested["condition_source"] = "configured fallback"
+    requested["ambient_time"] = pd.Series(
+        pd.NaT, index=requested.index, dtype="datetime64[ns, UTC]",
+    )
     path_text = str(csv_path or "").strip()
     if not path_text:
         return requested.sort_values("_order").drop(columns="_order").reset_index(drop=True)
@@ -456,7 +459,9 @@ def load_timestamped_ambient_conditions(
     if ambient.empty:
         return requested.sort_values("_order").drop(columns="_order").reset_index(drop=True)
 
-    valid_requested = requested.dropna(subset=["time"]).sort_values("time")
+    valid_requested = requested.drop(columns="ambient_time").dropna(
+        subset=["time"],
+    ).sort_values("time")
     matched = pd.merge_asof(
         valid_requested, ambient, left_on="time", right_on="ambient_time",
         direction="nearest", tolerance=pd.Timedelta(minutes=float(tolerance_minutes)),
@@ -465,9 +470,6 @@ def load_timestamped_ambient_conditions(
     matched.loc[valid, "temperature_k"] = matched.loc[valid, "observed_temperature_k"]
     matched.loc[valid, "pressure_pa"] = matched.loc[valid, "observed_pressure_pa"]
     matched.loc[valid, "condition_source"] = f"timestamped ambient CSV: {path}"
-    requested["ambient_time"] = pd.Series(
-        pd.NaT, index=requested.index, dtype="datetime64[ns, UTC]",
-    )
     requested = requested.set_index("_order")
     matched = matched.set_index("_order")
     for column in ("temperature_k", "pressure_pa", "condition_source", "ambient_time"):
