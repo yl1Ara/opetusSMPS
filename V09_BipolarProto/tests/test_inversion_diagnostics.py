@@ -6,8 +6,12 @@ import pandas as pd
 from DMPS_inversion_gui.diagnostics import (
     brownian_coagulation_kernel,
     brownian_coagulation_sink,
+    build_effective_zratio_diagnostics,
     build_mcc_growth_cross_checks,
+    build_formation_rate_diagnostics,
     build_growth_rate_diagnostics,
+    build_quality_dashboard,
+    build_temporal_mode_diagnostics,
     distribution_bin_coverage,
     distribution_moments,
     fit_lognormal_modes,
@@ -16,12 +20,118 @@ from DMPS_inversion_gui.diagnostics import (
     range_overlap_metrics,
     select_lognormal_mode_fit,
     sulfuric_acid_condensation_sink,
+    track_modal_components,
     weighted_log_diameter_quantile,
 )
 from inv_funcs.cpc_loss import cpc_loss1
 
 
 class InversionDiagnosticTests(unittest.TestCase):
+    @staticmethod
+    def polarity_consistency_fixture(ratios=(1.44, 1.44), cpc_types=("3010", "3010")):
+        sizes = np.geomspace(20.0, 70.0, 12)
+        times = pd.date_range("2026-08-01", periods=2, freq="1h", tz="UTC")
+        base_a = np.linspace(100.0, 500.0, len(sizes))
+        base_b = np.linspace(700.0, 150.0, len(sizes))
+        positive = np.column_stack([base_a * ratios[0], base_b * ratios[1]])
+        negative = np.column_stack([base_b, base_a])
+        return [{
+            "kind": "heatmap", "method": "gunn woessner mod", "polarity": "positive",
+            "x": times, "y": sizes, "Z": positive,
+            "scan_id": ["scan-a", "scan-b"], "zratio_used": [1.0, 1.0],
+            "cpc_type": list(cpc_types), "correction_mode": "Transport delay",
+        }, {
+            "kind": "heatmap", "method": "gunn woessner mod", "polarity": "negative",
+            "x": times[::-1], "y": sizes, "Z": negative,
+            "scan_id": ["scan-b", "scan-a"], "zratio_used": [1.0, 1.0],
+            "cpc_type": list(cpc_types)[::-1], "correction_mode": "Transport delay",
+        }]
+
+    def test_effective_zratio_recovers_known_ratio_and_pairs_by_scan_id(self):
+        result = self.polarity_consistency_fixture()
+        original = np.asarray(result[0]["Z"]).copy()
+
+        diagnostic = build_effective_zratio_diagnostics(result)
+
+        self.assertEqual(diagnostic["status"], "ok")
+        self.assertEqual(diagnostic["accepted_pair_count"], 2)
+        self.assertAlmostEqual(diagnostic["median_effective_zratio"], 1.2, places=10)
+        self.assertAlmostEqual(diagnostic["best_candidate_zratio"], 1.2, delta=0.02)
+        self.assertEqual({row["scan_id"] for row in diagnostic["rows"]}, {"scan-a", "scan-b"})
+        np.testing.assert_array_equal(result[0]["Z"], original)
+
+    def test_effective_zratio_reports_pair_spread(self):
+        diagnostic = build_effective_zratio_diagnostics(
+            self.polarity_consistency_fixture(ratios=(1.0, 2.25))
+        )
+
+        estimates = sorted(row["effective_zratio"] for row in diagnostic["rows"])
+        np.testing.assert_allclose(estimates, [1.0, 1.5])
+        self.assertLess(diagnostic["effective_zratio_p10"], diagnostic["effective_zratio_p90"])
+
+    def test_effective_zratio_flags_cpc_dependent_estimates(self):
+        diagnostic = build_effective_zratio_diagnostics(
+            self.polarity_consistency_fixture(
+                ratios=(1.0, 2.25), cpc_types=("3010", "HY09"),
+            )
+        )
+
+        self.assertTrue(diagnostic["cpc_dependence_warning"])
+        self.assertEqual(
+            {item["cpc_type"] for item in diagnostic["cpc_type_summaries"]},
+            {"3010", "HY09"},
+        )
+
+    def test_effective_zratio_reports_unpaired_scan(self):
+        result = self.polarity_consistency_fixture()
+        result[1]["Z"] = result[1]["Z"][:, :1]
+        for key in ("x", "scan_id", "zratio_used", "cpc_type"):
+            result[1][key] = result[1][key][:1]
+
+        diagnostic = build_effective_zratio_diagnostics(result)
+
+        rejected = next(row for row in diagnostic["rows"] if row["scan_id"] == "scan-a")
+        self.assertEqual(rejected["status"], "rejected")
+        self.assertIn("negative-voltage scan is missing", rejected["reason"])
+
+    def test_effective_zratio_rejects_insufficient_common_support(self):
+        result = self.polarity_consistency_fixture()
+
+        diagnostic = build_effective_zratio_diagnostics(
+            result, minimum_size_nm=68.0, maximum_size_nm=70.0,
+        )
+
+        self.assertEqual(diagnostic["status"], "failed")
+        self.assertTrue(all(row["status"] == "rejected" for row in diagnostic["rows"]))
+        self.assertTrue(all("common measured bins" in row["reason"] for row in diagnostic["rows"]))
+
+    def test_effective_zratio_marks_candidate_range_boundary(self):
+        diagnostic = build_effective_zratio_diagnostics(
+            self.polarity_consistency_fixture(ratios=(25.0, 25.0))
+        )
+
+        self.assertTrue(diagnostic["optimum_at_candidate_boundary"])
+        self.assertAlmostEqual(diagnostic["best_candidate_zratio"], 3.0)
+
+    def test_effective_zratio_fails_cleanly_for_misaligned_metadata(self):
+        result = self.polarity_consistency_fixture()
+        result[0]["zratio_used"] = [1.0]
+
+        diagnostic = build_effective_zratio_diagnostics(result)
+
+        self.assertEqual(diagnostic["status"], "failed")
+        self.assertIn("column metadata is inconsistent", diagnostic["reason"])
+
+    def test_effective_zratio_rejects_mismatched_cpc_type(self):
+        result = self.polarity_consistency_fixture()
+        result[1]["cpc_type"][1] = "HY09"
+
+        diagnostic = build_effective_zratio_diagnostics(result)
+
+        rejected = next(row for row in diagnostic["rows"] if row["scan_id"] == "scan-a")
+        self.assertEqual(rejected["status"], "rejected")
+        self.assertIn("CPC types differ", rejected["reason"])
+
     def test_log_diameter_quantile_is_exact_for_uniform_log_distribution(self):
         sizes = np.geomspace(10.0, 100.0, 6)
 
@@ -552,6 +662,46 @@ class InversionDiagnosticTests(unittest.TestCase):
             )
             self.assertEqual(fitted["number_of_modes"], 1)
 
+    def test_modal_tracking_preserves_identity_through_crossing(self):
+        times = pd.date_range("2026-08-01", periods=6, freq="1h")
+        fitted_scans = []
+        for index, timestamp in enumerate(times):
+            diameters = sorted((10.0 * 1.3 ** index, 40.0 / 1.3 ** index))
+            components = [{
+                "mode_diameter_nm": diameter,
+                "area_cm3": 1000.0,
+                "fit_range_area_cm3": 950.0,
+                "geometric_std": 1.3,
+            } for diameter in diameters]
+            fitted_scans.append((timestamp, components, 0.99))
+
+        rows = track_modal_components(fitted_scans)
+        tracks = {}
+        for row in rows:
+            tracks.setdefault(row["track_id"], []).append(row["mode_diameter_nm"])
+
+        self.assertEqual(len(tracks), 2)
+        directions = sorted(np.sign(values[-1] - values[0]) for values in tracks.values())
+        self.assertEqual(directions, [-1.0, 1.0])
+
+    def test_all_failed_modal_scans_report_zero_success_fraction(self):
+        times = pd.date_range("2026-08-01", periods=3, freq="1h")
+        result = [{
+            "kind": "heatmap", "method": "test", "polarity": "positive",
+            "x": times, "y": np.geomspace(5.0, 100.0, 20),
+            "Z": np.zeros((20, 3)),
+        }]
+
+        modes = build_temporal_mode_diagnostics(result)
+        dashboard = build_quality_dashboard([{
+            "scan_id": "scan", "nan_fraction": 0.0,
+            "flow_rel_rmse": 0.0, "missing_polarity": "none",
+        }], modes)
+
+        self.assertEqual(modes[0]["failed_scan_count"], 3)
+        self.assertEqual(modes[0]["successful_scan_count"], 0)
+        self.assertEqual(dashboard[0]["modal_fit_success_fraction"], 0.0)
+
     def test_particle_moments_match_per_bin_fixture(self):
         sizes = np.array([10.0, 20.0, 40.0])
         width = np.log10(2.0)
@@ -564,6 +714,76 @@ class InversionDiagnosticTests(unittest.TestCase):
         self.assertAlmostEqual(moments["geometric_mean_nm"], 25.1984209979)
         self.assertAlmostEqual(moments["surface_um2_cm3"], 1.79070781255)
         self.assertAlmostEqual(moments["volume_um3_cm3"], 0.0109432144100)
+
+    def test_three_term_formation_budget_uses_upper_boundary_flux(self):
+        sizes = np.array([3.0, 5.0, 8.0, 12.0, 20.0])
+        times = pd.date_range("2026-08-01", periods=5, freq="1h", tz="UTC")
+        z = np.column_stack([
+            np.full(len(sizes), 100.0 + 10.0 * index)
+            for index in range(len(times))
+        ])
+        result = [{
+            "kind": "heatmap", "method": "test", "polarity": "positive",
+            "x": times, "y": sizes, "Z": z,
+        }]
+        growth = [{
+            "source_method": "test", "polarity": "positive",
+            "model": "Center D50", "growth_rate": 2.0,
+            "event_start": times[0], "event_end": times[-1],
+        }]
+
+        diagnostics = build_formation_rate_diagnostics(
+            result,
+            growth_min_size_nm=3.0,
+            growth_max_size_nm=10.0,
+            ntot_limit=1e6,
+            method_label=lambda value: value,
+            growth_diagnostics=growth,
+        )
+
+        self.assertEqual(len(diagnostics), 1)
+        item = diagnostics[0]
+        complete = item["three_term_budget_available"]
+        self.assertTrue(np.all(complete))
+        expected_outflux = (
+            2.0 / 3600.0
+            * (100.0 + 10.0 * np.arange(len(times)))
+            / (10.0 * np.log(10.0))
+        )
+        np.testing.assert_allclose(item["growth_outflux_cm3_s1"], expected_outflux)
+        np.testing.assert_allclose(
+            item["formation_rate"][complete],
+            item["accumulation_rate_cm3_s1"][complete]
+            + item["growth_outflux_cm3_s1"][complete]
+            + item["coagulation_loss_cm3_s1"][complete],
+        )
+
+        without_growth = build_formation_rate_diagnostics(
+            result,
+            growth_min_size_nm=3.0,
+            growth_max_size_nm=10.0,
+            ntot_limit=1e6,
+            method_label=lambda value: value,
+        )[0]
+        self.assertTrue(np.all(np.isnan(without_growth["formation_rate"])))
+
+    def test_formation_interval_can_use_interpolated_boundaries_with_one_center(self):
+        sizes = np.array([2.0, 5.0, 20.0])
+        times = pd.date_range("2026-08-01", periods=3, freq="1h", tz="UTC")
+        result = [{
+            "kind": "heatmap", "method": "test", "polarity": "positive",
+            "x": times, "y": sizes, "Z": np.full((3, 3), 100.0),
+        }]
+
+        diagnostics = build_formation_rate_diagnostics(
+            result, growth_min_size_nm=3.0, growth_max_size_nm=10.0,
+            ntot_limit=1e6, method_label=lambda value: value,
+        )
+
+        self.assertEqual(len(diagnostics), 1)
+        np.testing.assert_allclose(
+            diagnostics[0]["concentration"], 100.0 * np.log10(10.0 / 3.0),
+        )
 
     def test_properties_do_not_bridge_disconnected_measurement_ranges(self):
         sizes = np.array([10.0, 20.0, 1000.0, 2000.0])

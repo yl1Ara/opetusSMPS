@@ -8,7 +8,7 @@ case "${1:-}" in
         app="gui.py"
         port=5006
         origin="${DMPS_WEBSOCKET_ORIGIN_MAIN:?main websocket origin is not configured}"
-        extra=(--reuse-sessions --keep-alive 10000 --check-unused-sessions 60000 --unused-session-lifetime 604800000)
+        extra=(--keep-alive 10000 --reuse-sessions --check-unused-sessions 60000 --unused-session-lifetime 3600000)
         ;;
     *)
         printf 'Usage: %s main\n' "$0" >&2

@@ -5,7 +5,7 @@ import numpy as np
 # From MATLAB wiedensohler.m (Runlong Cai's Julia code, 14th August 2023).
 _COEFF = {
     '+': np.array([
-        [-2.3484,  0.6044,  0.4800, -0.0013, -0.1553,  0.0320],
+        [-2.3484,  0.6044,  0.4800,  0.0013, -0.1553,  0.0320],
         [-44.4756, 79.3772, -62.89,  26.4492, -5.748,   0.5049],
     ]),
     '-': np.array([

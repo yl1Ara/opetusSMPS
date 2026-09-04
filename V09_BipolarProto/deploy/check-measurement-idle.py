@@ -1,36 +1,48 @@
 #!/usr/bin/env python3
-"""Exit 0 when the shared GUI is idle, 10 when measuring, and 20 if unknown."""
+"""Exit 0 when health reports idle, 10 when busy, and 20 when unknown."""
 
+import json
 import sys
+from datetime import datetime, timezone
+from pathlib import Path
 
-import panel  # Register Panel's custom Bokeh models before pulling the document.
-from bokeh.client import pull_session
+
+BUSY_STATES = {"initializing", "running", "stopping", "tuning", "calibration"}
 
 
-def main() -> int:
-    url = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:5006/gui"
-    session = None
+def measurement_state(path, maximum_age_seconds=10.0, expected_pid=None):
+    health = json.loads(Path(path).read_text())
+    timestamp = datetime.fromisoformat(health["timestamp"])
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    age = (datetime.now(timezone.utc) - timestamp.astimezone(timezone.utc)).total_seconds()
+    if age < 0 or age > float(maximum_age_seconds):
+        raise ValueError(f"health file age is {age:.1f}s")
+    if not health.get("runtime_id") or int(health.get("pid", 0)) <= 0:
+        raise ValueError("health lacks runtime identity")
+    if expected_pid is not None and int(health["pid"]) != int(expected_pid):
+        raise ValueError(
+            f"health PID {health['pid']} does not match service PID {expected_pid}"
+        )
+    state = str(health.get("runtime_state", "unknown"))
+    if health.get("scan_active") or state in BUSY_STATES:
+        return 10, f"instrument runtime is busy ({state})"
+    if state == "idle":
+        return 0, "instrument runtime is idle"
+    raise ValueError(f"unknown instrument runtime state: {state}")
+
+
+def main():
+    path = sys.argv[1] if len(sys.argv) > 1 else "health.json"
+    maximum_age = float(sys.argv[2]) if len(sys.argv) > 2 else 10.0
+    expected_pid = int(sys.argv[3]) if len(sys.argv) > 3 else None
     try:
-        session = pull_session(url=url)
-        matches = [
-            model
-            for model in session.document.models
-            if getattr(model, "label", None) == "Start measurement"
-            and hasattr(model, "active")
-        ]
-        if len(matches) != 1:
-            print("Could not uniquely locate the Start measurement toggle", file=sys.stderr)
-            return 20
-        if matches[0].active:
-            print("Measurement is active", file=sys.stderr)
-            return 10
-        return 0
-    except Exception as exc:
-        print(f"Could not inspect measurement state: {exc}", file=sys.stderr)
+        code, message = measurement_state(path, maximum_age, expected_pid)
+        print(message, file=sys.stderr if code else sys.stdout)
+        return code
+    except Exception as error:
+        print(f"Could not verify measurement state: {error}", file=sys.stderr)
         return 20
-    finally:
-        if session is not None:
-            session.close()
 
 
 if __name__ == "__main__":

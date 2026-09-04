@@ -651,10 +651,10 @@ def invert_one_scan(d, polarity, scan_range, zratio=None, temp=293.15, press=101
         )
 
         if zratio is None or not np.isfinite(zratio):
-            zratio = 1.35e-4 / 1.60e-4
+            zratio = 1.60e-4 / 1.35e-4
 
-        Zn = 1e-4
-        Zp = zratio * Zn
+        Zp = 1e-4
+        Zn = zratio * Zp
 
         args = (
             temp,
@@ -946,8 +946,9 @@ def estimate_ion_mobility_ratio_for_scan(g_scan, temp=293.15, press=101325):
         Rg_pos = np.interp(dp_g_nm, dp, Rp)
         Rg_neg = np.interp(dp_g_nm, dp, Rn)
 
-        fw_pos = inv.wiedensohler(dp_g_m, "+")
-        fw_neg = inv.wiedensohler(dp_g_m, "-")
+        # Positive voltage selects negative particles and vice versa.
+        fw_pos = inv.wiedensohler(dp_g_m, "-")
+        fw_neg = inv.wiedensohler(dp_g_m, "+")
 
         double_pos = Rg_pos * fw_pos[1] / fw_pos[0]
         double_neg = Rg_neg * fw_neg[1] / fw_neg[0]
@@ -1065,7 +1066,7 @@ def compute_inversion_heatmap(df2):
             "x": ion_x,
             "y": ion_y,
             "selected_dp": ion_dp,
-            "name": "Ion mobility ratio Z+/Z-",
+            "name": "Ion mobility ratio Zn/Zp",
         }
     )
 

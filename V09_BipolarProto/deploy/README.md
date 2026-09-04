@@ -60,7 +60,7 @@ deploy/install-services.sh --origin customer-host.tailnet-name.ts.net --state-di
 
 The services then load code and dependencies from the Git checkout but retain `settings.json`, `settings_inversion.json`, `logs/`, and viewer state under the state directory.
 
-The installer creates `.venv`, synchronizes locked application dependencies plus Raspberry Pi hardware dependencies, syntax-checks only the instrument application and hardware modules, installs `dmps`, enables only the hardware service, and verifies both its localhost endpoint and fresh `health.json` heartbeat. Before Panel starts, systemd writes calibrated midpoint code `32705` to the bipolar DAC; a failed midpoint write prevents the GUI from starting. Inversion code is not executed on the instrument.
+The installer acquires the instrument maintenance lock and refuses a busy or unverifiable running service before changing dependencies. It creates `.venv`, synchronizes locked application dependencies plus Raspberry Pi hardware dependencies, syntax-checks only the instrument application and hardware modules, installs `dmps`, enables only the hardware service, and verifies both its localhost endpoint and fresh process-matched `health.json` heartbeat. Before Panel starts, systemd writes calibrated midpoint code `32705` to the bipolar DAC; a failed midpoint write prevents the GUI from starting. Inversion code is not executed on the instrument.
 
 ## Operations and updates
 
@@ -70,7 +70,7 @@ dmps health
 dmps update
 ```
 
-`dmps update` operates on the complete monorepo. It refuses a dirty tree, refuses a non-fast-forward pull, and repeatedly inspects the shared live Panel document to refuse an active measurement. If measurement state cannot be verified, it fails closed. It then runs `git fetch --prune origin`, `git pull --ff-only`, dependency synchronization, and Python syntax checks before restarting the hardware service if it was already running. The restarted service must pass its localhost HTTP health check. A failed dependency or syntax check leaves the existing process running and does not restart it. If a measurement is started during the update, the final guard leaves the updated main service process running without restarting it and reports failure.
+`dmps update` operates on the complete monorepo. It acquires an exclusive maintenance lock, refuses a dirty tree or non-fast-forward pull, and reads a fresh `health.json` whose PID must match systemd's current process; it never opens a Panel session to determine whether measurement is idle. Measurement, initialization, tuning, and calibration hold shared maintenance leases, so they cannot begin or remain active during an update. If state cannot be verified, the update fails closed. After its final idle check, it stops the hardware service before changing the checkout or environment, runs dependency synchronization and Python syntax checks, installs runtime files, starts the service if it was previously active, and requires the new PID's localhost endpoint and heartbeat to pass. A failed update leaves the service stopped rather than running mixed old and new files.
 
 Stop a measurement in the GUI and confirm it is idle before updating. Do not schedule `dmps update` from cron or a systemd timer. Do not manually run a second hardware GUI beside `tdmps@USER.service`.
 

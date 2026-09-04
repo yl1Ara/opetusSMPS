@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from scipy.optimize import least_squares
+from scipy.optimize import least_squares, linear_sum_assignment
 from scipy.signal import find_peaks
 
 
@@ -355,6 +355,110 @@ def select_lognormal_mode_fit(size_nm, concentration, maximum_modes=3, part_colu
     return best
 
 
+def track_modal_components(fitted_scans, maximum_gap_hours=3.0):
+    """Assign persistent identities to fitted modes using predicted log-diameter."""
+    active = {}
+    rows = []
+    next_track = 1
+    for timestamp, components, fit_quality in sorted(fitted_scans, key=lambda item: item[0]):
+        timestamp = pd.Timestamp(timestamp)
+        active = {
+            track_id: history for track_id, history in active.items()
+            if (timestamp - history[-1][0]).total_seconds() <= maximum_gap_hours * 3600
+        }
+        components = sorted(components, key=lambda item: item["mode_diameter_nm"])
+        track_ids = list(active)
+        cost = np.full((len(track_ids), len(components)), np.inf)
+        for track_index, track_id in enumerate(track_ids):
+            history = active[track_id]
+            previous_time, previous = history[-1]
+            dt_hours = max((timestamp - previous_time).total_seconds() / 3600, 0.0)
+            predicted = np.log10(previous["mode_diameter_nm"])
+            if len(history) >= 2:
+                older_time, older = history[-2]
+                history_dt = (previous_time - older_time).total_seconds() / 3600
+                if history_dt > 0:
+                    velocity = (
+                        np.log10(previous["mode_diameter_nm"])
+                        - np.log10(older["mode_diameter_nm"])
+                    ) / history_dt
+                    predicted += velocity * dt_hours
+            for component_index, component in enumerate(components):
+                diameter_cost = abs(np.log10(component["mode_diameter_nm"]) - predicted)
+                area_cost = abs(np.log(
+                    max(component["area_cm3"], 1e-12)
+                    / max(previous["area_cm3"], 1e-12)
+                ))
+                gsd_cost = abs(np.log(
+                    component["geometric_std"] / previous["geometric_std"]
+                ))
+                cost[track_index, component_index] = diameter_cost + 0.03 * area_cost + 0.1 * gsd_cost
+
+        assignments = {}
+        if cost.size:
+            track_indices, component_indices = linear_sum_assignment(cost)
+            for track_index, component_index in zip(track_indices, component_indices):
+                # Prevent a stale or physically discontinuous mode from being
+                # forced onto the nearest candidate by the global assignment.
+                if cost[track_index, component_index] <= 0.25:
+                    assignments[component_index] = track_ids[track_index]
+
+        for component_index, component in enumerate(components):
+            track_id = assignments.get(component_index)
+            if track_id is None:
+                track_id = f"M{next_track}"
+                next_track += 1
+                active[track_id] = []
+            active[track_id].append((timestamp, component))
+            active[track_id] = active[track_id][-2:]
+            rows.append({
+                "time": timestamp,
+                "track_id": track_id,
+                "mode_diameter_nm": component["mode_diameter_nm"],
+                "area_cm3": component["area_cm3"],
+                "fit_range_area_cm3": component.get("fit_range_area_cm3", np.nan),
+                "geometric_std": component["geometric_std"],
+                "fit_r2": fit_quality,
+            })
+    return rows
+
+
+def build_temporal_mode_diagnostics(result, maximum_modes=3, maximum_gap_hours=3.0):
+    diagnostics = []
+    for trace in result:
+        if trace.get("kind") != "heatmap":
+            continue
+        sizes = np.asarray(trace["y"], dtype=float)
+        z = np.asarray(trace["Z"], dtype=float)
+        times = pd.to_datetime(trace["x"])
+        support_by_scan = trace.get("part_columns", [])
+        fitted_scans = []
+        failed_scan_count = 0
+        for scan_index, (timestamp, column) in enumerate(zip(times, z.T)):
+            part_columns = (
+                support_by_scan[scan_index]
+                if scan_index < len(support_by_scan) else None
+            )
+            fitted = select_lognormal_mode_fit(
+                sizes, column, maximum_modes, part_columns,
+            )
+            if fitted.get("status") != "ok" or fitted.get("r2", -np.inf) < 0.5:
+                failed_scan_count += 1
+                continue
+            fitted_scans.append((timestamp, fitted["components"], fitted["r2"]))
+        rows = track_modal_components(fitted_scans, maximum_gap_hours)
+        diagnostics.append({
+                "method": trace.get("method", "gunn woessner mod"),
+                "polarity": trace.get("polarity", "unknown"),
+                "maximum_gap_hours": float(maximum_gap_hours),
+                "failed_scan_count": failed_scan_count,
+                "successful_scan_count": len(fitted_scans),
+                "tracking_semantics": "heuristic predicted log-diameter assignment; not a physical identity proof",
+                "rows": rows,
+        })
+    return diagnostics
+
+
 def distribution_moments(size_nm, concentration, part_columns=None):
     size_nm = np.asarray(size_nm, dtype=float)
     concentration = np.asarray(concentration, dtype=float)
@@ -500,6 +604,9 @@ def build_aerosol_property_diagnostics(
         times = pd.to_datetime(trace["x"])
         rows = []
         support_by_scan = trace.get("part_columns", [None] * len(times))
+        temperatures = trace.get("temperature_k", [temperature_k] * len(times))
+        pressures = trace.get("pressure_pa", [pressure_pa] * len(times))
+        condition_sources = trace.get("condition_source", ["configured fallback"] * len(times))
         for scan_index, (time, column) in enumerate(zip(times, z.T)):
             part_columns = (
                 support_by_scan[scan_index]
@@ -522,16 +629,19 @@ def build_aerosol_property_diagnostics(
                 }
             rows.append({
                 "time": time,
+                "temperature_k": float(temperatures[scan_index]),
+                "pressure_pa": float(pressures[scan_index]),
+                "condition_source": condition_sources[scan_index],
                 **moments,
                 "invalid_or_negative_bin_count": int(np.count_nonzero(
                     ~np.isfinite(column) | (np.asarray(column, dtype=float) < 0)
                 )),
                 "condensation_sink_s1": sulfuric_acid_condensation_sink(
-                    sizes, column, temperature_k, pressure_pa, part_columns
+                    sizes, column, temperatures[scan_index], pressures[scan_index], part_columns
                 ),
                 **{
                     f"coagulation_sink_{target:g}nm_s1": brownian_coagulation_sink(
-                        sizes, column, target, temperature_k, pressure_pa,
+                        sizes, column, target, temperatures[scan_index], pressures[scan_index],
                         particle_density_kg_m3,
                         part_columns,
                     )
@@ -546,7 +656,7 @@ def build_aerosol_property_diagnostics(
                 "temperature_k": float(temperature_k),
                 "pressure_pa": float(pressure_pa),
                 "particle_density_kg_m3": float(particle_density_kg_m3),
-                "condition_source": "configured inversion conditions",
+                "condition_source": "per-scan rows; timestamped ambient with configured fallback",
                 "range_semantics": "measured-range; no size extrapolation",
                 "rows": rows,
             })
@@ -616,6 +726,104 @@ def build_scan_health(df, group_key):
     return rows
 
 
+def build_quality_dashboard(scan_health, mode_diagnostics=(), formation_diagnostics=()):
+    """Consolidate scan completeness, flow, modal, and J-budget quality."""
+    mode_failed = sum(item.get("failed_scan_count", 0) for item in mode_diagnostics)
+    mode_successful = sum(item.get("successful_scan_count", 0) for item in mode_diagnostics)
+    mode_total = mode_failed + mode_successful
+    formation_complete = [
+        np.mean(np.asarray(item.get("three_term_budget_available", []), dtype=bool))
+        for item in formation_diagnostics if len(item.get("three_term_budget_available", []))
+    ]
+    rows = []
+    for item in scan_health:
+        reasons = []
+        nan_fraction = float(item.get("nan_fraction", np.nan))
+        flow_relative = float(item.get("flow_rel_rmse", np.nan))
+        if np.isfinite(nan_fraction) and nan_fraction > 0.1:
+            reasons.append("CPC missing >10%")
+        if np.isfinite(flow_relative) and flow_relative > 0.05:
+            reasons.append("sheath-flow relative RMSE >5%")
+        if item.get("missing_polarity", "none") != "none":
+            reasons.append(f"missing {item['missing_polarity']} polarity")
+        severe = (
+            (np.isfinite(nan_fraction) and nan_fraction > 0.25)
+            or (np.isfinite(flow_relative) and flow_relative > 0.1)
+            or item.get("missing_polarity", "none") != "none"
+        )
+        rows.append({
+            **item,
+            "quality": "poor" if severe else ("warning" if reasons else "good"),
+            "quality_reasons": "; ".join(reasons) if reasons else "none",
+            "modal_fit_success_fraction": (
+                mode_successful / mode_total if mode_total else np.nan
+            ),
+            "formation_budget_complete_fraction": (
+                float(np.mean(formation_complete)) if formation_complete else np.nan
+            ),
+        })
+    return rows
+
+
+def boundary_log_distribution(size_nm, concentration, boundary_nm, part_columns=None):
+    """Interpolate dN/dlog10Dp at a measured, connected diameter boundary."""
+    size_nm = np.asarray(size_nm, dtype=float)
+    concentration = np.asarray(concentration, dtype=float)
+    valid_sizes = np.isfinite(size_nm) & (size_nm > 0)
+    order = np.flatnonzero(valid_sizes)[np.argsort(size_nm[valid_sizes])]
+    sorted_sizes = size_nm[order]
+    if len(sorted_sizes) < 2 or boundary_nm < sorted_sizes[0] or boundary_nm > sorted_sizes[-1]:
+        return np.nan
+    exact = np.flatnonzero(np.isclose(sorted_sizes, boundary_nm, rtol=1e-10))
+    if len(exact):
+        value = concentration[order[exact[0]]]
+        return float(value) if np.isfinite(value) and value >= 0 else np.nan
+    upper = int(np.searchsorted(sorted_sizes, boundary_nm))
+    lower = upper - 1
+    indices = order[[lower, upper]]
+    values = concentration[indices]
+    if np.any(~np.isfinite(values)) or np.any(values < 0):
+        return np.nan
+    if part_columns is not None and not any(
+        np.all(np.isfinite(np.asarray(part, dtype=float)[indices]))
+        for part in part_columns
+    ):
+        return np.nan
+    return float(np.interp(
+        np.log10(boundary_nm), np.log10(size_nm[indices]), values,
+    ))
+
+
+def integrate_log_distribution_interval(
+    size_nm, concentration, lower_nm, upper_nm, part_columns=None,
+):
+    """Integrate dN/dlog10Dp between exact diameter boundaries."""
+    size_nm = np.asarray(size_nm, dtype=float)
+    concentration = np.asarray(concentration, dtype=float)
+    inside = np.flatnonzero(
+        np.isfinite(size_nm) & (size_nm > lower_nm) & (size_nm < upper_nm)
+    )
+    order = inside[np.argsort(size_nm[inside])]
+    knot_sizes = np.concatenate(([lower_nm], size_nm[order], [upper_nm]))
+    knot_values = np.concatenate((
+        [boundary_log_distribution(size_nm, concentration, lower_nm, part_columns)],
+        concentration[order],
+        [boundary_log_distribution(size_nm, concentration, upper_nm, part_columns)],
+    ))
+    if part_columns is None:
+        knot_parts = [np.ones(len(knot_sizes), dtype=float)]
+    else:
+        knot_parts = []
+        for part in part_columns:
+            part = np.asarray(part, dtype=float)
+            knot_parts.append(np.concatenate((
+                [boundary_log_distribution(size_nm, part, lower_nm, [part])],
+                part[order],
+                [boundary_log_distribution(size_nm, part, upper_nm, [part])],
+            )))
+    return integrate_number_distribution(knot_sizes, knot_values, knot_parts)
+
+
 def build_formation_rate_diagnostics(
     result,
     *,
@@ -623,6 +831,10 @@ def build_formation_rate_diagnostics(
     growth_max_size_nm,
     ntot_limit,
     method_label,
+    growth_diagnostics=(),
+    temperature_k=293.15,
+    pressure_pa=101325.0,
+    particle_density_kg_m3=1000.0,
 ):
     diagnostics = []
     min_size = float(growth_min_size_nm)
@@ -638,33 +850,105 @@ def build_formation_rate_diagnostics(
         z = np.asarray(tr["Z"], dtype=float)
         times = pd.to_datetime(tr["x"])
         size_mask = np.isfinite(sizes) & (sizes >= min_size) & (sizes <= max_size)
-        if z.size == 0 or np.count_nonzero(size_mask) < 2 or len(times) < 3:
+        if z.size == 0 or len(times) < 3:
             continue
 
-        event_sizes = sizes[size_mask]
-        event_z = z[size_mask, :]
-        order = np.argsort(event_sizes)
-        event_sizes = event_sizes[order]
-        event_z = event_z[order, :]
-        conc = np.array([
-            integrate_number_distribution(event_sizes, col) for col in event_z.T
-        ])
+        support_by_scan = tr.get("part_columns", [])
+        temperatures = tr.get("temperature_k", [temperature_k] * len(times))
+        pressures = tr.get("pressure_pa", [pressure_pa] * len(times))
+        condition_sources = tr.get("condition_source", ["configured fallback"] * len(times))
+        ambient_times = tr.get("ambient_time", [pd.NaT] * len(times))
+        conc = []
+        coagulation_loss = []
+        upper_boundary_density = []
+        for scan_index in range(len(times)):
+            part_columns = (
+                support_by_scan[scan_index]
+                if scan_index < len(support_by_scan) else None
+            )
+            range_concentration = integrate_log_distribution_interval(
+                sizes, z[:, scan_index], min_size, max_size, part_columns,
+            )
+            conc.append(range_concentration)
+            full_column = z[:, scan_index]
+            full_sinks = np.array([
+                brownian_coagulation_sink(
+                    sizes, full_column, target,
+                    temperatures[scan_index], pressures[scan_index],
+                    particle_density_kg_m3, part_columns,
+                )
+                for target in sizes
+            ])
+            coagulation_loss.append(integrate_log_distribution_interval(
+                sizes, full_column * full_sinks, min_size, max_size, part_columns,
+            ))
+            upper_boundary_density.append(boundary_log_distribution(
+                sizes, full_column, max_size, part_columns,
+            ))
+        conc = np.asarray(conc, dtype=float)
+        coagulation_loss = np.asarray(coagulation_loss, dtype=float)
+        upper_boundary_density = np.asarray(upper_boundary_density, dtype=float)
         conc = guard_diagnostic_values(conc, ntot_limit, use_ntot_limit=True, multiplier=8.0)
         conc, spike_limit = suppress_isolated_spikes(conc, multiplier=8.0)
-        hours = (times - times[0]).total_seconds() / 3600.0
-        finite = np.isfinite(hours) & np.isfinite(conc)
+        seconds = np.asarray((times - times[0]).total_seconds(), dtype=float)
+        finite = np.isfinite(seconds) & np.isfinite(conc)
         if np.count_nonzero(finite) < 3:
             continue
 
-        rate = np.full(len(conc), np.nan)
-        rate[finite] = np.gradient(conc[finite], hours[finite])
+        accumulation = np.full(len(conc), np.nan)
+        accumulation[finite] = np.gradient(conc[finite], seconds[finite])
         finite_idx = np.flatnonzero(finite)
-        dt = np.diff(hours[finite])
-        close = np.flatnonzero(dt < 1 / 60)
+        dt = np.diff(seconds[finite])
+        close = np.flatnonzero(dt < 60)
         if len(close):
-            rate[finite_idx[close]] = np.nan
-            rate[finite_idx[close + 1]] = np.nan
-        rate = guard_diagnostic_values(np.abs(rate), ntot_limit, use_ntot_limit=True, multiplier=6.0) * np.sign(rate)
+            accumulation[finite_idx[close]] = np.nan
+            accumulation[finite_idx[close + 1]] = np.nan
+
+        matching_growth = [
+            growth for growth in growth_diagnostics
+            if growth.get("source_method") == tr.get("method", "gunn woessner mod")
+            and growth.get("polarity") == tr.get("polarity")
+            and growth.get("model") != "MCC cross-check"
+            and np.isfinite(growth.get("growth_rate", np.nan))
+        ]
+        model_priority = {"Center D50": 0, "Ridge peak": 1, "Lower edge D25": 2,
+                          "Upper edge D75": 3, "Appearance time": 4}
+        matching_growth.sort(key=lambda item: model_priority.get(item.get("model"), 99))
+        growth_rate = np.full(len(conc), np.nan)
+        growth_rate_low = np.full(len(conc), np.nan)
+        growth_rate_high = np.full(len(conc), np.nan)
+        growth_source = np.full(len(conc), "unavailable", dtype=object)
+        for growth in matching_growth:
+            inside = (times >= pd.Timestamp(growth["event_start"])) & (
+                times <= pd.Timestamp(growth["event_end"])
+            ) & ~np.isfinite(growth_rate)
+            growth_rate[inside] = float(growth["growth_rate"])
+            growth_rate_low[inside] = float(growth.get("slope_p10", growth["growth_rate"]))
+            growth_rate_high[inside] = float(growth.get("slope_p90", growth["growth_rate"]))
+            growth_source[inside] = str(growth.get("model", "unknown"))
+        boundary_factor = upper_boundary_density / (max_size * np.log(10.0))
+        growth_outflux = growth_rate / 3600.0 * boundary_factor
+        growth_outflux_low = growth_rate_low / 3600.0 * boundary_factor
+        growth_outflux_high = growth_rate_high / 3600.0 * boundary_factor
+        complete = (
+            np.isfinite(accumulation) & np.isfinite(growth_outflux)
+            & np.isfinite(coagulation_loss)
+        )
+        formation_rate = np.full(len(conc), np.nan)
+        formation_rate[complete] = (
+            accumulation[complete] + growth_outflux[complete]
+            + coagulation_loss[complete]
+        )
+        formation_rate_low = np.full(len(conc), np.nan)
+        formation_rate_high = np.full(len(conc), np.nan)
+        formation_rate_low[complete] = (
+            accumulation[complete] + growth_outflux_low[complete]
+            + coagulation_loss[complete]
+        )
+        formation_rate_high[complete] = (
+            accumulation[complete] + growth_outflux_high[complete]
+            + coagulation_loss[complete]
+        )
         baseline_n = max(3, int(np.ceil(np.count_nonzero(finite) * 0.2)))
         baseline = conc[finite][:baseline_n]
         threshold = np.nanmedian(baseline) + 3 * np.nanstd(baseline)
@@ -675,8 +959,21 @@ def build_formation_rate_diagnostics(
             "label": f"{method_label(tr.get('method', 'gunn woessner mod'))} {tr['polarity']}",
             "time": times,
             "concentration": conc,
-            "formation_rate": rate,
-            "rate_semantics": "apparent accumulation rate dN/dt; excludes growth flux and losses",
+            "accumulation_rate_cm3_s1": accumulation,
+            "growth_outflux_cm3_s1": growth_outflux,
+            "coagulation_loss_cm3_s1": coagulation_loss,
+            "formation_rate": formation_rate,
+            "formation_rate_low": formation_rate_low,
+            "formation_rate_high": formation_rate_high,
+            "growth_rate_nm_h": growth_rate,
+            "growth_source": growth_source,
+            "three_term_budget_available": complete,
+            "temperature_k": np.asarray(temperatures, dtype=float),
+            "pressure_pa": np.asarray(pressures, dtype=float),
+            "condition_source": np.asarray(condition_sources, dtype=object),
+            "ambient_time": pd.to_datetime(ambient_times),
+            "rate_semantics": "three-term apparent J = dN/dt + upper-boundary growth flux + restricted neutral Brownian coagulation sink approximation",
+            "sensitivity_semantics": "J low/high propagate only the selected growth track's pairwise-slope p10-p90 spread; they are not confidence bounds",
             "onset_time": onset_time,
             "threshold": threshold,
             "spike_limit": spike_limit,
@@ -702,23 +999,306 @@ def build_polarity_difference_heatmaps(result):
         pos_z = np.asarray(pos["Z"], dtype=float)
         neg_z = np.asarray(neg["Z"], dtype=float)
         sizes = np.asarray(pos["y"], dtype=float)
-        if pos_z.shape != neg_z.shape or len(sizes) == 0:
+        neg_sizes = np.asarray(neg["y"], dtype=float)
+        pos_ids = [str(value) for value in pos.get("scan_id", [])]
+        neg_ids = [str(value) for value in neg.get("scan_id", [])]
+        if (
+            len(sizes) == 0 or sizes.shape != neg_sizes.shape
+            or not np.allclose(sizes, neg_sizes, equal_nan=True)
+            or pos_z.shape[1] != len(pos_ids) or neg_z.shape[1] != len(neg_ids)
+        ):
             continue
+        pos_lookup = {scan_id: index for index, scan_id in enumerate(pos_ids)}
+        neg_lookup = {scan_id: index for index, scan_id in enumerate(neg_ids)}
+        common_ids = [scan_id for scan_id in pos_ids if scan_id in neg_lookup]
+        if not common_ids:
+            continue
+        pos_indices = [pos_lookup[scan_id] for scan_id in common_ids]
+        neg_indices = [neg_lookup[scan_id] for scan_id in common_ids]
 
         ratio = np.divide(
-            pos_z,
-            neg_z,
-            out=np.full_like(pos_z, np.nan, dtype=float),
-            where=neg_z > 0,
+            pos_z[:, pos_indices],
+            neg_z[:, neg_indices],
+            out=np.full((len(sizes), len(common_ids)), np.nan, dtype=float),
+            where=neg_z[:, neg_indices] > 0,
         )
         comparisons.append({
             "method": method,
-            "x": pos["x"],
+            "x": [pos["x"][index] for index in pos_indices],
             "y": sizes,
             "z": np.clip(ratio, 0, 2),
+            "scan_id": common_ids,
         })
 
     return comparisons
+
+
+def build_effective_zratio_diagnostics(
+    result, minimum_size_nm=20.0, maximum_size_nm=70.0,
+    candidate_min=0.3, candidate_max=3.0, minimum_bins=5,
+    minimum_concentration_cm3=1.0,
+):
+    """Estimate an effective Zn/Zp from paired Gunn-Woessner inversions.
+
+    For the Gunn-Woessner singly charged relation, the positive/negative
+    inverted concentration ratio scales as (Zn/Zp)^2. This diagnostic applies
+    that analytic scaling over common measured support; it is not an
+    independent ion-mobility measurement or a replacement for re-inversion.
+    """
+    heatmaps = [
+        trace for trace in result
+        if trace.get("kind") == "heatmap"
+        and trace.get("method", "gunn woessner mod") == "gunn woessner mod"
+    ]
+    by_polarity = {trace.get("polarity"): trace for trace in heatmaps}
+    positive = by_polarity.get("positive")
+    negative = by_polarity.get("negative")
+    if positive is None or negative is None:
+        return None
+
+    positive_sizes = np.asarray(positive.get("y", []), dtype=float)
+    negative_sizes = np.asarray(negative.get("y", []), dtype=float)
+    if (
+        len(positive_sizes) == 0
+        or positive_sizes.shape != negative_sizes.shape
+        or not np.allclose(positive_sizes, negative_sizes, equal_nan=True)
+    ):
+        return {
+            "kind": "effective_zratio_consistency", "status": "failed",
+            "reason": "positive and negative diameter axes differ", "rows": [],
+        }
+    positive_z = np.asarray(positive.get("Z", []), dtype=float)
+    negative_z = np.asarray(negative.get("Z", []), dtype=float)
+    for label, trace, matrix, sizes in (
+        ("positive", positive, positive_z, positive_sizes),
+        ("negative", negative, negative_z, negative_sizes),
+    ):
+        if matrix.ndim != 2 or matrix.shape[0] != len(sizes):
+            return {
+                "kind": "effective_zratio_consistency", "status": "failed",
+                "reason": f"{label} heatmap matrix shape is inconsistent", "rows": [],
+            }
+        column_count = matrix.shape[1]
+        if any(len(trace.get(key, [])) != column_count for key in (
+            "x", "scan_id", "zratio_used", "cpc_type",
+        )):
+            return {
+                "kind": "effective_zratio_consistency", "status": "failed",
+                "reason": f"{label} heatmap column metadata is inconsistent", "rows": [],
+            }
+        parts = trace.get("part_columns", [])
+        if parts and (
+            len(parts) != column_count
+            or any(
+                np.asarray(part).shape != sizes.shape
+                for scan_parts in parts for part in scan_parts
+            )
+        ):
+            return {
+                "kind": "effective_zratio_consistency", "status": "failed",
+                "reason": f"{label} measured-support metadata is inconsistent", "rows": [],
+            }
+
+    lower, upper = sorted((float(minimum_size_nm), float(maximum_size_nm)))
+    candidate_lower, candidate_upper = sorted((float(candidate_min), float(candidate_max)))
+    candidate_lower = max(candidate_lower, np.finfo(float).tiny)
+    candidate_upper = max(candidate_upper, candidate_lower * (1 + 1e-6))
+    candidates = np.geomspace(candidate_lower, candidate_upper, 161)
+    positive_ids = list(positive.get("scan_id", []))
+    negative_ids = list(negative.get("scan_id", []))
+    if (
+        len({str(value) for value in positive_ids}) != len(positive_ids)
+        or len({str(value) for value in negative_ids}) != len(negative_ids)
+    ):
+        return {
+            "kind": "effective_zratio_consistency", "status": "failed",
+            "reason": "duplicate scan IDs prevent unambiguous polarity pairing", "rows": [],
+        }
+    positive_lookup = {str(scan_id): index for index, scan_id in enumerate(positive_ids)}
+    negative_lookup = {str(scan_id): index for index, scan_id in enumerate(negative_ids)}
+    common_ids = sorted(set(positive_lookup) & set(negative_lookup))
+    rows = []
+    objective_pairs = []
+
+    for scan_id in sorted(set(positive_lookup) - set(negative_lookup)):
+        index = positive_lookup[scan_id]
+        rows.append({
+            "method": "gunn woessner mod", "scan_id": scan_id,
+            "positive_time": pd.Timestamp(positive["x"][index]),
+            "negative_time": pd.NaT, "status": "rejected",
+            "reason": "negative-voltage scan is missing",
+        })
+    for scan_id in sorted(set(negative_lookup) - set(positive_lookup)):
+        index = negative_lookup[scan_id]
+        rows.append({
+            "method": "gunn woessner mod", "scan_id": scan_id,
+            "positive_time": pd.NaT,
+            "negative_time": pd.Timestamp(negative["x"][index]),
+            "status": "rejected", "reason": "positive-voltage scan is missing",
+        })
+
+    for scan_id in common_ids:
+        positive_index = positive_lookup[scan_id]
+        negative_index = negative_lookup[scan_id]
+        row = {
+            "method": "gunn woessner mod",
+            "scan_id": scan_id,
+            "positive_time": pd.Timestamp(positive["x"][positive_index]),
+            "negative_time": pd.Timestamp(negative["x"][negative_index]),
+            "status": "rejected",
+            "reason": "",
+        }
+        positive_cpc = str(positive.get("cpc_type", ["unknown"] * len(positive_ids))[positive_index])
+        negative_cpc = str(negative.get("cpc_type", ["unknown"] * len(negative_ids))[negative_index])
+        row["cpc_type"] = positive_cpc
+        positive_cpc_mixed = bool(
+            positive.get("cpc_type_mixed", [False] * len(positive_ids))[positive_index]
+        )
+        negative_cpc_mixed = bool(
+            negative.get("cpc_type_mixed", [False] * len(negative_ids))[negative_index]
+        )
+        if positive_cpc_mixed or negative_cpc_mixed:
+            row["reason"] = "a polarity column contains mixed CPC types"
+            rows.append(row)
+            continue
+        if positive_cpc != negative_cpc:
+            row["reason"] = "positive and negative CPC types differ"
+            rows.append(row)
+            continue
+        positive_used = float(positive.get("zratio_used", [np.nan] * len(positive_ids))[positive_index])
+        negative_used = float(negative.get("zratio_used", [np.nan] * len(negative_ids))[negative_index])
+        if (
+            not np.isfinite(positive_used) or positive_used <= 0
+            or not np.isfinite(negative_used) or negative_used <= 0
+            or not np.isclose(positive_used, negative_used, rtol=1e-6)
+        ):
+            row["reason"] = "positive and negative inversions used different Zn/Zp"
+            rows.append(row)
+            continue
+        used_ratio = float(np.sqrt(positive_used * negative_used))
+        positive_values = positive_z[:, positive_index]
+        negative_values = negative_z[:, negative_index]
+        positive_parts = positive.get("part_columns", [])
+        negative_parts = negative.get("part_columns", [])
+        positive_support = distribution_support_widths(
+            positive_sizes,
+            positive_parts[positive_index] if positive_index < len(positive_parts) else None,
+        )
+        negative_support = distribution_support_widths(
+            negative_sizes,
+            negative_parts[negative_index] if negative_index < len(negative_parts) else None,
+        )
+        valid = (
+            np.isfinite(positive_sizes) & (positive_sizes >= lower) & (positive_sizes <= upper)
+            & np.isfinite(positive_values) & (positive_values >= minimum_concentration_cm3)
+            & np.isfinite(negative_values) & (negative_values >= minimum_concentration_cm3)
+            & np.isfinite(positive_support) & (positive_support > 0)
+            & np.isfinite(negative_support) & (negative_support > 0)
+        )
+        if np.count_nonzero(valid) < int(minimum_bins):
+            row["reason"] = f"fewer than {int(minimum_bins)} common measured bins"
+            rows.append(row)
+            continue
+
+        log_ratio = np.log(positive_values[valid] / negative_values[valid])
+        implied_ratios = used_ratio * np.exp(0.5 * log_ratio)
+        effective_ratio = float(np.exp(np.median(np.log(implied_ratios))))
+        adjusted_residual = log_ratio - 2 * np.log(effective_ratio / used_ratio)
+        row.update({
+            "status": "ok",
+            "reason": "",
+            "pair_time": row["positive_time"] + (row["negative_time"] - row["positive_time"]) / 2,
+            "time_gap_minutes": abs(
+                (row["positive_time"] - row["negative_time"]).total_seconds()
+            ) / 60.0,
+            "zratio_used": used_ratio,
+            "effective_zratio": effective_ratio,
+            "effective_zratio_p10": float(np.percentile(implied_ratios, 10)),
+            "effective_zratio_p90": float(np.percentile(implied_ratios, 90)),
+            "common_bin_count": int(np.count_nonzero(valid)),
+            "minimum_size_nm": float(np.min(positive_sizes[valid])),
+            "maximum_size_nm": float(np.max(positive_sizes[valid])),
+            "median_positive_negative_ratio": float(np.exp(np.median(log_ratio))),
+            "median_abs_log_mismatch_before": float(np.median(np.abs(log_ratio))),
+            "median_abs_log_mismatch_after": float(np.median(np.abs(adjusted_residual))),
+            "correction_mode": str(positive.get("correction_mode", "unknown")),
+            "transport_delay_seconds": positive.get("transport_delay_seconds", np.nan),
+            "response_window_seconds": positive.get("response_window_seconds", np.nan),
+            "dwell_seconds": positive.get("dwell_seconds", np.nan),
+            "size_step_shift": positive.get("size_step_shift", np.nan),
+        })
+        row["temporal_separation_warning"] = row["time_gap_minutes"] > 30.0
+        rows.append(row)
+        objective_pairs.append((log_ratio, used_ratio))
+
+    accepted = [row for row in rows if row["status"] == "ok"]
+    if not accepted:
+        return {
+            "kind": "effective_zratio_consistency", "status": "failed",
+            "reason": "no valid paired scans", "rows": rows,
+            "candidate_zratio": candidates,
+            "objective": np.full(len(candidates), np.nan),
+        }
+
+    objective = np.array([
+        np.median([
+            np.median(np.abs(log_ratio - 2 * np.log(candidate / used_ratio)))
+            for log_ratio, used_ratio in objective_pairs
+        ])
+        for candidate in candidates
+    ])
+    estimates = np.asarray([row["effective_zratio"] for row in accepted])
+    estimate_p10 = float(np.percentile(estimates, 10))
+    estimate_p90 = float(np.percentile(estimates, 90))
+    cpc_summaries = []
+    for cpc_name in sorted({row["cpc_type"] for row in accepted}):
+        cpc_estimates = np.asarray([
+            row["effective_zratio"] for row in accepted if row["cpc_type"] == cpc_name
+        ])
+        cpc_summaries.append({
+            "cpc_type": cpc_name,
+            "pair_count": len(cpc_estimates),
+            "median_effective_zratio": float(np.median(cpc_estimates)),
+            "effective_zratio_p10": float(np.percentile(cpc_estimates, 10)),
+            "effective_zratio_p90": float(np.percentile(cpc_estimates, 90)),
+        })
+    cpc_medians = np.asarray([
+        summary["median_effective_zratio"] for summary in cpc_summaries
+    ])
+    cpc_dependence_warning = bool(
+        len(cpc_medians) > 1 and np.max(cpc_medians) / np.min(cpc_medians) > 1.1
+    )
+    best_index = int(np.nanargmin(objective))
+    optimum_at_boundary = best_index in {0, len(candidates) - 1}
+    return {
+        "kind": "effective_zratio_consistency",
+        "status": "ok",
+        "reason": "",
+        "method": "gunn woessner mod",
+        "rows": rows,
+        "candidate_zratio": candidates,
+        "objective": objective,
+        "best_candidate_zratio": float(candidates[best_index]),
+        "optimum_at_candidate_boundary": optimum_at_boundary,
+        "objective_weighting": "median per diameter within each pair, then median across equally weighted scan pairs",
+        "median_effective_zratio": float(np.median(estimates)),
+        "effective_zratio_p10": estimate_p10,
+        "effective_zratio_p90": estimate_p90,
+        "pair_spread_factor": estimate_p90 / estimate_p10 if estimate_p10 > 0 else np.nan,
+        "stability": "stable" if estimate_p90 / estimate_p10 <= 1.15 else "variable",
+        "cpc_type_summaries": cpc_summaries,
+        "cpc_dependence_warning": cpc_dependence_warning,
+        "accepted_pair_count": len(accepted),
+        "rejected_pair_count": len(rows) - len(accepted),
+        "temporally_separated_pair_count": sum(
+            row["temporal_separation_warning"] for row in accepted
+        ),
+        "interpretation": (
+            "effective Gunn-Woessner polarity-balance ratio; absorbs temporal, "
+            "CPC, DMA, loss, concentration-ratio, and inversion biases"
+        ),
+        "spread_semantics": "P10-P90 across scan-pair estimates; not a confidence interval",
+    }
 
 
 def growth_models_from_settings(settings, options, defaults):

@@ -64,12 +64,21 @@ DEFAULT_SETTINGS = {
     "qs_lpm": 1.0,
     "temp_K": 293.15,
     "press_Pa": 101325,
-    "zratio": 1.35e-4 / 1.60e-4,
+    "ambient_conditions_csv": "",
+    "ambient_match_tolerance_min": 30.0,
+    "ambient_naive_timezone": "Europe/Helsinki",
+    "zratio": 1.60e-4 / 1.35e-4,
+    "zratio_convention": "Zn/Zp",
+    "positive_ion_mobility_m2_Vs": 1.35e-4,
+    "positive_ion_mass_amu": 140.0,
+    "negative_ion_mass_amu": 101.0,
+    "positive_ion_concentration_m3": 1e13,
+    "negative_ion_concentration_m3": 1e13,
     "zratio_min": 0.3,
     "zratio_max": 3.0,
     "zratio_smoothing_step": 0.2,
     "zratio_min_size_nm": 10.0,
-    "zratio_estimate_offset": 0.2,
+    "zratio_estimate_offset": 0.0,
     "ntot_plot_max": 10000,
     "heatmap_clip": 20000,
     "raw_uncertainty": "percentile 10-90",
@@ -87,7 +96,11 @@ DEFAULT_SETTINGS = {
     "modal_fit_modes": "Auto (1-3)",
     "modal_fit_min_nm": 6.5,
     "modal_fit_max_nm": 300.0,
+    "mode_tracking_enabled": False,
     "difference_peak_min_size_nm": 30.0,
+    "effective_zratio_diagnostic_enabled": False,
+    "effective_zratio_min_size_nm": 20.0,
+    "effective_zratio_max_size_nm": 70.0,
     "smallest_size": 6.5,
     "scan_inversion_type": "DMPS",
     "smps_settling_time_sec": 30.0,
@@ -114,9 +127,30 @@ DEFAULT_SETTINGS = {
 INVERSION_METHODS = {
     "gunn woessner mod": "Gunn-Woessner modified",
     "wiedensohler": "Wiedensohler",
-    "fuchs": "Fuchs",
+    "fuchs": "Fuchs-type limiting sphere (experimental)",
 }
 INVERSION_METHOD_LABELS = {label: method for method, label in INVERSION_METHODS.items()}
+
+CHARGE_MODEL_PROVENANCE = {
+    "gunn woessner mod": (
+        "Gunn-Woessner Gaussian equilibrium with the Chen et al. finite-size "
+        "alpha correction. The correction was fitted over 20-70 nm; values "
+        "below 20 nm are extrapolated."
+    ),
+    "wiedensohler": (
+        "Wiedensohler (1988) polynomial for |q|=1-2 and Gunn-Woessner for "
+        "higher states. The polynomial is a fixed-ion-property submicron "
+        "approximation and does not respond to the ion-property controls."
+    ),
+    "fuchs": (
+        "Fuchs limiting-sphere attachment solved by conservative detailed "
+        "balance. This corrected Chen-derived port is not yet verified as the "
+        "complete Hoppel-Frick (1986) three-body treatment. Like-sign attachment "
+        "can truncate to zero below about 20 nm; treat that range as experimental. "
+        "Configured ion mobilities are treated as values at scan conditions, so "
+        "pressure does not independently rescale the charging fractions."
+    ),
+}
 
 pn.extension("plotly")
 
@@ -127,8 +161,12 @@ latest_inversion = None
 latest_difference_diagnostics = None
 latest_growth_diagnostics = []
 latest_growth_settings = {}
+latest_formation_diagnostics = []
 latest_aerosol_properties = []
+latest_mode_tracks = []
+latest_quality_dashboard = []
 latest_modal_analysis = None
+saved_roi_analyses = []
 _UNSET = object()
 auto_pending_signature = None
 AUTO_STATE_FILE = APP_ROOT / "auto_inversion_state.json"
@@ -185,6 +223,18 @@ def load_settings():
     ensure_settings_file()
     try:
         settings = json.loads(SETTINGS_FILE.read_text())
+        if settings.get("zratio_convention") == "Zp/Zn":
+            ratio = float(settings.get("zratio", np.nan))
+            if np.isfinite(ratio) and ratio > 0:
+                settings["zratio"] = 1.0 / ratio
+            settings["zratio_convention"] = "Zn/Zp"
+            SETTINGS_FILE.write_text(json.dumps(settings, indent=2))
+        elif settings.get("zratio_convention") != "Zn/Zp":
+            legacy_nominal = 1.35e-4 / 1.60e-4
+            if np.isclose(settings.get("zratio", np.nan), legacy_nominal):
+                settings["zratio"] = 1.0 / legacy_nominal
+            settings["zratio_convention"] = "Zn/Zp"
+            SETTINGS_FILE.write_text(json.dumps(settings, indent=2))
         if "smps_correction_mode" not in settings and "smps_size_step_shift" in settings:
             settings["smps_correction_mode"] = "Integer step shift"
             SETTINGS_FILE.write_text(json.dumps(settings, indent=2))
@@ -217,7 +267,16 @@ def save_settings():
         "qs_lpm": float(qs_lpm.value),
         "temp_K": float(temp_K.value),
         "press_Pa": float(press_Pa.value),
+        "ambient_conditions_csv": ambient_conditions_csv.value,
+        "ambient_match_tolerance_min": float(ambient_match_tolerance_min.value),
+        "ambient_naive_timezone": ambient_naive_timezone.value,
         "zratio": float(zratio_widget.value),
+        "zratio_convention": "Zn/Zp",
+        "positive_ion_mobility_m2_Vs": float(positive_ion_mobility.value),
+        "positive_ion_mass_amu": float(positive_ion_mass.value),
+        "negative_ion_mass_amu": float(negative_ion_mass.value),
+        "positive_ion_concentration_m3": float(positive_ion_concentration.value),
+        "negative_ion_concentration_m3": float(negative_ion_concentration.value),
         "zratio_min": float(zratio_min_widget.value),
         "zratio_max": float(zratio_max_widget.value),
         "zratio_smoothing_step": float(zratio_smoothing_step.value),
@@ -240,7 +299,11 @@ def save_settings():
         "modal_fit_modes": modal_fit_modes.value,
         "modal_fit_min_nm": float(modal_fit_min_nm.value),
         "modal_fit_max_nm": float(modal_fit_max_nm.value),
+        "mode_tracking_enabled": bool(mode_tracking_enabled.value),
         "difference_peak_min_size_nm": float(difference_peak_min_size_nm.value),
+        "effective_zratio_diagnostic_enabled": bool(effective_zratio_diagnostic_enabled.value),
+        "effective_zratio_min_size_nm": float(effective_zratio_min_size_nm.value),
+        "effective_zratio_max_size_nm": float(effective_zratio_max_size_nm.value),
         "smallest_size": float(smallest_size.value),
         "scan_inversion_type": scan_inversion_type.value,
         "smps_settling_time_sec": float(smps_settling_time_sec.value),
@@ -267,6 +330,8 @@ def save_settings():
 
 
 def _json_safe(value):
+    if value is pd.NaT or value is pd.NA:
+        return None
     if isinstance(value, np.ndarray):
         return [_json_safe(v) for v in value.tolist()]
     if isinstance(value, (pd.Index, pd.Series)):
@@ -330,6 +395,86 @@ def app_path(value):
     if path.is_absolute():
         return path
     return APP_ROOT / path
+
+
+def load_timestamped_ambient_conditions(
+    times, csv_path, fallback_temperature_k, fallback_pressure_pa,
+    tolerance_minutes=30.0, naive_timezone="Europe/Helsinki",
+):
+    """Match ambient T/P observations to scan times with explicit fallback."""
+    def parse_times(values):
+        converted = []
+        for value in values:
+            parsed = pd.to_datetime(value, errors="coerce")
+            if pd.isna(parsed):
+                converted.append(pd.NaT)
+            elif parsed.tzinfo is None:
+                converted.append(parsed.tz_localize(
+                    naive_timezone, ambiguous="NaT", nonexistent="NaT",
+                ).tz_convert("UTC"))
+            else:
+                converted.append(parsed.tz_convert("UTC"))
+        return pd.Series(converted, dtype="datetime64[ns, UTC]")
+
+    requested = pd.DataFrame({"time": parse_times(times)})
+    requested["_order"] = np.arange(len(requested))
+    requested["temperature_k"] = float(fallback_temperature_k)
+    requested["pressure_pa"] = float(fallback_pressure_pa)
+    requested["condition_source"] = "configured fallback"
+    path_text = str(csv_path or "").strip()
+    if not path_text:
+        return requested.sort_values("_order").drop(columns="_order").reset_index(drop=True)
+    path = app_path(path_text)
+    if not path.exists():
+        return requested.sort_values("_order").drop(columns="_order").reset_index(drop=True)
+
+    observed = pd.read_csv(path)
+    normalized = {str(column).strip().lower(): column for column in observed.columns}
+    time_column = next((normalized[name] for name in ("time", "timestamp", "datetime") if name in normalized), None)
+    temp_k_column = next((normalized[name] for name in ("temperature_k", "temp_k") if name in normalized), None)
+    temp_c_column = next((normalized[name] for name in ("temperature_c", "temp_c") if name in normalized), None)
+    pressure_pa_column = next((normalized[name] for name in ("pressure_pa", "press_pa") if name in normalized), None)
+    pressure_hpa_column = next((normalized[name] for name in ("pressure_hpa", "press_hpa") if name in normalized), None)
+    if time_column is None or (temp_k_column is None and temp_c_column is None) or (
+        pressure_pa_column is None and pressure_hpa_column is None
+    ):
+        raise ValueError(
+            "ambient CSV requires time, temperature_k or temperature_c, and pressure_pa or pressure_hpa"
+        )
+    ambient = pd.DataFrame({"ambient_time": parse_times(observed[time_column])})
+    ambient["observed_temperature_k"] = pd.to_numeric(
+        observed[temp_k_column if temp_k_column is not None else temp_c_column], errors="coerce"
+    ) + (0.0 if temp_k_column is not None else 273.15)
+    ambient["observed_pressure_pa"] = pd.to_numeric(
+        observed[pressure_pa_column if pressure_pa_column is not None else pressure_hpa_column], errors="coerce"
+    ) * (1.0 if pressure_pa_column is not None else 100.0)
+    ambient = ambient.dropna().sort_values("ambient_time")
+    ambient = ambient[
+        (ambient["observed_temperature_k"] > 0)
+        & (ambient["observed_pressure_pa"] > 0)
+    ]
+    if ambient.empty:
+        return requested.sort_values("_order").drop(columns="_order").reset_index(drop=True)
+
+    valid_requested = requested.dropna(subset=["time"]).sort_values("time")
+    matched = pd.merge_asof(
+        valid_requested, ambient, left_on="time", right_on="ambient_time",
+        direction="nearest", tolerance=pd.Timedelta(minutes=float(tolerance_minutes)),
+    )
+    valid = matched["ambient_time"].notna()
+    matched.loc[valid, "temperature_k"] = matched.loc[valid, "observed_temperature_k"]
+    matched.loc[valid, "pressure_pa"] = matched.loc[valid, "observed_pressure_pa"]
+    matched.loc[valid, "condition_source"] = f"timestamped ambient CSV: {path}"
+    requested["ambient_time"] = pd.Series(
+        pd.NaT, index=requested.index, dtype="datetime64[ns, UTC]",
+    )
+    requested = requested.set_index("_order")
+    matched = matched.set_index("_order")
+    for column in ("temperature_k", "pressure_pa", "condition_source", "ambient_time"):
+        requested.loc[matched.index, column] = matched[column]
+    return requested.sort_index()[[
+        "time", "temperature_k", "pressure_pa", "condition_source", "ambient_time",
+    ]].reset_index(drop=True)
 
 
 def parse_saved_date(value):
@@ -398,6 +543,26 @@ def save_data(event=None):
             heatmap_df.to_csv(
                 outdir / f"heatmap_{method_name}_{tr['polarity']}_{stamp}.csv"
             )
+            if "temperature_k" in tr and "pressure_pa" in tr:
+                pd.DataFrame({
+                    "time": pd.to_datetime(tr["x"]),
+                    "temperature_k": tr["temperature_k"],
+                    "pressure_pa": tr["pressure_pa"],
+                    "condition_source": tr.get("condition_source", "unknown"),
+                    "ambient_time": tr.get("ambient_time", pd.NaT),
+                    "scan_id": tr.get("scan_id", "unknown"),
+                    "zratio_used": tr.get("zratio_used", np.nan),
+                    "cpc_type": tr.get("cpc_type", "unknown"),
+                    "cpc_type_mixed": tr.get("cpc_type_mixed", False),
+                    "correction_mode": tr.get("correction_mode", "unknown"),
+                    "transport_delay_seconds": tr.get("transport_delay_seconds", np.nan),
+                    "response_window_seconds": tr.get("response_window_seconds", np.nan),
+                    "dwell_seconds": tr.get("dwell_seconds", np.nan),
+                    "size_step_shift": tr.get("size_step_shift", np.nan),
+                }).to_csv(
+                    outdir / f"heatmap_conditions_{method_name}_{tr['polarity']}_{stamp}.csv",
+                    index=False,
+                )
             support_by_scan = tr.get("part_columns", [])
             if support_by_scan:
                 support_widths = np.column_stack([
@@ -430,12 +595,23 @@ def save_data(event=None):
         elif tr["kind"] == "ion_ratio":
             ion_ratio_df = pd.DataFrame({
                 "time": pd.to_datetime(tr["x"]),
-                "Zp_Zn_raw": tr["y"],
-                "Zp_Zn_smoothed": tr.get("y_smoothed", tr["y"]),
+                "Zn_Zp_raw": tr["y"],
+                "Zn_Zp_smoothed": tr.get("y_smoothed", tr["y"]),
                 "selected_dp_nm": tr["selected_dp"],
+                "scan_id": tr.get("scan_id", ["unknown"] * len(tr["x"])),
             })
             ion_ratio_df = ion_ratio_df.set_index("time").sort_index()
             ion_ratio_df.to_csv(outdir / f"estimated_z_ratio_{stamp}.csv")
+        elif tr["kind"] == "effective_zratio_consistency":
+            rows = tr.get("rows", [])
+            if rows:
+                pd.DataFrame(rows).to_csv(
+                    outdir / f"effective_zratio_polarity_consistency_{stamp}.csv",
+                    index=False,
+                )
+            (outdir / f"effective_zratio_polarity_consistency_{stamp}.json").write_text(
+                json.dumps(_json_safe(tr), indent=2)
+            )
         elif tr["kind"] in {
             "cpc_assignment_diagnostics",
             "range_overlap_diagnostics",
@@ -520,6 +696,32 @@ def save_data(event=None):
             f"npf_growth_models_{stamp}.json",
         ):
             (outdir / filename).unlink(missing_ok=True)
+    if latest_formation_diagnostics:
+        formation_rows = []
+        vector_keys = {
+            "time", "concentration", "accumulation_rate_cm3_s1",
+            "growth_outflux_cm3_s1", "coagulation_loss_cm3_s1",
+            "formation_rate", "growth_rate_nm_h", "growth_source",
+            "formation_rate_low", "formation_rate_high", "three_term_budget_available",
+            "temperature_k", "pressure_pa", "condition_source", "ambient_time",
+        }
+        for item in latest_formation_diagnostics:
+            metadata = {key: value for key, value in item.items() if key not in vector_keys}
+            for index, timestamp in enumerate(item["time"]):
+                formation_rows.append({
+                    **metadata,
+                    **{key: item[key][index] for key in vector_keys if key in item},
+                    "time": timestamp,
+                })
+        pd.DataFrame(formation_rows).to_csv(
+            outdir / f"formation_rate_budget_{stamp}.csv", index=False
+        )
+        (outdir / f"formation_rate_budget_{stamp}.json").write_text(
+            json.dumps(_json_safe(latest_formation_diagnostics), indent=2)
+        )
+    elif daily_overwrite_checkbox.value:
+        (outdir / f"formation_rate_budget_{stamp}.csv").unlink(missing_ok=True)
+        (outdir / f"formation_rate_budget_{stamp}.json").unlink(missing_ok=True)
     if latest_aerosol_properties:
         property_rows = []
         for item in latest_aerosol_properties:
@@ -538,6 +740,20 @@ def save_data(event=None):
             f"aerosol_properties_{stamp}.json",
         ):
             (outdir / filename).unlink(missing_ok=True)
+    if latest_mode_tracks:
+        mode_rows = []
+        for item in latest_mode_tracks:
+            metadata = {key: value for key, value in item.items() if key != "rows"}
+            mode_rows.extend({**metadata, **row} for row in item["rows"])
+        pd.DataFrame(mode_rows).to_csv(
+            outdir / f"temporal_mode_tracks_{stamp}.csv", index=False
+        )
+        (outdir / f"temporal_mode_tracks_{stamp}.json").write_text(
+            json.dumps(_json_safe(latest_mode_tracks), indent=2)
+        )
+    elif daily_overwrite_checkbox.value:
+        (outdir / f"temporal_mode_tracks_{stamp}.csv").unlink(missing_ok=True)
+        (outdir / f"temporal_mode_tracks_{stamp}.json").unlink(missing_ok=True)
     if latest_modal_analysis is not None:
         pd.DataFrame(latest_modal_analysis.get("components", [])).to_csv(
             outdir / f"clicked_modal_fit_{stamp}.csv", index=False
@@ -562,6 +778,32 @@ def save_data(event=None):
             f"clicked_modal_fit_{stamp}.json",
         ):
             (outdir / filename).unlink(missing_ok=True)
+    if saved_roi_analyses:
+        (outdir / f"roi_analyses_{stamp}.json").write_text(
+            json.dumps(_json_safe(saved_roi_analyses), indent=2)
+        )
+        roi_rows = []
+        for analysis in saved_roi_analyses:
+            roi_rows.extend({
+                "roi_id": analysis["roi_id"],
+                "method": analysis["method"],
+                "polarity": analysis["polarity"],
+                "time_start": analysis["time_start"],
+                "time_end": analysis["time_end"],
+                "size_min_nm": analysis["size_min_nm"],
+                "size_max_nm": analysis["size_max_nm"],
+                **row,
+            } for row in analysis.get("scan_fits", []))
+        pd.DataFrame(roi_rows).to_csv(outdir / f"roi_scan_fits_{stamp}.csv", index=False)
+    elif daily_overwrite_checkbox.value:
+        (outdir / f"roi_analyses_{stamp}.json").unlink(missing_ok=True)
+        (outdir / f"roi_scan_fits_{stamp}.csv").unlink(missing_ok=True)
+    if latest_quality_dashboard:
+        pd.DataFrame(latest_quality_dashboard).to_csv(
+            outdir / f"quality_dashboard_{stamp}.csv", index=False
+        )
+    elif daily_overwrite_checkbox.value:
+        (outdir / f"quality_dashboard_{stamp}.csv").unlink(missing_ok=True)
     status.object = f"Saved plots and data to `{outdir}`."
 
 
@@ -1473,21 +1715,85 @@ qs_lpm = pn.widgets.FloatInput(name="Sample flow qs (L/min)", value=float(settin
 
 temp_K = pn.widgets.FloatInput(name="T (K)", value=float(settings.get("temp_K", 293.15)), step=1, start=1)
 press_Pa = pn.widgets.FloatInput(name="P (Pa)", value=float(settings.get("press_Pa", 101325)), step=100, start=1)
+ambient_conditions_csv = pn.widgets.TextInput(
+    name="Ambient conditions CSV (optional)",
+    value=str(settings.get("ambient_conditions_csv", DEFAULT_SETTINGS["ambient_conditions_csv"])),
+    placeholder="time,temperature_k,pressure_pa",
+    width=500,
+)
+ambient_match_tolerance_min = pn.widgets.FloatInput(
+    name="Ambient match tolerance (min)",
+    value=float(settings.get(
+        "ambient_match_tolerance_min", DEFAULT_SETTINGS["ambient_match_tolerance_min"],
+    )),
+    step=5.0,
+    start=0.0,
+)
+ambient_naive_timezone = pn.widgets.TextInput(
+    name="Timezone for naive ambient/scan times",
+    value=str(settings.get(
+        "ambient_naive_timezone", DEFAULT_SETTINGS["ambient_naive_timezone"],
+    )),
+    placeholder="Europe/Helsinki",
+    width=260,
+)
 
 zratio_widget = pn.widgets.FloatInput(
     name="Zn/Zp",
     value=float(settings.get("zratio", DEFAULT_SETTINGS["zratio"])),
     step=0.01,
+    start=np.finfo(float).tiny,
+)
+positive_ion_mobility = pn.widgets.FloatInput(
+    name="Zp positive mobility (m2/V/s)",
+    value=float(settings.get(
+        "positive_ion_mobility_m2_Vs",
+        DEFAULT_SETTINGS["positive_ion_mobility_m2_Vs"],
+    )),
+    step=0.05e-4,
+    start=np.finfo(float).tiny,
+)
+positive_ion_mass = pn.widgets.FloatInput(
+    name="Positive ion mass (amu)",
+    value=float(settings.get("positive_ion_mass_amu", DEFAULT_SETTINGS["positive_ion_mass_amu"])),
+    step=1.0,
+    start=np.finfo(float).tiny,
+)
+negative_ion_mass = pn.widgets.FloatInput(
+    name="Negative ion mass (amu)",
+    value=float(settings.get("negative_ion_mass_amu", DEFAULT_SETTINGS["negative_ion_mass_amu"])),
+    step=1.0,
+    start=np.finfo(float).tiny,
+)
+positive_ion_concentration = pn.widgets.FloatInput(
+    name="Positive ion concentration (m-3)",
+    value=float(settings.get(
+        "positive_ion_concentration_m3",
+        DEFAULT_SETTINGS["positive_ion_concentration_m3"],
+    )),
+    step=1e12,
+    start=np.finfo(float).tiny,
+)
+negative_ion_concentration = pn.widgets.FloatInput(
+    name="Negative ion concentration (m-3)",
+    value=float(settings.get(
+        "negative_ion_concentration_m3",
+        DEFAULT_SETTINGS["negative_ion_concentration_m3"],
+    )),
+    step=1e12,
+    start=np.finfo(float).tiny,
 )
 zratio_min_widget = pn.widgets.FloatInput(
     name="Zn/Zp min",
     value=float(settings.get("zratio_min", DEFAULT_SETTINGS["zratio_min"])),
     step=0.01,
+    start=np.finfo(float).tiny,
 )
 zratio_max_widget = pn.widgets.FloatInput(
     name="Zn/Zp max",
     value=float(settings.get("zratio_max", DEFAULT_SETTINGS["zratio_max"])),
     step=0.01,
+    start=np.finfo(float).tiny,
 )
 zratio_smoothing_step = pn.widgets.FloatInput(
     name="Zn/Zp max step",
@@ -1802,6 +2108,12 @@ modal_fit_max_nm = pn.widgets.FloatInput(
     step=5.0,
     width=180,
 )
+mode_tracking_enabled = pn.widgets.Checkbox(
+    name="Enable heuristic temporal mode tracking (slow)",
+    value=bool(settings.get(
+        "mode_tracking_enabled", DEFAULT_SETTINGS["mode_tracking_enabled"],
+    )),
+)
 difference_peak_min_size_nm = pn.widgets.FloatInput(
     name="Diff peak min dp (nm)",
     value=float(settings.get(
@@ -1809,6 +2121,29 @@ difference_peak_min_size_nm = pn.widgets.FloatInput(
         DEFAULT_SETTINGS["difference_peak_min_size_nm"],
     )),
     step=1.0,
+)
+effective_zratio_diagnostic_enabled = pn.widgets.Checkbox(
+    name="Estimate effective Zn/Zp from polarity agreement",
+    value=bool(settings.get(
+        "effective_zratio_diagnostic_enabled",
+        DEFAULT_SETTINGS["effective_zratio_diagnostic_enabled"],
+    )),
+)
+effective_zratio_min_size_nm = pn.widgets.FloatInput(
+    name="Effective Zn/Zp min dp (nm)",
+    value=float(settings.get(
+        "effective_zratio_min_size_nm", DEFAULT_SETTINGS["effective_zratio_min_size_nm"],
+    )),
+    step=1.0,
+    start=1.0,
+)
+effective_zratio_max_size_nm = pn.widgets.FloatInput(
+    name="Effective Zn/Zp max dp (nm)",
+    value=float(settings.get(
+        "effective_zratio_max_size_nm", DEFAULT_SETTINGS["effective_zratio_max_size_nm"],
+    )),
+    step=1.0,
+    start=1.0,
 )
 
 tube_segments = pn.widgets.TextAreaInput(
@@ -1830,6 +2165,11 @@ inversion_methods = pn.widgets.MultiChoice(
     value=[method_label(method) for method in saved_methods],
     width=700,
 )
+roi_selection_tool = pn.widgets.Select(
+    name="Heatmap ROI tool",
+    options={"Rectangle": "select", "Freehand": "lasso"},
+    value="select",
+)
 
 status = pn.pane.Markdown("Status: idle")
 
@@ -1839,9 +2179,103 @@ residual_plot = pn.pane.Plotly(width=1300, height=1200)
 difference_plot = pn.pane.Plotly(width=1300)
 smps_timing_plot = pn.pane.Plotly(width=1300, height=1100)
 aerosol_plot = pn.pane.Plotly(width=1300, height=2000)
+mode_tracking_plot = pn.pane.Plotly(width=1100, height=700)
+quality_dashboard_pane = pn.pane.DataFrame(pd.DataFrame(), width=1200, height=500)
 modal_fit_plot = pn.pane.Plotly(width=1000, height=650)
 modal_fit_status = pn.pane.Markdown(
     "Click an inverted heatmap to inspect and fit that scan's size distribution."
+)
+charge_model_status = pn.pane.Markdown()
+charge_comparison_plot = pn.pane.Plotly(height=600, width=1100)
+charge_comparison_button = pn.widgets.Button(
+    name="Update charge-fraction comparison", button_type="primary",
+)
+roi_plot = pn.pane.Plotly(height=650, width=1000)
+roi_status = pn.pane.Markdown(
+    "Use rectangle or freehand selection on an inversion heatmap to save an ROI analysis."
+)
+roi_history = pn.pane.DataFrame(pd.DataFrame(), width=1100, height=260)
+clear_rois_button = pn.widgets.Button(name="Clear saved ROIs", button_type="warning")
+
+
+def charge_model_description(methods, minimum_nm):
+    lines = ["**Charge model provenance and validity**"]
+    for method in normalize_inversion_methods(methods):
+        lines.append(f"- **{method_label(method)}:** {CHARGE_MODEL_PROVENANCE[method]}")
+    if float(minimum_nm) < 20 and "gunn woessner mod" in normalize_inversion_methods(methods):
+        lines.append("- **Warning:** Gunn-Woessner modified is extrapolated below 20 nm.")
+    lines.append(
+        "- `Zn/Zp` is a mobility ratio. Scan-derived conductivity ratios are "
+        "corrected using the configured `Np/Nn`; those quantities are not "
+        "independently identifiable from the polarity signals alone."
+    )
+    return "\n".join(lines)
+
+
+def build_charge_fraction_comparison(
+    minimum_nm, maximum_nm, temperature, pressure, zp, zn_over_zp,
+    positive_mass, negative_mass, positive_concentration, negative_concentration,
+):
+    minimum_nm = max(1.0, float(minimum_nm))
+    maximum_nm = max(minimum_nm * 1.01, float(maximum_nm))
+    diameters_nm = np.geomspace(minimum_nm, maximum_nm, 80)
+    diameters_m = diameters_nm * 1e-9
+    zp = float(zp)
+    zn = float(zn_over_zp) * zp
+    common = (
+        float(temperature), zp, zn, float(positive_mass), float(negative_mass),
+        float(positive_concentration), float(negative_concentration),
+    )
+    fig = go.Figure()
+    for method in selected_inversion_methods():
+        for charge_number, color_dash in ((-1, "solid"), (1, "dot")):
+            if method == "gunn woessner mod":
+                values = inv.gunn_woessner_modified(
+                    charge_number, diameters_m, *common, 0,
+                )
+            elif method == "wiedensohler":
+                values = inv.varaus(diameters_m, [charge_number], temperature)[:, 0]
+            else:
+                values = np.array([
+                    inv.fuchs_charge_fractions(
+                        diameter, [charge_number], Zp=zp, Zn=zn,
+                        Mrp=positive_mass, Mrn=negative_mass,
+                        Np=positive_concentration, Nn=negative_concentration,
+                        T=temperature, P=pressure,
+                    )[0]
+                    for diameter in diameters_m
+                ])
+            fig.add_scatter(
+                x=diameters_nm,
+                y=values,
+                mode="lines",
+                line={"dash": color_dash},
+                name=f"{method_label(method)} q={charge_number:+d}",
+            )
+    fig.update_layout(
+        title="Bipolar equilibrium charge-fraction comparison",
+        xaxis={"title": "Particle diameter (nm)", "type": "log"},
+        yaxis={"title": "Charge fraction", "rangemode": "tozero"},
+        margin={"l": 70, "r": 30, "t": 60, "b": 60},
+    )
+    return fig
+
+
+def update_charge_comparison(event=None):
+    charge_model_status.object = charge_model_description(
+        inversion_methods.value, smallest_size.value,
+    )
+    charge_comparison_plot.object = build_charge_fraction_comparison(
+        smallest_size.value, max(300.0, modal_fit_max_nm.value), temp_K.value,
+        press_Pa.value,
+        positive_ion_mobility.value, zratio_widget.value,
+        positive_ion_mass.value, negative_ion_mass.value,
+        positive_ion_concentration.value, negative_ion_concentration.value,
+    )
+
+
+charge_model_status.object = charge_model_description(
+    inversion_methods.value, smallest_size.value,
 )
 
 
@@ -2216,64 +2650,68 @@ def estimate_ion_mobility_ratio_for_scan(g_scan, temp=293.15, press=101325):
         dp_g_nm = dp_g_m * 1e9
 
         if dp_g_nm > np.nanmax(dp):
-            return np.sqrt(Rp[i] / Rn[i]), dp[i]
+            concentration_correction = (
+                float(positive_ion_concentration.value)
+                / float(negative_ion_concentration.value)
+            )
+            return np.sqrt(Rp[i] / Rn[i]) * concentration_correction, dp[i]
 
         Rg_pos = np.interp(dp_g_nm, dp, Rp)
         Rg_neg = np.interp(dp_g_nm, dp, Rn)
 
         zratio_default = float(zratio_widget.value)
-        Zn = 1e-4
-        Zp = zratio_default * Zn
+        Zp = float(positive_ion_mobility.value)
+        Zn = zratio_default * Zp
 
         fw_pos_1 = inv.gunn_woessner_modified(
-            1,
-            np.array([dp_g_m]),
-            temp,
-            Zp,
-            Zn,
-            140,
-            101,
-            1e13,
-            1e13,
-            0,
-        )
-        
-        fw_pos_2 = inv.gunn_woessner_modified(
-            2,
-            np.array([dp_g_m]),
-            temp,
-            Zp,
-            Zn,
-            140,
-            101,
-            1e13,
-            1e13,
-            0,
-        )
-
-        fw_neg_1 = inv.gunn_woessner_modified(
             -1,
             np.array([dp_g_m]),
             temp,
             Zp,
             Zn,
-            140,
-            101,
-            1e13,
-            1e13,
+            float(positive_ion_mass.value),
+            float(negative_ion_mass.value),
+            float(positive_ion_concentration.value),
+            float(negative_ion_concentration.value),
             0,
         )
         
-        fw_neg_2 = inv.gunn_woessner_modified(
+        fw_pos_2 = inv.gunn_woessner_modified(
             -2,
             np.array([dp_g_m]),
             temp,
             Zp,
             Zn,
-            140,
-            101,
-            1e13,
-            1e13,
+            float(positive_ion_mass.value),
+            float(negative_ion_mass.value),
+            float(positive_ion_concentration.value),
+            float(negative_ion_concentration.value),
+            0,
+        )
+
+        fw_neg_1 = inv.gunn_woessner_modified(
+            1,
+            np.array([dp_g_m]),
+            temp,
+            Zp,
+            Zn,
+            float(positive_ion_mass.value),
+            float(negative_ion_mass.value),
+            float(positive_ion_concentration.value),
+            float(negative_ion_concentration.value),
+            0,
+        )
+        
+        fw_neg_2 = inv.gunn_woessner_modified(
+            2,
+            np.array([dp_g_m]),
+            temp,
+            Zp,
+            Zn,
+            float(positive_ion_mass.value),
+            float(negative_ion_mass.value),
+            float(positive_ion_concentration.value),
+            float(negative_ion_concentration.value),
             0,
         )
 
@@ -2284,7 +2722,11 @@ def estimate_ion_mobility_ratio_for_scan(g_scan, temp=293.15, press=101325):
         ok_neg = double_neg < 0.10 * Rn[i]
 
         if ok_pos and ok_neg:
-            return np.sqrt(Rp[i] / Rn[i]), dp[i]
+            concentration_correction = (
+                float(positive_ion_concentration.value)
+                / float(negative_ion_concentration.value)
+            )
+            return np.sqrt(Rp[i] / Rn[i]) * concentration_correction, dp[i]
 
     return np.nan, np.nan
 
@@ -2309,16 +2751,15 @@ def smooth_ion_ratio_points(ion_points):
 
     if max_step <= 0:
         return [
-            (t, raw + offset if np.isfinite(raw) else raw, ratio_for_use(raw + offset if np.isfinite(raw) else raw), dp, scan_id)
+            (t, raw, ratio_for_use(raw + offset if np.isfinite(raw) else raw), dp, scan_id)
             for t, raw, dp, scan_id in ion_points
         ]
 
     smoothed_points = []
     previous = np.nan
     for t, raw, dp, scan_id in sorted(ion_points, key=lambda x: x[0]):
-        if np.isfinite(raw):
-            raw = raw + offset
-        used = ratio_for_use(raw)
+        adjusted = raw + offset if np.isfinite(raw) else raw
+        used = ratio_for_use(adjusted)
         if np.isfinite(previous):
             delta = used - previous
             smoothed = previous + np.clip(delta, -max_step, max_step)
@@ -2422,7 +2863,7 @@ def invert_one_scan(
     if zratio is None or not np.isfinite(zratio) or use_zratio_checkbox.value:
         zratio = float(zratio_widget.value)
 
-    zp = 1e-4
+    zp = float(positive_ion_mobility.value)
     zn = zratio * zp
 
     for i, dp_nm in enumerate(dp_meas_nm):
@@ -2440,8 +2881,8 @@ def invert_one_scan(
             qa, qc, qm, qs,
             1.93, qa, 1,
             zp, zn,
-            140, 101,
-            1e13, 1e13,
+            float(positive_ion_mass.value), float(negative_ion_mass.value),
+            float(positive_ion_concentration.value), float(negative_ion_concentration.value),
             inversion_method,
             0,
             parsed_tube_segments,
@@ -2563,6 +3004,16 @@ def run_inversion_calculation(df):
     ntot_closure_diagnostics = []
 
     group_key = "scan_id" if "scan_id" in df.columns else "scan_number"
+    scan_condition_times = df.groupby(group_key)["time"].median()
+    matched_conditions = load_timestamped_ambient_conditions(
+        scan_condition_times.to_numpy(), ambient_conditions_csv.value,
+        temp_K.value, press_Pa.value, ambient_match_tolerance_min.value,
+        ambient_naive_timezone.value,
+    )
+    conditions_by_scan = {
+        scan_id: row
+        for scan_id, (_, row) in zip(scan_condition_times.index, matched_conditions.iterrows())
+    }
     transport_assignments = {}
     response_kernel_result = None
     if scan_inversion_type.value == "SMPS" and smps_correction_mode.value == "Transport delay":
@@ -2602,10 +3053,11 @@ def run_inversion_calculation(df):
 
     zratios = {}
     for scan_id, g_scan in df.groupby(group_key):
+        conditions = conditions_by_scan[scan_id]
         zratio, selected_dp = estimate_ion_mobility_ratio_for_scan(
             g_scan,
-            temp=float(temp_K.value),
-            press=float(press_Pa.value),
+            temp=float(conditions["temperature_k"]),
+            press=float(conditions["pressure_pa"]),
         )
         if np.isfinite(zratio):
             ion_points.append((g_scan["time"].median(), zratio, selected_dp, scan_id))
@@ -2624,16 +3076,32 @@ def run_inversion_calculation(df):
             heat_part_columns = []
             heat_times = []
             heat_flow_rel_rmse = []
+            heat_temperatures = []
+            heat_pressures = []
+            heat_condition_sources = []
+            heat_ambient_times = []
+            heat_scan_ids = []
+            heat_zratios_used = []
+            heat_cpc_types = []
+            heat_cpc_type_mixed = []
             ntot_vals = []
             ntot_measured = []
             residual_rows = []
 
             for scan_id, g_scan in dd.groupby(group_key):
                 zratio = zratios.get(scan_id, np.nan)
+                if (
+                    inversion_method == "fuchs" or use_zratio_checkbox.value
+                    or not np.isfinite(zratio) or zratio <= 0
+                ):
+                    # Fuchs and explicit/fallback settings do not use the
+                    # scan-derived Gunn-Woessner estimate.
+                    zratio = float(zratio_widget.value)
                 scan_parts = []
                 ntot_scan = 0.0
-                temp = float(temp_K.value)
-                press = float(press_Pa.value)
+                conditions = conditions_by_scan[scan_id]
+                temp = float(conditions["temperature_k"])
+                press = float(conditions["pressure_pa"])
                 qa = float(qa_lpm.value) / 60000.0
                 qs = float(qs_lpm.value) / 60000.0
                 q_sheath_lpm = float(g_scan["sheath_setpoint"].median())
@@ -2656,6 +3124,7 @@ def run_inversion_calculation(df):
                     "cpc_type", pd.Series("3010", index=g_scan.index)
                 ).dropna().astype(str)
                 scan_cpc_type = cpc_type_values.mode().iloc[0] if len(cpc_type_values) else "3010"
+                scan_cpc_type_mixed = cpc_type_values.nunique() > 1
 
                 for _, g_range in g_scan.groupby("scan_range"):
                     cpc_series_override = None
@@ -2828,6 +3297,16 @@ def run_inversion_calculation(df):
                 ])
                 heat_times.append(g_scan["time"].median())
                 heat_flow_rel_rmse.append(flow_rel_rmse)
+                heat_temperatures.append(temp)
+                heat_pressures.append(press)
+                heat_condition_sources.append(conditions["condition_source"])
+                heat_ambient_times.append(conditions["ambient_time"])
+                heat_scan_ids.append(str(scan_id))
+                heat_zratios_used.append(
+                    float(zratio) if inversion_method != "wiedensohler" else np.nan
+                )
+                heat_cpc_types.append(scan_cpc_type)
+                heat_cpc_type_mixed.append(bool(scan_cpc_type_mixed))
                 ntot_limit = float(ntot_plot_max.value)
                 if np.isfinite(ntot_limit) and ntot_limit > 0 and ntot_scan > ntot_limit:
                     ntot_scan = np.nan
@@ -2843,6 +3322,22 @@ def run_inversion_calculation(df):
                     "x": heat_times,
                     "y": size_axis,
                     "flow_rel_rmse": heat_flow_rel_rmse,
+                    "temperature_k": heat_temperatures,
+                    "pressure_pa": heat_pressures,
+                    "condition_source": heat_condition_sources,
+                    "ambient_time": heat_ambient_times,
+                    "scan_id": heat_scan_ids,
+                    "zratio_used": heat_zratios_used,
+                    "cpc_type": heat_cpc_types,
+                    "cpc_type_mixed": heat_cpc_type_mixed,
+                    "correction_mode": (
+                        smps_correction_mode.value
+                        if scan_inversion_type.value == "SMPS" else "DMPS point assignment"
+                    ),
+                    "transport_delay_seconds": float(smps_transport_delay_sec.value),
+                    "response_window_seconds": float(smps_response_window_sec.value),
+                    "dwell_seconds": float(smps_dwell_sec.value),
+                    "size_step_shift": int(smps_size_step_shift.value),
                     "part_columns": heat_part_columns,
                 })
 
@@ -2891,6 +3386,16 @@ def run_inversion_calculation(df):
         "kind": "kernel_sample_residuals",
         "rows": kernel_sample_residuals,
     })
+    if effective_zratio_diagnostic_enabled.value:
+        effective_diagnostic = diag.build_effective_zratio_diagnostics(
+            output,
+            minimum_size_nm=float(effective_zratio_min_size_nm.value),
+            maximum_size_nm=float(effective_zratio_max_size_nm.value),
+            candidate_min=float(zratio_min_widget.value),
+            candidate_max=float(zratio_max_widget.value),
+        )
+        if effective_diagnostic is not None:
+            output.append(effective_diagnostic)
 
     return output
 
@@ -2928,7 +3433,7 @@ def scan_polarity_label(polarity):
 
 
 def plot_aerosol_property_diagnostics(result):
-    global latest_aerosol_properties
+    global latest_aerosol_properties, latest_mode_tracks
     latest_aerosol_properties = diag.build_aerosol_property_diagnostics(
         result,
         temperature_k=float(temp_K.value),
@@ -2936,6 +3441,33 @@ def plot_aerosol_property_diagnostics(result):
         coagulation_targets_nm=parsed_coagulation_targets(),
         particle_density_kg_m3=float(particle_density_kg_m3.value),
     )
+    mode_figure = go.Figure()
+    for item in latest_mode_tracks:
+        frame = pd.DataFrame(item["rows"])
+        if frame.empty:
+            continue
+        for track_id, track in frame.groupby("track_id"):
+            mode_figure.add_scatter(
+                x=track["time"], y=track["mode_diameter_nm"],
+                mode="lines+markers",
+                name=(f"{method_label(item['method'])} "
+                      f"{scan_polarity_label(item['polarity'])} {track_id}"),
+                customdata=diag.plotly_customdata(
+                    track["area_cm3"], track["geometric_std"], track["fit_r2"],
+                ),
+                hovertemplate=(
+                    "time=%{x}<br>Dg=%{y:.2f} nm<br>N=%{customdata[0]:.1f} cm-3"
+                    "<br>GSD=%{customdata[1]:.2f}<br>fit R2=%{customdata[2]:.3f}<extra></extra>"
+                ),
+            )
+    mode_figure.update_layout(
+        title="Heuristic temporal lognormal-mode tracks",
+        xaxis={"title": "Time"},
+        yaxis={"title": "Mode diameter (nm)", "type": "log"},
+        margin={"l": 70, "r": 260, "t": 60, "b": 50},
+        legend={"x": 1.02, "y": 1.0},
+    )
+    mode_tracking_plot.object = mode_figure if latest_mode_tracks else None
     if not latest_aerosol_properties:
         aerosol_plot.object = None
         return None
@@ -2974,8 +3506,8 @@ def plot_aerosol_property_diagnostics(result):
     fig.update_xaxes(title_text="Time", tickformat="%Y-%m-%d %H:%M", row=6, col=1)
     fig.update_layout(
         height=2000, width=1300,
-        title=(f"Measured-range aerosol properties at configured T={float(temp_K.value):.2f} K, "
-               f"P={float(press_Pa.value):.0f} Pa; no size extrapolation"),
+        title=("Measured-range aerosol properties using per-scan ambient conditions "
+               "with configured T/P fallback; no size extrapolation"),
         margin=dict(l=70, r=260, t=80, b=50), legend=dict(x=1.02, y=1.0),
     )
     aerosol_plot.object = fig
@@ -3019,6 +3551,21 @@ def analyze_heatmap_click(click_data, figure, result, mode_setting, min_nm, max_
         return None
     sizes = np.asarray(trace["y"], dtype=float)
     concentration = np.asarray(trace["Z"], dtype=float)[:, time_index]
+    trace_temperatures = trace.get("temperature_k", [])
+    trace_pressures = trace.get("pressure_pa", [])
+    trace_sources = trace.get("condition_source", [])
+    temperature = float(
+        trace_temperatures[time_index]
+        if time_index < len(trace_temperatures) else temp_K.value
+    )
+    pressure = float(
+        trace_pressures[time_index]
+        if time_index < len(trace_pressures) else press_Pa.value
+    )
+    condition_source = (
+        trace_sources[time_index]
+        if time_index < len(trace_sources) else "configured fallback"
+    )
     support_by_scan = trace.get("part_columns", [])
     part_columns = support_by_scan[time_index] if time_index < len(support_by_scan) else None
     lower, upper = sorted((float(min_nm), float(max_nm)))
@@ -3042,21 +3589,241 @@ def analyze_heatmap_click(click_data, figure, result, mode_setting, min_nm, max_
         "fit_max_nm": upper, "clicked_diameter_nm": float(point.get("y", np.nan)),
         "moments": diag.distribution_moments(sizes, concentration, part_columns),
         "condensation_sink_s1": diag.sulfuric_acid_condensation_sink(
-            sizes, concentration, float(temp_K.value), float(press_Pa.value),
+            sizes, concentration, temperature, pressure,
             part_columns),
         "coagulation_sinks_s1": {
             f"{target:g}nm": diag.brownian_coagulation_sink(
-                sizes, concentration, target, float(temp_K.value),
-                float(press_Pa.value), float(particle_density_kg_m3.value),
+                sizes, concentration, target, temperature,
+                pressure, float(particle_density_kg_m3.value),
                 part_columns)
             for target in parsed_coagulation_targets()
         },
-        "temperature_k": float(temp_K.value),
-        "pressure_pa": float(press_Pa.value),
+        "temperature_k": temperature,
+        "pressure_pa": pressure,
+        "condition_source": condition_source,
         "particle_density_kg_m3": float(particle_density_kg_m3.value),
         "range_semantics": "observations and moments are measured-range; modal full area is model-extrapolated",
     })
     return fitted
+
+
+def analyze_heatmap_roi(selection_data, figure, result, mode_setting):
+    """Fit all scans and the median distribution inside selected heatmap cells."""
+    if not selection_data or figure is None or not selection_data.get("points"):
+        return None
+    selected_by_curve = {}
+    for point in selection_data["points"]:
+        curve_number = point.get("curveNumber")
+        point_number = point.get("pointNumber", point.get("pointIndex"))
+        if (
+            curve_number is None
+            or not isinstance(point_number, (list, tuple, np.ndarray))
+            or len(point_number) != 2
+        ):
+            continue
+        selected_by_curve.setdefault(int(curve_number), []).append(
+            (int(point_number[0]), int(point_number[1]))
+        )
+
+    curve_number = next((
+        number for number in selected_by_curve
+        if 0 <= number < len(figure.data)
+        and isinstance(figure.data[number].meta, dict)
+        and figure.data[number].meta.get("kind") == "inversion_heatmap"
+    ), None)
+    if curve_number is None:
+        return None
+    metadata = figure.data[curve_number].meta
+    trace = next((item for item in result if item.get("kind") == "heatmap"
+                  and item.get("method", "gunn woessner mod") == metadata["method"]
+                  and item.get("polarity") == metadata["polarity"]), None)
+    if trace is None:
+        return None
+
+    sizes = np.asarray(trace["y"], dtype=float)
+    times = pd.DatetimeIndex(pd.to_datetime(trace["x"], errors="coerce"))
+    z = np.asarray(trace["Z"], dtype=float)
+    valid_cells = sorted(set(
+        (size_index, time_index)
+        for size_index, time_index in selected_by_curve[curve_number]
+        if 0 <= size_index < len(sizes) and 0 <= time_index < len(times)
+    ))
+    if not valid_cells:
+        return None
+
+    scan_fits = []
+    selected_values = np.full_like(z, np.nan, dtype=float)
+    support_by_scan = trace.get("part_columns", [])
+    selected_time_indices = np.array(sorted({cell[1] for cell in valid_cells}), dtype=int)
+    selected_index_sets = []
+
+    def longest_connected(indices, time_indices):
+        indices = np.asarray(sorted(set(indices)), dtype=int)
+        if not len(indices):
+            return indices
+        breaks = []
+        for position, (left, right) in enumerate(zip(indices[:-1], indices[1:]), start=1):
+            disconnected = right != left + 1
+            for time_index in time_indices:
+                parts = support_by_scan[time_index] if time_index < len(support_by_scan) else None
+                if parts is not None and not any(
+                    np.isfinite(np.asarray(part, dtype=float)[left])
+                    and np.isfinite(np.asarray(part, dtype=float)[right])
+                    for part in parts
+                ):
+                    disconnected = True
+                    break
+            if disconnected:
+                breaks.append(position)
+        groups = np.split(indices, breaks)
+        return max(groups, key=len)
+
+    for time_index in selected_time_indices:
+        raw_size_indices = np.array([
+            size_index for size_index, selected_time in valid_cells
+            if selected_time == time_index
+        ], dtype=int)
+        selected_index_sets.append(set(raw_size_indices))
+        selected_values[raw_size_indices, time_index] = z[raw_size_indices, time_index]
+        size_indices = longest_connected(raw_size_indices, [time_index])
+        part_columns = (
+            support_by_scan[time_index]
+            if time_index < len(support_by_scan) else None
+        )
+        selected_parts = (
+            [np.asarray(column, dtype=float)[size_indices] for column in part_columns]
+            if part_columns is not None else None
+        )
+        fitted = (
+            diag.select_lognormal_mode_fit(
+                sizes[size_indices], z[size_indices, time_index], 3, selected_parts,
+            )
+            if str(mode_setting).startswith("Auto")
+            else diag.fit_lognormal_modes(
+                sizes[size_indices], z[size_indices, time_index],
+                int(mode_setting), selected_parts,
+            )
+        )
+        row = {
+            "time": times[time_index],
+            "status": fitted.get("status", "failed"),
+            "reason": fitted.get("reason", ""),
+            "number_of_modes": fitted.get("number_of_modes", 0),
+            "r2": fitted.get("r2", np.nan),
+            "selected_cell_count": len(raw_size_indices),
+            "fit_cell_count": len(size_indices),
+        }
+        if fitted.get("status") == "ok":
+            row["components"] = fitted["components"]
+        scan_fits.append(row)
+
+    common_indices = longest_connected(
+        set.intersection(*selected_index_sets), selected_time_indices,
+    )
+    if len(common_indices):
+        roi_values = selected_values[np.ix_(common_indices, selected_time_indices)]
+        aggregate = np.nanmedian(roi_values, axis=1)
+        aggregate_fit = (
+            diag.select_lognormal_mode_fit(sizes[common_indices], aggregate, 3)
+            if str(mode_setting).startswith("Auto")
+            else diag.fit_lognormal_modes(
+                sizes[common_indices], aggregate, int(mode_setting),
+            )
+        )
+    else:
+        aggregate = np.array([], dtype=float)
+        aggregate_fit = {
+            "status": "failed",
+            "reason": "no common contiguous diameter support across selected scans",
+        }
+    all_size_indices = np.array(sorted({cell[0] for cell in valid_cells}), dtype=int)
+    return {
+        "status": "ok",
+        "method": metadata["method"],
+        "polarity": metadata["polarity"],
+        "time_start": times[selected_time_indices].min(),
+        "time_end": times[selected_time_indices].max(),
+        "size_min_nm": float(np.min(sizes[all_size_indices])),
+        "size_max_nm": float(np.max(sizes[all_size_indices])),
+        "selected_cell_count": len(valid_cells),
+        "selected_scan_count": len(selected_time_indices),
+        "diameter_nm": sizes[common_indices],
+        "median_concentration": aggregate,
+        "aggregate_fit": aggregate_fit,
+        "scan_fits": scan_fits,
+        "selection_semantics": (
+            "exact Plotly-selected cells retained; each fit uses its longest "
+            "contiguous run and the aggregate uses common contiguous support"
+        ),
+    }
+
+
+def _roi_history_frame():
+    return pd.DataFrame([{
+        "ROI": item["roi_id"],
+        "Method": method_label(item["method"]),
+        "Polarity": scan_polarity_label(item["polarity"]),
+        "Start": item["time_start"],
+        "End": item["time_end"],
+        "dp min (nm)": item["size_min_nm"],
+        "dp max (nm)": item["size_max_nm"],
+        "Scans": item["selected_scan_count"],
+        "Cells": item["selected_cell_count"],
+    } for item in saved_roi_analyses])
+
+
+def render_roi_analysis(analysis):
+    if analysis is None:
+        return
+    analysis = copy.deepcopy(analysis)
+    analysis["roi_id"] = f"ROI-{len(saved_roi_analyses) + 1}"
+    saved_roi_analyses.append(analysis)
+    roi_history.object = _roi_history_frame()
+    aggregate_fit = analysis["aggregate_fit"]
+    fig = go.Figure()
+    fig.add_scatter(
+        x=analysis["diameter_nm"], y=analysis["median_concentration"],
+        mode="markers+lines", name="ROI median",
+    )
+    if aggregate_fit.get("status") == "ok":
+        fig.add_scatter(
+            x=aggregate_fit["curve_diameter_nm"], y=aggregate_fit["curve_total"],
+            mode="lines", line={"color": "black", "dash": "dash"},
+            name="Aggregate modal fit",
+        )
+    fig.update_layout(
+        title=(f"{analysis['roi_id']}: {method_label(analysis['method'])} "
+               f"{scan_polarity_label(analysis['polarity'])}"),
+        xaxis={"title": "Particle diameter (nm)", "type": "log"},
+        yaxis={"title": "dN/dlog10Dp (cm-3)"},
+    )
+    roi_plot.object = fig
+    successful = sum(row["status"] == "ok" for row in analysis["scan_fits"])
+    roi_status.object = (
+        f"**{analysis['roi_id']} saved:** {analysis['selected_scan_count']} scans, "
+        f"{analysis['selected_cell_count']} cells, {successful} successful per-scan "
+        f"modal fits; {analysis['size_min_nm']:.1f}-{analysis['size_max_nm']:.1f} nm."
+    )
+
+
+def on_inversion_heatmap_selection(event):
+    if latest_inversion is not None:
+        render_roi_analysis(analyze_heatmap_roi(
+            event.new, inversion_plot.object, latest_inversion, modal_fit_modes.value,
+        ))
+
+
+def clear_saved_rois(event=None):
+    saved_roi_analyses.clear()
+    roi_history.object = pd.DataFrame()
+    roi_plot.object = None
+    roi_status.object = "Saved ROI analyses cleared for this explorer."
+
+
+def update_roi_selection_tool(event=None):
+    if inversion_plot.object is not None:
+        inversion_plot.object.update_layout(dragmode=roi_selection_tool.value)
+        inversion_plot.param.trigger("object")
 
 
 def render_modal_analysis(analysis, plot_pane=None, status_pane=None):
@@ -3102,11 +3869,21 @@ def on_inversion_heatmap_click(event):
             modal_fit_modes.value, modal_fit_min_nm.value, modal_fit_max_nm.value))
 
 def plot_inversion_result(result):
-    global latest_growth_diagnostics, latest_growth_settings, latest_modal_analysis
+    global latest_growth_diagnostics, latest_growth_settings
+    global latest_modal_analysis, latest_formation_diagnostics
+    global latest_quality_dashboard, latest_mode_tracks
     latest_modal_analysis = None
+    saved_roi_analyses.clear()
+    roi_history.object = pd.DataFrame()
+    roi_plot.object = None
+    roi_status.object = "ROI history reset for the new inversion result."
     modal_fit_plot.object = None
     modal_fit_status.object = "Click an inverted heatmap to inspect and fit that scan's size distribution."
     heatmaps = [tr for tr in result if tr["kind"] == "heatmap"]
+    latest_mode_tracks = (
+        diag.build_temporal_mode_diagnostics(result)
+        if mode_tracking_enabled.value else []
+    )
     heatmap_keys = [(tr.get("method", "gunn woessner mod"), tr["polarity"]) for tr in heatmaps]
     comparisons = build_scan_smeariii_comparison_heatmaps(result)
     comparison_keys = [key for key in heatmap_keys if key in comparisons]
@@ -3149,9 +3926,22 @@ def plot_inversion_result(result):
         growth_max_size_nm=float(growth_max_size_nm.value),
         ntot_limit=float(ntot_plot_max.value),
         method_label=method_label,
+        growth_diagnostics=growth_diagnostics,
+        temperature_k=float(temp_K.value),
+        pressure_pa=float(press_Pa.value),
+        particle_density_kg_m3=float(particle_density_kg_m3.value),
     )
+    latest_formation_diagnostics = formation_diagnostics
     polarity_differences = diag.build_polarity_difference_heatmaps(result)
+    effective_zratio_diagnostic = next((
+        trace for trace in result
+        if trace.get("kind") == "effective_zratio_consistency"
+    ), None)
     scan_health = next((tr.get("rows", []) for tr in result if tr.get("kind") == "scan_health"), [])
+    latest_quality_dashboard = diag.build_quality_dashboard(
+        scan_health, latest_mode_tracks, formation_diagnostics,
+    )
+    quality_dashboard_pane.object = pd.DataFrame(latest_quality_dashboard)
     result_t0, result_t1 = result_time_range(result)
     smear_cpc = pd.DataFrame(columns=["time", "SMEARIII_CPC"])
     if result_t0 is not None:
@@ -3165,6 +3955,24 @@ def plot_inversion_result(result):
         for method, polarity in heatmap_keys
     ]
     subplot_titles.extend(["Ntot", "Estimated Zn/Zp ratio"])
+    if effective_zratio_diagnostic is not None:
+        if effective_zratio_diagnostic.get("status") == "ok":
+            summary = (
+                f"median {effective_zratio_diagnostic['median_effective_zratio']:.3f}, "
+                f"{effective_zratio_diagnostic['accepted_pair_count']} accepted pairs"
+            )
+            if effective_zratio_diagnostic.get("stability") == "variable":
+                summary += ", variable between pairs"
+            if effective_zratio_diagnostic.get("cpc_dependence_warning"):
+                summary += ", CPC-dependent warning"
+            if effective_zratio_diagnostic.get("optimum_at_candidate_boundary"):
+                summary += ", candidate-range boundary warning"
+        else:
+            summary = effective_zratio_diagnostic.get("reason", "unavailable")
+        subplot_titles.extend([
+            f"Effective Zn/Zp from Gunn-Woessner polarity agreement ({summary})",
+            "Effective Zn/Zp candidate objective (lower is better)",
+        ])
     if growth_diagnostics:
         rates = ", ".join(
             f"{growth_diag['model']} {growth_diag['polarity']}: "
@@ -3173,7 +3981,7 @@ def plot_inversion_result(result):
         )
         subplot_titles.append(f"NPF growth-model comparison ({rates})")
     if formation_diagnostics:
-        subplot_titles.append("NPF apparent accumulation / onset diagnostic")
+        subplot_titles.append("NPF concentration, three-term apparent J budget in hover")
     if scan_health:
         subplot_titles.append("Scan health")
     subplot_titles.extend([
@@ -3192,10 +4000,15 @@ def plot_inversion_result(result):
 
     ntot_row = len(heatmap_keys) + 1
     ion_ratio_row = ntot_row + 1
-    growth_row = ion_ratio_row + 1 if growth_diagnostics else None
-    formation_row = ion_ratio_row + 1 + int(bool(growth_diagnostics)) if formation_diagnostics else None
-    scan_health_row = ion_ratio_row + 1 + int(bool(growth_diagnostics)) + int(bool(formation_diagnostics)) if scan_health else None
-    median_row = ion_ratio_row + 1 + int(bool(growth_diagnostics)) + int(bool(formation_diagnostics)) + int(bool(scan_health))
+    effective_zratio_row = ion_ratio_row + 1 if effective_zratio_diagnostic is not None else None
+    effective_zratio_objective_row = (
+        effective_zratio_row + 1 if effective_zratio_row is not None else None
+    )
+    after_zratio_row = ion_ratio_row + 2 * int(effective_zratio_diagnostic is not None)
+    growth_row = after_zratio_row + 1 if growth_diagnostics else None
+    formation_row = after_zratio_row + 1 + int(bool(growth_diagnostics)) if formation_diagnostics else None
+    scan_health_row = after_zratio_row + 1 + int(bool(growth_diagnostics)) + int(bool(formation_diagnostics)) if scan_health else None
+    median_row = after_zratio_row + 1 + int(bool(growth_diagnostics)) + int(bool(formation_diagnostics)) + int(bool(scan_health))
     cpc_scatter_row = median_row + 1
     inversion_scatter_row = cpc_scatter_row + 1
     polarity_difference_start_row = inversion_scatter_row + 1
@@ -3492,12 +4305,78 @@ def plot_inversion_result(result):
                     x=tr["x"],
                     y=np.clip(tr["y_smoothed"], zmin, zmax),
                     mode="lines+markers",
-                    name="Zn/Zp smoothed (used)",
+                    name="Zn/Zp processed scan estimate",
                     customdata=np.column_stack((tr["y_smoothed"], tr["selected_dp"])),
-                    hovertemplate="smoothed Zn/Zp=%{customdata[0]:.3f}<br>dp=%{customdata[1]:.1f} nm<extra></extra>",
+                    hovertemplate="processed scan estimate=%{customdata[0]:.3f}<br>dp=%{customdata[1]:.1f} nm<extra></extra>",
                     row=ion_ratio_row,
                     col=1,
                 )
+
+        elif tr["kind"] == "effective_zratio_consistency":
+            accepted = pd.DataFrame([
+                row for row in tr.get("rows", []) if row.get("status") == "ok"
+            ])
+            if not accepted.empty:
+                for cpc_name, cpc_rows in accepted.groupby("cpc_type"):
+                    fig.add_scatter(
+                        x=cpc_rows["pair_time"],
+                        y=cpc_rows["effective_zratio"],
+                        mode="lines+markers",
+                        error_y={
+                            "type": "data", "symmetric": False,
+                            "array": cpc_rows["effective_zratio_p90"] - cpc_rows["effective_zratio"],
+                            "arrayminus": cpc_rows["effective_zratio"] - cpc_rows["effective_zratio_p10"],
+                        },
+                        name=f"Effective Zn/Zp, {cpc_name}",
+                        customdata=diag.plotly_customdata(
+                            cpc_rows["scan_id"], cpc_rows["zratio_used"],
+                            cpc_rows["common_bin_count"], cpc_rows["time_gap_minutes"],
+                            cpc_rows["median_positive_negative_ratio"], cpc_rows["cpc_type"],
+                            cpc_rows["correction_mode"], cpc_rows["temporal_separation_warning"],
+                            cpc_rows["transport_delay_seconds"],
+                            cpc_rows["response_window_seconds"],
+                            cpc_rows["dwell_seconds"], cpc_rows["size_step_shift"],
+                        ),
+                        hovertemplate=(
+                            "scan=%{customdata[0]}<br>pair time=%{x|%Y-%m-%d %H:%M}<br>"
+                            "effective Zn/Zp=%{y:.3f}<br>used Zn/Zp=%{customdata[1]:.3f}<br>"
+                            "common bins=%{customdata[2]:.0f}<br>polarity time gap=%{customdata[3]:.1f} min<br>"
+                            "median positive/negative=%{customdata[4]:.3f}<br>"
+                            "CPC=%{customdata[5]}<br>correction=%{customdata[6]}<br>"
+                            "separation >30 min=%{customdata[7]}<br>"
+                            "delay/window/dwell=%{customdata[8]:.1f}/%{customdata[9]:.1f}/%{customdata[10]:.1f} s<br>"
+                            "size step shift=%{customdata[11]}<br>"
+                            "whiskers=within-pair diameter P10-P90 (not confidence)<extra></extra>"
+                        ),
+                        row=effective_zratio_row, col=1,
+                    )
+                fig.add_scatter(
+                    x=accepted["pair_time"], y=accepted["zratio_used"],
+                    mode="lines", line={"dash": "dash"},
+                    name="Zn/Zp used by inversion",
+                    row=effective_zratio_row, col=1,
+                )
+            candidates = np.asarray(tr.get("candidate_zratio", []), dtype=float)
+            objective = np.asarray(tr.get("objective", []), dtype=float)
+            if len(candidates) and len(candidates) == len(objective):
+                fig.add_scatter(
+                    x=candidates, y=objective, mode="lines",
+                    name="Median absolute log mismatch",
+                    hovertemplate="candidate Zn/Zp=%{x:.3f}<br>objective=%{y:.4f}<extra></extra>",
+                    row=effective_zratio_objective_row, col=1,
+                )
+                if tr.get("status") == "ok":
+                    best = float(tr["best_candidate_zratio"])
+                    best_index = int(np.nanargmin(np.abs(candidates - best)))
+                    best_label = "Bound-limited candidate" if tr.get(
+                        "optimum_at_candidate_boundary"
+                    ) else "Best effective Zn/Zp"
+                    fig.add_scatter(
+                        x=[best], y=[objective[best_index]], mode="markers",
+                        marker={"size": 12, "symbol": "diamond"},
+                        name=f"{best_label} {best:.3f}",
+                        row=effective_zratio_objective_row, col=1,
+                    )
 
     if growth_row is not None:
         for growth_diag in growth_diagnostics:
@@ -3557,6 +4436,11 @@ def plot_inversion_result(result):
         for formation_diag in formation_diagnostics:
             customdata = np.column_stack((
                 formation_diag["formation_rate"],
+                formation_diag["accumulation_rate_cm3_s1"],
+                formation_diag["growth_outflux_cm3_s1"],
+                formation_diag["coagulation_loss_cm3_s1"],
+                formation_diag["formation_rate_low"],
+                formation_diag["formation_rate_high"],
                 np.full(len(formation_diag["time"]), formation_diag["threshold"]),
                 np.full(len(formation_diag["time"]), formation_diag["spike_limit"]),
             ))
@@ -3569,9 +4453,13 @@ def plot_inversion_result(result):
                 hovertemplate=(
                     "time=%{x|%Y-%m-%d %H:%M}<br>"
                     "N(%{fullData.name})=%{y:.2f}<br>"
-                    "apparent accumulation dN/dt=%{customdata[0]:.2f} cm-3 h-1<br>"
-                    "onset threshold=%{customdata[1]:.2f}<br>"
-                    "spike guard=%{customdata[2]:.2f}<extra></extra>"
+                    "three-term apparent J=%{customdata[0]:.3g} cm-3 s-1<br>"
+                    "dN/dt=%{customdata[1]:.3g} cm-3 s-1<br>"
+                    "growth outflux=%{customdata[2]:.3g} cm-3 s-1<br>"
+                    "coagulation loss=%{customdata[3]:.3g} cm-3 s-1<br>"
+                    "J sensitivity low-high=%{customdata[4]:.3g}-%{customdata[5]:.3g}<br>"
+                    "onset threshold=%{customdata[6]:.2f}<br>"
+                    "spike guard=%{customdata[7]:.2f}<extra></extra>"
                 ),
                 row=formation_row,
                 col=1,
@@ -3687,6 +4575,11 @@ def plot_inversion_result(result):
     fig.update_xaxes(title_text="Time", tickformat="%H:%M", row=ntot_row, col=1)
     fig.update_yaxes(title_text="Zn/Zp", row=ion_ratio_row, col=1)
     fig.update_xaxes(title_text="Time", tickformat="%H:%M", row=ion_ratio_row, col=1)
+    if effective_zratio_row is not None:
+        fig.update_yaxes(title_text="Effective Zn/Zp", row=effective_zratio_row, col=1)
+        fig.update_xaxes(title_text="Paired scan time", tickformat="%H:%M", row=effective_zratio_row, col=1)
+        fig.update_yaxes(title_text="Median |log(+/-)|", row=effective_zratio_objective_row, col=1)
+        fig.update_xaxes(title_text="Candidate effective Zn/Zp", type="log", row=effective_zratio_objective_row, col=1)
     if growth_row is not None:
         fig.update_yaxes(
             title_text="Growth rate (nm/h); whiskers: pairwise-slope P10-P90",
@@ -3771,6 +4664,7 @@ def plot_inversion_result(result):
         height=max(1200, 520 * rows),
         width=1300,
         title="Online inversion result",
+        dragmode=roi_selection_tool.value,
         showlegend=True,
         margin=dict(l=50, r=260, t=60, b=30),
         legend=dict(x=1.02, y=1.0),
@@ -4712,7 +5606,11 @@ def run_auto_worker():
 save_button.on_click(save_data)
 invert_button.on_click(run_inversion)
 smps_timing_button.on_click(update_smps_timing_plot)
+charge_comparison_button.on_click(update_charge_comparison)
+clear_rois_button.on_click(clear_saved_rois)
+roi_selection_tool.param.watch(update_roi_selection_tool, "value")
 inversion_plot.param.watch(on_inversion_heatmap_click, "click_data")
+inversion_plot.param.watch(on_inversion_heatmap_selection, "selected_data")
 
 
 for w in [
@@ -4735,7 +5633,15 @@ for w in [
     qs_lpm,
     temp_K,
     press_Pa,
+    ambient_conditions_csv,
+    ambient_match_tolerance_min,
+    ambient_naive_timezone,
     zratio_widget,
+    positive_ion_mobility,
+    positive_ion_mass,
+    negative_ion_mass,
+    positive_ion_concentration,
+    negative_ion_concentration,
     zratio_min_widget,
     zratio_max_widget,
     zratio_smoothing_step,
@@ -4758,7 +5664,11 @@ for w in [
     modal_fit_modes,
     modal_fit_min_nm,
     modal_fit_max_nm,
+    mode_tracking_enabled,
     difference_peak_min_size_nm,
+    effective_zratio_diagnostic_enabled,
+    effective_zratio_min_size_nm,
+    effective_zratio_max_size_nm,
     smallest_size,
     scan_inversion_type,
     smps_settling_time_sec,
@@ -4794,7 +5704,10 @@ selection_controls = pn.Column(
 inversion_controls = pn.Column(
     pn.Row(dma_L, dma_r1, dma_r2),
     pn.Row(qa_lpm, qs_lpm, temp_K, press_Pa),
+    pn.Row(ambient_conditions_csv, ambient_match_tolerance_min, ambient_naive_timezone),
     pn.Row(zratio_widget, zratio_min_widget, zratio_max_widget, zratio_smoothing_step),
+    pn.Row(positive_ion_mobility, positive_ion_mass, negative_ion_mass),
+    pn.Row(positive_ion_concentration, negative_ion_concentration),
     pn.Row(zratio_min_size_nm, zratio_estimate_offset, use_zratio_checkbox, smallest_size),
     pn.Row(scan_inversion_type, smps_settling_time_sec, smps_correction_mode, smps_transport_delay_sec),
     pn.Row(
@@ -4815,10 +5728,13 @@ diagnostic_controls = pn.Column(
         growth_max_gap_minutes, growth_min_event_scans,
         growth_max_rate_nm_h,
     ),
-    pn.Row(difference_peak_min_size_nm),
+    pn.Row(
+        difference_peak_min_size_nm, effective_zratio_diagnostic_enabled,
+        effective_zratio_min_size_nm, effective_zratio_max_size_nm,
+    ),
     pn.Row(mcc_cross_check_enabled, mcc_min_correlation),
     pn.Row(coagulation_targets_nm, particle_density_kg_m3),
-    pn.Row(modal_fit_modes, modal_fit_min_nm, modal_fit_max_nm),
+    pn.Row(modal_fit_modes, modal_fit_min_nm, modal_fit_max_nm, mode_tracking_enabled),
     pn.Row(smps_timing_offset_min_sec, smps_timing_offset_max_sec, smps_timing_offset_step_sec, smps_timing_match_tolerance_min),
 )
 
@@ -4842,10 +5758,14 @@ plot_tabs = pn.Tabs(
     ("Raw Data", pn.Column(raw_plot)),
     ("Inversion", pn.Column(inversion_plot)),
     ("Clicked Distribution", pn.Column(modal_fit_status, modal_fit_plot)),
+    ("Saved ROIs", pn.Column(pn.Row(roi_selection_tool, clear_rois_button), roi_status, roi_history, roi_plot)),
     ("Aerosol Properties", pn.Column(aerosol_plot)),
+    ("Mode Tracking", pn.Column(mode_tracking_plot)),
+    ("Quality Dashboard", pn.Column(quality_dashboard_pane)),
     ("Residuals", pn.Column(residual_plot)),
     ("SMPS Timing", pn.Column(smps_timing_plot)),
     ("Difference Diagnostics", pn.Column(difference_plot)),
+    ("Charge Models", pn.Column(charge_model_status, charge_comparison_button, charge_comparison_plot)),
     dynamic=True,
 )
 

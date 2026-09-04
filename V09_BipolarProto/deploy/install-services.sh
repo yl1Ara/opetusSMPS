@@ -34,6 +34,7 @@ if [[ "${state_dir}" != /* || ! -d "${state_dir}" || ! -w "${state_dir}" ]]; the
     printf 'State directory must be an existing writable absolute path: %s\n' "${state_dir}" >&2
     exit 1
 fi
+
 if [[ "$(id -un)" != "${user_name}" ]]; then
     printf 'Run this script as %s (it invokes sudo only for system files).\n' "${user_name}" >&2
     exit 1
@@ -47,10 +48,26 @@ if systemctl is-active --quiet tdmps.service; then
     exit 1
 fi
 
+main_service="tdmps@${user_name}.service"
+exec 9>"${state_dir}/maintenance.lock"
+if ! flock --nonblock --exclusive 9; then
+    printf 'Refusing install: a measurement or another maintenance operation is active.\n' >&2
+    exit 1
+fi
+if systemctl is-active --quiet "${main_service}"; then
+    main_pid="$(systemctl show "${main_service}" -p MainPID --value)"
+    if [[ ! "${main_pid}" =~ ^[1-9][0-9]*$ ]] \
+        || ! python3 "${script_dir}/check-measurement-idle.py" "${state_dir}/health.json" 10 "${main_pid}"; then
+        printf 'Refusing install: the running instrument is busy or its state is unknown.\n' >&2
+        exit 1
+    fi
+    sudo systemctl stop "${main_service}"
+fi
+
 cd "${app_dir}"
 uv sync --locked
 uv pip install --python "${app_dir}/.venv/bin/python" -r requirements-hardware.txt
-"${app_dir}/.venv/bin/python" deploy/compile-check.py gui.py DmpsControl deploy/force-safe.py deploy/zero-bipolar.py deploy/check-health.py
+"${app_dir}/.venv/bin/python" deploy/compile-check.py gui.py gui_app.py gui_runtime_host.py DmpsControl deploy/force-safe.py deploy/zero-bipolar.py deploy/check-health.py deploy/check-measurement-idle.py
 
 config_tmp="$(mktemp)"
 trap 'rm -f "${config_tmp}"' EXIT
@@ -73,7 +90,7 @@ fi
 
 sudo systemctl daemon-reload
 sudo systemctl disable --now "tdmps-viewer@${user_name}.service" >/dev/null 2>&1 || true
-sudo systemctl enable --now "tdmps@${user_name}.service"
+sudo systemctl enable --now "${main_service}"
 "${HOME}/bin/dmps" health
 
 printf 'Installed TDMPS from %s\n' "${app_dir}"

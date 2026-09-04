@@ -239,7 +239,7 @@ ensure_settings_file()
 load_settings()
 
 
-def invert_one_scan(d, polarity, scan_range, zratio=None, temp=293.15, press=101325):
+def invert_one_scan(d, polarity, scan_range, zn_over_zp=None, temp=293.15, press=101325):
 
     d = d.copy()
     d["cpc_float"] = pd.to_numeric(d["cpc_count"], errors="coerce")
@@ -279,11 +279,11 @@ def invert_one_scan(d, polarity, scan_range, zratio=None, temp=293.15, press=101
     else:
         p = np.arange(1, 6, 1, dtype=float)
 
-    if zratio is None or not np.isfinite(zratio):
-        zratio = 1.35e-4 / 1.60e-4
+    if zn_over_zp is None or not np.isfinite(zn_over_zp):
+        zn_over_zp = 1.60e-4 / 1.35e-4
 
-    Zn = 1e-4
-    Zp = zratio * Zn
+    Zp = 1e-4
+    Zn = zn_over_zp * Zp
 
     for i, dp_nm in enumerate(dp_meas_nm):
         voltage = voltage_from_size(

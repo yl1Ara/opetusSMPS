@@ -54,6 +54,8 @@ def intfun(dp, t, press, p, volt, pituus, arkaksi, aryksi, qa, qc, qm, qs,
 
     # Charging efficiency; shape (n_dp, n_p)
     p = np.atleast_1d(p)
+    if np.any(~np.isfinite(p)) or np.any(p != np.rint(p)):
+        raise ValueError("particle charge states must be finite integers")
     if charging_efficiency == 'wiedensohler':
         if summed == 1:
             charge = varaus(dp, -p, t) + varaus(dp, p, t)
@@ -68,7 +70,6 @@ def intfun(dp, t, press, p, volt, pituus, arkaksi, aryksi, qa, qc, qm, qs,
             
     elif charging_efficiency == 'fuchs':
         charge = np.zeros((len(dp), len(p)))
-        print(len(dp))
 
         for i in range(len(dp)):
             frac, beta_p, beta_n = calChargeFracF(
@@ -76,15 +77,18 @@ def intfun(dp, t, press, p, volt, pituus, arkaksi, aryksi, qa, qc, qm, qs,
                 Np=Np, Nn=Nn, epsp=1000, T=t, P=press
             )
 
-            # calChargeFracF returns charges from -5 ... +5
-            # index = q + 5
-            idx = (p.astype(int) + 5).astype(int)
+            # The adaptive distribution is symmetric in index about q=0.
+            center = len(frac) // 2
+            idx = p.astype(int) + center
 
             if summed == 1:
-                idx_opposite = ((-p).astype(int) + 5).astype(int)
+                idx_opposite = (-p).astype(int) + center
                 charge[i, :] = frac[idx] + frac[idx_opposite]
             else:
                 charge[i, :] = frac[idx]
+
+    else:
+        raise ValueError(f"unknown charging efficiency: {charging_efficiency!r}")
 
     # Sum over charges, then multiply by losses; res shape (n_dp,)
     res = np.sum(tr * charge, axis=1) * totalloss

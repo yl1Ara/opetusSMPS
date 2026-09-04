@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 
 
-GUI_PATH = Path(__file__).parents[1] / "gui.py"
+GUI_PATH = Path(__file__).parents[1] / "gui_app.py"
 
 
 def load_timing_helpers():

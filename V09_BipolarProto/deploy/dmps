@@ -17,13 +17,30 @@ health_url() {
 }
 
 check_health() {
-    local url attempt
+    local url attempt main_pid server_ready=false
     url="$(health_url)"
     systemctl is-active --quiet "${main_service}"
+    main_pid="$(systemctl show "${main_service}" -p MainPID --value)"
+    if [[ ! "${main_pid}" =~ ^[1-9][0-9]*$ ]]; then
+        printf 'main service has no active process\n' >&2
+        return 1
+    fi
     for attempt in {1..30}; do
         if curl --fail --silent --show-error --output /dev/null "${url}"; then
-            if "${APP_DIR}/.venv/bin/python" "${APP_DIR}/deploy/check-health.py" \
-                "${DMPS_STATE_DIR:-${APP_DIR}}/health.json" 10; then
+            server_ready=true
+            break
+        fi
+        sleep 1
+    done
+    if [[ "${server_ready}" != true ]]; then
+        printf 'main HTTP endpoint did not become ready: %s\n' "${url}" >&2
+        return 1
+    fi
+    for attempt in {1..30}; do
+        if "${APP_DIR}/.venv/bin/python" "${APP_DIR}/deploy/check-health.py" \
+            "${DMPS_STATE_DIR:-${APP_DIR}}/health.json" 10 "${main_pid}"; then
+            if systemctl is-active --quiet "${main_service}" \
+                && [[ "$(systemctl show "${main_service}" -p MainPID --value)" == "${main_pid}" ]]; then
                 printf 'main healthy: %s\n' "${url}"
                 return 0
             fi
@@ -45,11 +62,17 @@ control() {
 }
 
 measurement_is_idle() {
+    local main_pid
     if ! systemctl is-active --quiet "${main_service}"; then
         return 0
     fi
+    main_pid="$(systemctl show "${main_service}" -p MainPID --value)"
+    if [[ ! "${main_pid}" =~ ^[1-9][0-9]*$ ]]; then
+        printf 'Could not verify measurement state: service has no active PID\n' >&2
+        return 20
+    fi
     "${APP_DIR}/.venv/bin/python" "${APP_DIR}/deploy/check-measurement-idle.py" \
-        "$(health_url)"
+        "${DMPS_STATE_DIR:-${APP_DIR}}/health.json" 10 "${main_pid}"
 }
 
 sync_runtime_files() {
@@ -64,8 +87,14 @@ sync_runtime_files() {
 }
 
 update_app() {
-    local repo_root main_was_active=false
+    local repo_root main_was_active=false lock_file
     repo_root="$(git -C "${APP_DIR}" rev-parse --show-toplevel)"
+    lock_file="${DMPS_STATE_DIR:-${APP_DIR}}/maintenance.lock"
+    exec 9>"${lock_file}"
+    if ! flock --nonblock --exclusive 9; then
+        printf 'Refusing update: a measurement or another update is active.\n' >&2
+        return 1
+    fi
     if [[ -n "$(git -C "${repo_root}" status --porcelain --untracked-files=normal)" ]]; then
         printf 'Refusing update: repository has tracked or untracked changes.\n' >&2
         git -C "${repo_root}" status --short >&2
@@ -82,19 +111,18 @@ update_app() {
         printf 'Refusing update after fetch: measurement is active or its state could not be verified.\n' >&2
         return 1
     fi
+    if [[ "${main_was_active}" == true ]]; then
+        sudo systemctl stop "${main_service}"
+    fi
     git -C "${repo_root}" pull --ff-only
     cd "${APP_DIR}"
     uv sync --locked
     uv pip install --python "${APP_DIR}/.venv/bin/python" -r requirements-hardware.txt
-    "${APP_DIR}/.venv/bin/python" deploy/compile-check.py gui.py DmpsControl deploy/force-safe.py deploy/zero-bipolar.py deploy/check-health.py
+    "${APP_DIR}/.venv/bin/python" deploy/compile-check.py gui.py gui_app.py gui_runtime_host.py DmpsControl deploy/force-safe.py deploy/zero-bipolar.py deploy/check-health.py deploy/check-measurement-idle.py
     sync_runtime_files
 
     if [[ "${main_was_active}" == true ]]; then
-        if ! measurement_is_idle; then
-            printf 'Update installed but main service was not restarted: a measurement started during the update.\n' >&2
-            return 1
-        fi
-        sudo systemctl restart "${main_service}"
+        sudo systemctl start "${main_service}"
         check_health
     fi
     printf 'Update complete. Services that were stopped remain stopped.\n'

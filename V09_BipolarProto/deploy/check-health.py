@@ -9,6 +9,7 @@ from pathlib import Path
 def main():
     path = Path(sys.argv[1])
     maximum_age = float(sys.argv[2]) if len(sys.argv) > 2 else 10.0
+    expected_pid = int(sys.argv[3]) if len(sys.argv) > 3 else None
     try:
         health = json.loads(path.read_text())
         timestamp = datetime.fromisoformat(health["timestamp"])
@@ -17,9 +18,21 @@ def main():
         age = (datetime.now(timezone.utc) - timestamp).total_seconds()
         if age < -5 or age > maximum_age:
             raise ValueError(f"health file age is {age:.1f}s")
-        for key in ("version", "commit", "scan_active", "phase", "hardware_initialized", "cpc", "flowmeter", "hv"):
+        for key in ("runtime_id", "runtime_state", "pid", "version", "commit", "scan_active", "phase", "hardware_initialized", "cpc", "flowmeter", "hv"):
             if key not in health:
                 raise ValueError(f"missing {key}")
+        if not health["runtime_id"] or int(health["pid"]) <= 0:
+            raise ValueError("health lacks runtime identity")
+        if expected_pid is not None and int(health["pid"]) != expected_pid:
+            raise ValueError(
+                f"health PID {health['pid']} does not match service PID {expected_pid}"
+            )
+        if health["runtime_state"] not in {
+            "idle", "initializing", "running", "stopping", "tuning", "calibration",
+        }:
+            raise ValueError(f"invalid runtime state: {health['runtime_state']}")
+        if (health["runtime_state"] == "running") != bool(health["scan_active"]):
+            raise ValueError("runtime state and scan_active are inconsistent")
         if health["scan_active"]:
             cpc_age = health["cpc"].get("sample_age_sec")
             flow_age = health["flowmeter"].get("sample_age_sec")
