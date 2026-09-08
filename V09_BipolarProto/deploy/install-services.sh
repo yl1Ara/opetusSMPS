@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export PATH="${HOME}/.local/bin:${PATH}"
 
 usage() {
     printf 'Usage: %s --origin HOST[:PORT] [--state-dir PATH] [--user USER]\n' "$0"

@@ -74,6 +74,9 @@ class RuntimeSafetyTests(unittest.TestCase):
             Path(__file__).parents[1] / "deploy" / "run-force-safe.sh"
         ).read_text()
         self.assertIn('SERVICE_RESULT:-}" == "exec-condition"', force_safe)
+        for script_name in ("dmps", "install-services.sh"):
+            script = (Path(__file__).parents[1] / "deploy" / script_name).read_text()
+            self.assertIn('${HOME}/.local/bin:${PATH}', script)
 
     def test_health_json_is_atomic_and_strict(self):
         with tempfile.TemporaryDirectory() as directory:
