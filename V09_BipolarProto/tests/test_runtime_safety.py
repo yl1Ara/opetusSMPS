@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import socket
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -18,6 +19,13 @@ idle_spec = importlib.util.spec_from_file_location(
 )
 check_measurement_idle = importlib.util.module_from_spec(idle_spec)
 idle_spec.loader.exec_module(check_measurement_idle)
+
+port_spec = importlib.util.spec_from_file_location(
+    "check_port_available",
+    Path(__file__).parents[1] / "deploy" / "check-port-available.py",
+)
+check_port_available = importlib.util.module_from_spec(port_spec)
+port_spec.loader.exec_module(check_port_available)
 
 class RuntimeSafetyTests(unittest.TestCase):
     def test_gui_refresh_uses_single_owner_bridge_without_stopping_previous_runtime(self):
@@ -47,6 +55,25 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertFalse(shutdown.run("process exit"))
         self.assertEqual(calls, ["SIGTERM"])
         self.assertTrue(shutdown.started)
+
+    def test_port_guard_detects_existing_listener(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(("127.0.0.1", 0))
+            port = listener.getsockname()[1]
+            self.assertFalse(check_port_available.port_available("127.0.0.1", port))
+        self.assertTrue(check_port_available.port_available("127.0.0.1", port))
+
+    def test_service_conflicts_with_legacy_and_checks_port_before_hardware(self):
+        service = (
+            Path(__file__).parents[1] / "deploy" / "tdmps@.service"
+        ).read_text()
+        self.assertIn("Conflicts=tdmps.service", service)
+        self.assertIn("StartLimitBurst=3", service)
+        self.assertLess(service.index("ExecCondition="), service.index("ExecStartPre="))
+        force_safe = (
+            Path(__file__).parents[1] / "deploy" / "run-force-safe.sh"
+        ).read_text()
+        self.assertIn('SERVICE_RESULT:-}" == "exec-condition"', force_safe)
 
     def test_health_json_is_atomic_and_strict(self):
         with tempfile.TemporaryDirectory() as directory:

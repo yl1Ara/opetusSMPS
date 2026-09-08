@@ -7,6 +7,8 @@ This deployment keeps all source files in one SSH-cloned monorepo checkout, but 
 
 The hardware service restarts after process failures so its web interface remains available. Restarting the web process does not automatically initialize hardware or resume a scan. The server binds only to localhost and accepts only its configured exact websocket origin; wildcards are not used.
 
+The templated hardware unit conflicts with the legacy `tdmps.service`, checks that port 5006 is free before touching hardware, and rate-limits failed starts. Installation disables inactive legacy service names. If a legacy service is active, `dmps start`, `dmps restart`, and `dmps update` fail closed until it is stopped and disabled.
+
 ## SSH deploy key
 
 Create a key on the customer system and leave its passphrase empty for unattended `git fetch`:

@@ -11,6 +11,7 @@ fi
 source "${config}"
 
 main_service="tdmps@${user_name}.service"
+legacy_service="tdmps.service"
 
 health_url() {
     printf 'http://127.0.0.1:5006/gui'
@@ -53,7 +54,15 @@ check_health() {
 
 control() {
     case "$1" in
-        start|stop|restart) sudo systemctl "$1" "${main_service}" ;;
+        start|restart)
+            if systemctl is-active --quiet "${legacy_service}"; then
+                printf 'Refusing %s: legacy %s is active. Stop and disable it first.\n' \
+                    "$1" "${legacy_service}" >&2
+                return 1
+            fi
+            sudo systemctl "$1" "${main_service}"
+            ;;
+        stop) sudo systemctl stop "${main_service}" ;;
         status) systemctl --no-pager --full status "${main_service}" ;;
         health) check_health ;;
         log|logs) journalctl -u "${main_service}" -f ;;
@@ -76,6 +85,7 @@ measurement_is_idle() {
 }
 
 sync_runtime_files() {
+    sudo install -o root -g root -m 0755 "${APP_DIR}/deploy/check-port-available.py" /usr/local/libexec/dmps-port-available
     sudo install -o root -g root -m 0755 "${APP_DIR}/deploy/run-panel.sh" /usr/local/libexec/dmps-run-panel
     sudo install -o root -g root -m 0755 "${APP_DIR}/deploy/run-force-safe.sh" /usr/local/libexec/dmps-force-safe
     sudo install -o root -g root -m 0755 "${APP_DIR}/deploy/run-zero-bipolar.sh" /usr/local/libexec/dmps-zero-bipolar
@@ -84,6 +94,9 @@ sync_runtime_files() {
     install -m 0755 "${APP_DIR}/deploy/dmps" "${HOME}/bin/dmps"
     install -m 0644 "${APP_DIR}/deploy/dmps-completion.bash" "${HOME}/.dmps-complete"
     sudo systemctl daemon-reload
+    if ! systemctl is-active --quiet tdmps.service; then
+        sudo systemctl disable tdmps.service tdmps-serve.service >/dev/null 2>&1 || true
+    fi
 }
 
 update_app() {
@@ -93,6 +106,11 @@ update_app() {
     exec 9>"${lock_file}"
     if ! flock --nonblock --exclusive 9; then
         printf 'Refusing update: a measurement or another update is active.\n' >&2
+        return 1
+    fi
+    if systemctl is-active --quiet "${legacy_service}"; then
+        printf 'Refusing update: legacy %s is active. Stop and disable it first.\n' \
+            "${legacy_service}" >&2
         return 1
     fi
     if [[ -n "$(git -C "${repo_root}" status --porcelain --untracked-files=normal)" ]]; then
@@ -118,7 +136,7 @@ update_app() {
     cd "${APP_DIR}"
     uv sync --locked
     uv pip install --python "${APP_DIR}/.venv/bin/python" -r requirements-hardware.txt
-    "${APP_DIR}/.venv/bin/python" deploy/compile-check.py gui.py gui_app.py gui_runtime_host.py DmpsControl deploy/force-safe.py deploy/zero-bipolar.py deploy/check-health.py deploy/check-measurement-idle.py
+    "${APP_DIR}/.venv/bin/python" deploy/compile-check.py gui.py gui_app.py gui_runtime_host.py DmpsControl deploy/force-safe.py deploy/zero-bipolar.py deploy/check-health.py deploy/check-measurement-idle.py deploy/check-port-available.py
     sync_runtime_files
 
     if [[ "${main_was_active}" == true ]]; then

@@ -1,7 +1,8 @@
 [Unit]
 Description=Tailscale Serve for TDMPS hardware GUI
-After=tailscaled.service tdmps@%i.service
+After=tailscaled.service tdmps-serve.service tdmps@%i.service
 Wants=tailscaled.service
+Conflicts=tdmps-serve.service
 
 [Service]
 Type=oneshot
