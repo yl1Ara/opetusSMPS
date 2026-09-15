@@ -88,10 +88,12 @@ class CPC:
 
 
 class HaukeDMA:
-    def __init__(self):
+    def __init__(self, length_m=0.28):
+        if float(length_m) <= 0:
+            raise ValueError("DMA length must be positive")
         self.r1 = 0.025
         self.r2 = 0.033
-        self.L = 0.28
+        self.L = float(length_m)
         
 I2C_BUS = 1
 I2C_ADDRESS = 0x40

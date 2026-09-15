@@ -50,12 +50,15 @@ class HVController:
         lambda_air = lambda_0 * (T / T0) * (P0 / P)
         return 1 + (2 * lambda_air / dp) * (a + b * np.exp(-c * dp / (2 * lambda_air)))
         
-    def voltage_from_size(self, dp_nm, Q_sh_lpm=14.0, T_C=24.0, P=101325, debug=False):
+    def voltage_from_size(
+        self, dp_nm, Q_sh_lpm=14.0, T_C=24.0, P=101325,
+        debug=False, dma_length_m=0.28,
+    ):
         mu = 1.81e-5    
         e = 1.602e-19    
         negative = False
         
-        dma = HaukeDMA()
+        dma = HaukeDMA(length_m=dma_length_m)
         r1 = dma.r1    
         r2 = dma.r2
         L = dma.L
@@ -116,12 +119,15 @@ def cunningham_correction(dp, T=293.15, P=101325, a= 1.142, b=0.558, c=0.999, te
     lambda_air = lambda_0 * (T / T0) * (P0 / P)
     return 1 + (2 * lambda_air / dp) * (a + b * np.exp(-c * dp / (2 * lambda_air)))
 
-def voltage_from_size(dp_nm, Q_sh_lpm=14.0, T_C=24.0, P=101325, debug=False):
+def voltage_from_size(
+    dp_nm, Q_sh_lpm=14.0, T_C=24.0, P=101325,
+    debug=False, dma_length_m=0.28,
+):
     mu = 1.81e-5    
     e = 1.602e-19    
     negative = False
     
-    dma = HaukeDMA()
+    dma = HaukeDMA(length_m=dma_length_m)
     r1 = dma.r1    
     r2 = dma.r2
     L = dma.L
@@ -185,15 +191,19 @@ def cleanup():
 
 
     
-def voltage_set(dp, Q_sh_lpm=10.0):
-    voltage = voltage_from_size(dp, Q_sh_lpm=Q_sh_lpm)
+def voltage_set(dp, Q_sh_lpm=10.0, dma_length_m=0.28):
+    voltage = voltage_from_size(
+        dp, Q_sh_lpm=Q_sh_lpm, dma_length_m=dma_length_m,
+    )
     value = DACValue(voltage)
     
     write_dac8551(value)
 
 
-def dac_code_from_size(dp, Q_sh_lpm=10.0):
-    voltage = voltage_from_size(dp, Q_sh_lpm=Q_sh_lpm)
+def dac_code_from_size(dp, Q_sh_lpm=10.0, dma_length_m=0.28):
+    voltage = voltage_from_size(
+        dp, Q_sh_lpm=Q_sh_lpm, dma_length_m=dma_length_m,
+    )
     return DACValue(voltage)
 
     
@@ -273,8 +283,10 @@ class SpellmanHV:
         self.command(body)
         self.voltage = voltage
 
-    def voltage_set(self, dp, Q_sh_lpm=10.0):
-        self.set_voltage(voltage_from_size(abs(float(dp)), Q_sh_lpm=Q_sh_lpm))
+    def voltage_set(self, dp, Q_sh_lpm=10.0, dma_length_m=0.28):
+        self.set_voltage(voltage_from_size(
+            abs(float(dp)), Q_sh_lpm=Q_sh_lpm, dma_length_m=dma_length_m,
+        ))
 
     def zero(self):
         self.set_voltage(0.0)

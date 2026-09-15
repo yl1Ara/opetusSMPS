@@ -165,6 +165,29 @@ class OnlineInteractionTests(unittest.TestCase):
         self.assertEqual(converted, {"values": [1.0, None, None], "scalar": None})
         json.dumps(converted, allow_nan=False)
 
+    def test_scan_dma_geometry_overrides_legacy_viewer_defaults(self):
+        scan = pd.DataFrame({
+            "dma_length_m": [0.11, 0.11],
+            "dma_r1_m": [0.025, 0.025],
+            "dma_r2_m": [0.033, 0.033],
+        })
+
+        dma = online_app.get_dma(scan)
+
+        self.assertEqual((dma.L, dma.r1, dma.r2), (0.11, 0.025, 0.033))
+
+    def test_inconsistent_scan_dma_geometry_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "inconsistent dma_length_m"):
+            online_app.get_dma(pd.DataFrame({"dma_length_m": [0.11, 0.28]}))
+
+        filtered, diagnostics = online_app.filter_complete_scans(pd.DataFrame({
+            "scan_id": ["bad-geometry", "bad-geometry"],
+            "Ntot": [False, False],
+            "dma_length_m": [0.11, 0.28],
+        }))
+        self.assertTrue(filtered.empty)
+        self.assertIn("inconsistent dma_length_m", diagnostics[0]["reason"])
+
     def test_incomplete_scan_is_removed_without_dropping_complete_scan(self):
         rows = []
         for scan_id, point_indices in (("complete", range(3)), ("interrupted", range(2))):

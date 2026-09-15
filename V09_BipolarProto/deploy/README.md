@@ -82,7 +82,7 @@ After rebooting, verify the serial devices before starting the GUI:
 ls -l /dev/serial* /dev/ttyAMA* /dev/ttyS*
 ```
 
-The verified `MPS` monopolar installation uses `/dev/serial0 -> /dev/ttyS0` on GPIO14/15 for the CPC and `/dev/ttyAMA3` on GPIO4/5 for the Spellman supply. Set `cpc_com_port` to `/dev/serial0`, `spellman_port` to `/dev/ttyAMA3`, and `hv_source` to `Monopolar Spellman`. Selecting that source forces positive-only scans and disables Ntot controls in the GUI.
+The verified `MPS` monopolar installation uses `/dev/serial0 -> /dev/ttyS0` on GPIO14/15 for the CPC and `/dev/ttyAMA3` on GPIO4/5 for the Spellman supply. Set `cpc_com_port` to `/dev/serial0`, `spellman_port` to `/dev/ttyAMA3`, `hv_source` to `Monopolar Spellman`, and the Hauke DMA length to `0.11 m` before initializing hardware. Selecting that source forces positive-only scans and disables Ntot controls in the GUI. Other installations retain the `0.28 m` DMA default unless explicitly changed.
 
 After changing overlays, reboot and confirm GPIO4/5 report `TXD3`/`RXD3`. Device aliases can vary with firmware, so verify the actual devices instead of assuming `/dev/serial1` exists.
 

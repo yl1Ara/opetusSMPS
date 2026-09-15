@@ -77,6 +77,7 @@ class GuiSettingsTests(unittest.TestCase):
         }
 
         self.assertIn("smps_plot_step_shift", keys)
+        self.assertIn("dma_length_m", keys)
 
     def test_active_scan_snapshot_contains_all_cpc_timing_inputs(self):
         source = GUI_PATH.read_text()
@@ -118,6 +119,7 @@ class GuiSettingsTests(unittest.TestCase):
             "cpc_query_start_time", "cpc_query_end_time",
             "cpc_timestamp_uncertainty_sec", "cpc_timestamp_basis",
             "app_version", "git_commit",
+            "dma_length_m", "dma_r1_m", "dma_r2_m",
         }.issubset(keys))
 
 

@@ -52,6 +52,7 @@ DEFAULT_SETTINGS = {
     "settling_time": 10,
     "final_point_extra_hold": 0,
     "smps_plot_step_shift": 0,
+    "dma_length_m": 0.28,
     "hv_source": "Bipolar DAC",
     "spellman_port": "/dev/ttyUSB0",
     "spellman_baud": 9600,
@@ -243,6 +244,17 @@ with runtime_bridge_lock:
 #### Widgets ####
 cpc_com_port = pn.widgets.TextInput(name="CPC COM port", value="/dev/ttyAMA0")
 cpc_type = pn.widgets.Select(name="CPC Type", options=["3010", "3771", "HY09"], value="3010")
+dma_length_m = pn.widgets.FloatInput(
+    name="Hauke DMA length (m)",
+    value=DEFAULT_SETTINGS["dma_length_m"],
+    start=0.01,
+    end=1.0,
+    step=0.01,
+    width=180,
+)
+dma_geometry_notice = pn.pane.Markdown(
+    "Set the installed Hauke DMA length before initializing hardware."
+)
 hv_source = pn.widgets.Select(
     name="HV source",
     options=["Bipolar DAC", "Monopolar Spellman"],
@@ -602,6 +614,7 @@ def save_settings():
         "settling_time": int(settling_time.value),
         "final_point_extra_hold": int(final_point_extra_hold.value),
         "smps_plot_step_shift": int(smps_plot_step_shift.value),
+        "dma_length_m": float(dma_length_m.value),
         "hv_source": str(hv_source.value),
         "spellman_port": str(spellman_port.value),
         "spellman_baud": int(spellman_baud.value),
@@ -731,6 +744,7 @@ def load_settings():
         "smps_plot_step_shift",
         int(round(settings.get("smps_plot_time_shift_sec", DEFAULT_SETTINGS["smps_plot_step_shift"]))),
     )
+    dma_length_m.value = settings.get("dma_length_m", DEFAULT_SETTINGS["dma_length_m"])
     polarity_switch_time.value = settings.get(
         "polarity_switch_time", DEFAULT_SETTINGS["polarity_switch_time"]
     )
@@ -882,6 +896,7 @@ def current_scan_settings():
         "initial_point_pre_hold": float(initial_point_pre_hold.value),
         "settling_time": float(settling_time.value), "final_point_extra_hold": float(final_point_extra_hold.value),
         "smps_plot_step_shift": int(smps_plot_step_shift.value),
+        "dma_length_m": float(dma_length_m.value),
         "polarity_switch_time": float(polarity_switch_time.value), "bipolar": bool(Bipolar_toggle.value) and not monopolar,
         "hv_source": str(hv_source.value), "spellman_port": str(spellman_port.value),
         "spellman_baud": int(spellman_baud.value), "spellman_max_voltage": float(spellman_max_voltage.value),
@@ -912,8 +927,15 @@ def build_scan_points(include_dac_codes=False, settings=None):
             for dp in sizes:
                 point = {"scan_range": scan_range, "dp": float(dp), "sheath": sheath}
                 if include_dac_codes and settings["hv_source"] == "Bipolar DAC":
-                    point["dac_code"] = ctl.HV.dac_code_from_size(float(dp), Q_sh_lpm=sheath)
-                point["hv_target_v"] = abs(ctl.HV.voltage_from_size(float(dp), Q_sh_lpm=sheath)) if settings["hv_source"] == "Monopolar Spellman" else ctl.HV.voltage_from_size(float(dp), Q_sh_lpm=sheath)
+                    point["dac_code"] = ctl.HV.dac_code_from_size(
+                        float(dp), Q_sh_lpm=sheath,
+                        dma_length_m=settings["dma_length_m"],
+                    )
+                voltage = ctl.HV.voltage_from_size(
+                    float(dp), Q_sh_lpm=sheath,
+                    dma_length_m=settings["dma_length_m"],
+                )
+                point["hv_target_v"] = abs(voltage) if settings["hv_source"] == "Monopolar Spellman" else voltage
                 scan.append(point)
 
     return scan
@@ -931,6 +953,7 @@ def get_scan_program():
         float(sheath2.value),
         bool(Bipolar_toggle.value),
         hv_source.value,
+        float(dma_length_m.value),
     )
     if scan_program_cache_key == cache_key:
         return scan_program_cache
@@ -947,7 +970,10 @@ def update_scan_preview():
     try:
         scan = build_scan_points(include_dac_codes=False)
         sizes = [f"{p['dp']:.3g}" for p in scan]
-        scan_pane.object = f"Scan points ({len(sizes)}): {sizes}"
+        scan_pane.object = (
+            f"Hauke DMA length: **{float(dma_length_m.value):.3f} m**. "
+            f"Scan points ({len(sizes)}): {sizes}"
+        )
     except Exception as e:
         scan_pane.object = f"Scan parse error: {e}"
 
@@ -1127,7 +1153,10 @@ def set_hv_for_point(point, generation):
         if active_scan_settings and active_scan_settings["hv_source"] == "Monopolar Spellman":
             if hv_device is None:
                 raise RuntimeError("Monopolar Spellman HV is not initialized")
-            hv_device.voltage_set(abs(float(dp)), Q_sh_lpm=q_sheath)
+            hv_device.voltage_set(
+                abs(float(dp)), Q_sh_lpm=q_sheath,
+                dma_length_m=active_scan_settings["dma_length_m"],
+            )
             hv_target_voltage = abs(float(point.get("hv_target_v", 0.0)))
             hv_runtime_status = "enabled"
             return
@@ -1135,7 +1164,10 @@ def set_hv_for_point(point, generation):
         if "dac_code" in point:
             ctl.HV.write_dac8551(point["dac_code"])
         else:
-            ctl.HV.voltage_set(dp, Q_sh_lpm=q_sheath)
+            ctl.HV.voltage_set(
+                dp, Q_sh_lpm=q_sheath,
+                dma_length_m=active_scan_settings["dma_length_m"],
+            )
         hv_target_voltage = float(point.get("hv_target_v", 0.0))
         hv_runtime_status = "enabled"
 
@@ -2325,6 +2357,9 @@ def append_measurement_row(point, scan_number_value, is_ntot=False, extra=None):
         "aerosol_flow_lpm": aerosol_flow,
         "aerosol_dp_pa": aerosol_dp,
         "aerosol_temp_c": aerosol_temp,
+        "dma_length_m": settings["dma_length_m"],
+        "dma_r1_m": 0.025,
+        "dma_r2_m": 0.033,
         "cpc_type": settings["cpc_type"],
         "point_dwell_sec": settings["meas_time"],
         "cpc_poll_interval_sec": settings["cpc_poll_interval"],
@@ -3311,6 +3346,7 @@ def on_scan_setting_change(event):
 
 scan_setting_widgets = [
     cpc_com_port,
+    dma_length_m,
     sheath_pid_kp,
     sheath_pid_ki,
     sheath_pid_kd,
@@ -3399,6 +3435,7 @@ update_cpc_timing_display()
 control_layout = pn.Column(
     f"# DMA / CPC Control GUI v{APP_VERSION}",
     pn.Row(git_update_status, git_update_button, sizing_mode="stretch_width"),
+    pn.Row(dma_length_m, dma_geometry_notice),
     pn.Row(cpc_com_port, cpc_type),
     pn.Row(hv_source, spellman_port, spellman_baud, spellman_max_voltage),
     pn.Row(manual_hv_voltage, manual_hv_apply_button, manual_hv_status),

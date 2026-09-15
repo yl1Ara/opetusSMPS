@@ -578,6 +578,9 @@ def save_data(event=None):
                     "response_window_seconds": tr.get("response_window_seconds", np.nan),
                     "dwell_seconds": tr.get("dwell_seconds", np.nan),
                     "size_step_shift": tr.get("size_step_shift", np.nan),
+                    "dma_length_m": tr.get("dma_length_m", np.nan),
+                    "dma_r1_m": tr.get("dma_r1_m", np.nan),
+                    "dma_r2_m": tr.get("dma_r2_m", np.nan),
                     "counting_uncertainty": tr.get("counting_uncertainty", "disabled"),
                     "cpc_sample_flow_lpm": tr.get("cpc_sample_flow_lpm", np.nan),
                     "cpc_counting_interval_fallback_sec": tr.get(
@@ -888,12 +891,25 @@ def voltage_from_size(dp_nm, q_sh_lpm, dma, temp_K=293.15, press_Pa=101325):
     return sign * v
 
 
-def get_dma():
-    return SimpleNamespace(
-        L=float(dma_L.value),
-        r1=float(dma_r1.value),
-        r2=float(dma_r2.value),
+def get_dma(scan_rows=None):
+    def scan_value(column, fallback):
+        if scan_rows is None or column not in scan_rows:
+            return float(fallback)
+        values = pd.to_numeric(scan_rows[column], errors="coerce").dropna().unique()
+        if len(values) == 0:
+            return float(fallback)
+        if len(values) != 1:
+            raise ValueError(f"scan contains inconsistent {column} values")
+        return float(values[0])
+
+    dma = SimpleNamespace(
+        L=scan_value("dma_length_m", dma_L.value),
+        r1=scan_value("dma_r1_m", dma_r1.value),
+        r2=scan_value("dma_r2_m", dma_r2.value),
     )
+    if dma.L <= 0 or dma.r1 <= 0 or dma.r2 <= dma.r1:
+        raise ValueError("DMA geometry requires L > 0 and r2 > r1 > 0")
+    return dma
 
 
 def inversion_size_column(df):
@@ -1665,6 +1681,11 @@ def filter_complete_scans(df):
             final_rows = measured[pd.to_numeric(measured["point_index"], errors="coerce") == final_index]
             if final_rows["point_valid_until"].isna().all():
                 reason = "final scan point was not completed"
+        if reason is None:
+            try:
+                get_dma(measured)
+            except ValueError as error:
+                reason = str(error)
         diagnostics.append({
             "scan_id": str(scan_id),
             "accepted": reason is None,
@@ -3074,7 +3095,7 @@ def invert_one_scan(
     halfs = 0.5 * (limits[1:] - limits[:-1])
     gl_pts = (mids[:, None] + halfs[:, None] * _GL_NODES[None, :]).ravel()
 
-    dma = get_dma()
+    dma = get_dma(d)
     A = np.zeros((len(dp_meas_nm), len(dp_grid_nm)))
 
     qa = float(qa_lpm.value) / 60000.0
@@ -3337,6 +3358,9 @@ def run_inversion_calculation(df):
             heat_zratios_used = []
             heat_cpc_types = []
             heat_cpc_type_mixed = []
+            heat_dma_lengths = []
+            heat_dma_r1 = []
+            heat_dma_r2 = []
             ntot_vals = []
             ntot_std_vals = []
             ntot_measured = []
@@ -3613,6 +3637,10 @@ def run_inversion_calculation(df):
                 )
                 heat_cpc_types.append(scan_cpc_type)
                 heat_cpc_type_mixed.append(bool(scan_cpc_type_mixed))
+                scan_dma = get_dma(g_scan)
+                heat_dma_lengths.append(scan_dma.L)
+                heat_dma_r1.append(scan_dma.r1)
+                heat_dma_r2.append(scan_dma.r2)
                 ntot_limit = float(ntot_plot_max.value)
                 if np.isfinite(ntot_limit) and ntot_limit > 0 and ntot_scan > ntot_limit:
                     ntot_scan = np.nan
@@ -3641,6 +3669,9 @@ def run_inversion_calculation(df):
                     "zratio_used": heat_zratios_used,
                     "cpc_type": heat_cpc_types,
                     "cpc_type_mixed": heat_cpc_type_mixed,
+                    "dma_length_m": heat_dma_lengths,
+                    "dma_r1_m": heat_dma_r1,
+                    "dma_r2_m": heat_dma_r2,
                     "correction_mode": (
                         smps_correction_mode.value
                         if scan_inversion_type.value == "SMPS" else "DMPS point assignment"
