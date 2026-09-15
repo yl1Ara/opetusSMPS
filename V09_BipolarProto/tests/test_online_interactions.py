@@ -165,6 +165,41 @@ class OnlineInteractionTests(unittest.TestCase):
         self.assertEqual(converted, {"values": [1.0, None, None], "scalar": None})
         json.dumps(converted, allow_nan=False)
 
+    def test_incomplete_scan_is_removed_without_dropping_complete_scan(self):
+        rows = []
+        for scan_id, point_indices in (("complete", range(3)), ("interrupted", range(2))):
+            for point_index in point_indices:
+                rows.append({
+                    "scan_id": scan_id,
+                    "Ntot": False,
+                    "point_index": point_index,
+                    "expected_scan_points": 3,
+                    "scan_complete": scan_id == "complete",
+                    "point_valid_until": "2026-01-01" if point_index == 2 else np.nan,
+                })
+
+        filtered, diagnostics = online_app.filter_complete_scans(pd.DataFrame(rows))
+
+        self.assertEqual(set(filtered["scan_id"]), {"complete"})
+        rejected = next(row for row in diagnostics if row["scan_id"] == "interrupted")
+        self.assertFalse(rejected["accepted"])
+
+    def test_legacy_scan_remains_usable_when_mixed_with_new_metadata(self):
+        frame = pd.DataFrame({
+            "scan_id": ["legacy", "legacy", "new", "new"],
+            "Ntot": [False] * 4,
+            "point_index": [np.nan, np.nan, 0, 1],
+            "scan_complete": [np.nan, np.nan, True, True],
+            "expected_scan_points": [np.nan, np.nan, 2, 2],
+            "point_valid_until": [np.nan, np.nan, np.nan, "2026-01-01"],
+            "_completion_metadata_present": [False, False, True, True],
+        })
+
+        filtered, diagnostics = online_app.filter_complete_scans(frame)
+
+        self.assertEqual(set(filtered["scan_id"]), {"legacy", "new"})
+        self.assertTrue(all(row["accepted"] for row in diagnostics))
+
     def test_contamination_check_uses_charge_opposite_voltage_sign(self):
         scan = pd.DataFrame({
             "size_nm": [20, -20, 40, -40, 80, -80],

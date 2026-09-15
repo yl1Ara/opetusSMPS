@@ -217,6 +217,8 @@ class CpcDelayReplayTests(unittest.TestCase):
         np.testing.assert_allclose(recovered, expected, rtol=1e-12, atol=1e-12)
         np.testing.assert_allclose(fitted, measured, rtol=1e-12, atol=1e-12)
         self.assertEqual(diagnostics["rank"], 2)
+        self.assertEqual(diagnostics["_solution_jacobian"].shape, (2, 3))
+        self.assertTrue(np.isfinite(diagnostics["_solution_jacobian"]).all())
 
     def test_smooth_nnls_stabilizes_rank_deficient_fast_scan(self):
         transfer = np.eye(3)

@@ -437,6 +437,19 @@ def solve_response_kernel_nnls(
         augmented_values = np.r_[observational_values, np.zeros(len(penalty))]
         regularization_rows = len(penalty)
     solution, _ = nnls(augmented_design, augmented_values)
+    active = np.isfinite(solution) & (solution > 0)
+    solution_jacobian = np.zeros((len(solution), len(sample_values)), dtype=float)
+    if np.any(active):
+        observation_transform = (
+            whitener if correlation_whitening else np.eye(len(sample_values))
+        )
+        augmented_transform = np.vstack([
+            observation_transform,
+            np.zeros((regularization_rows, len(sample_values))),
+        ])
+        solution_jacobian[active] = np.linalg.pinv(
+            augmented_design[:, active],
+        ) @ augmented_transform
     fitted = design @ solution
     singular_values = (
         np.linalg.svd(observational_design, compute_uv=False)
@@ -461,6 +474,7 @@ def solve_response_kernel_nnls(
         "correlation_whitening": correlation_whitening,
         "covariance_eigenvalue_floor": covariance_floor,
         "solution_roughness": float(np.linalg.norm(np.diff(solution, n=2))) if len(solution) >= 3 else 0.0,
+        "_solution_jacobian": solution_jacobian,
     }
 
 

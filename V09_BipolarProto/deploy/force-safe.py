@@ -46,7 +46,6 @@ def main():
     if valve is not None:
         attempt("inlet valve close", valve.close)
 
-    # Always safe the locally connected bipolar DAC before optional serial HV.
     attempt("bipolar SPI setup", ctl.HV.setup)
     attempt("bipolar HV zero", ctl.HV.zero)
     attempt("bipolar SPI close", ctl.HV.cleanup)
@@ -61,7 +60,7 @@ def main():
             max_voltage=settings.get("spellman_max_voltage", 30000),
         )
 
-    if settings.get("hv_source") == "Monopolar Spellman":
+    if str(settings.get("spellman_port", "")).strip():
         attempt("Spellman connect", connect_spellman)
         if spellman is not None:
             attempt("Spellman zero", spellman.zero)

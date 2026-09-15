@@ -146,14 +146,17 @@ class Flowmeter:
         self.bus = self.bus_factory(self.bus_number)
         try:
             if query_identity:
-                self.serial_number = self.read_u32(0x31AE, 0x31AF)
-                self.article_number = self.read_u32(0x31E3, 0x31E4)
-                scale = self.read_signed_word(0x30DE)
-                offset = self.read_signed_word(0x30DF)
-                if scale <= 0:
-                    raise RuntimeError(f"SFM3000 invalid scale factor {scale}")
-                self.scale_factor = float(scale)
-                self.offset = float(offset)
+                try:
+                    self.serial_number = self.read_u32(0x31AE, 0x31AF)
+                    self.article_number = self.read_u32(0x31E3, 0x31E4)
+                    scale = self.read_signed_word(0x30DE)
+                    offset = self.read_signed_word(0x30DF)
+                    if scale <= 0:
+                        raise RuntimeError(f"SFM3000 invalid scale factor {scale}")
+                    self.scale_factor = float(scale)
+                    self.offset = float(offset)
+                except Exception as error:
+                    print(f"SFM3000 identity query failed; using defaults: {error}", flush=True)
             self.start_measurement()
         except Exception:
             self._close_bus()

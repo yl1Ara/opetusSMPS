@@ -46,6 +46,8 @@ DEFAULT_SETTINGS = {
     "initial_point_pre_hold": 0.0,
     "ntot_every_n_scans": 1,
     "ntot_rest_time": 10,
+    "ntot_valve_enabled": False,
+    "pico_valve_port": "/dev/ttyACM0",
     "n_scans_plot": 5,
     "settling_time": 10,
     "final_point_extra_hold": 0,
@@ -305,6 +307,11 @@ aerosol_calibration_status = pn.pane.Markdown("Aerosol calibration: idle")
 start_button = pn.widgets.Toggle(name="Start measurement", button_type="success")
 init_button = pn.widgets.Button(name="Initialize hardware", button_type="primary")
 stop_button = pn.widgets.Button(name="Stop and zero HV", button_type="danger")
+manual_hv_voltage = pn.widgets.IntInput(
+    name="Manual HV test (V)", value=0, start=0, end=10000, step=100, width=160
+)
+manual_hv_apply_button = pn.widgets.Button(name="Apply manual HV", button_type="warning")
+manual_hv_status = pn.pane.Markdown("Manual HV: idle")
 Bipolar_toggle = pn.widgets.Toggle(
     name="Bipolar scan", button_type="primary", value=True
 )
@@ -355,6 +362,12 @@ initial_point_pre_hold = pn.widgets.FloatInput(
     step=0.5, width=190,
 )
 Ntot_time = pn.widgets.IntInput(name="Ntot measurement time (s)", value=60, step=1)
+ntot_valve_enabled = pn.widgets.Checkbox(
+    name="Enable Ntot valve", value=DEFAULT_SETTINGS["ntot_valve_enabled"]
+)
+pico_valve_port = pn.widgets.TextInput(
+    name="Ntot valve port", value=DEFAULT_SETTINGS["pico_valve_port"], width=150
+)
 ntot_every_n_scans = pn.widgets.IntInput(
     name="Ntot every N scans (0 off)",
     value=DEFAULT_SETTINGS["ntot_every_n_scans"],
@@ -583,6 +596,8 @@ def save_settings():
         "initial_point_pre_hold": float(initial_point_pre_hold.value),
         "ntot_every_n_scans": int(ntot_every_n_scans.value),
         "ntot_rest_time": int(ntot_rest_time.value),
+        "ntot_valve_enabled": bool(ntot_valve_enabled.value),
+        "pico_valve_port": str(pico_valve_port.value),
         "n_scans_plot": int(n_scans_plot.value),
         "settling_time": int(settling_time.value),
         "final_point_extra_hold": int(final_point_extra_hold.value),
@@ -695,6 +710,11 @@ def load_settings():
         "ntot_rest_time",
         DEFAULT_SETTINGS["ntot_rest_time"],
     )
+    legacy_bipolar_ntot = settings.get(
+        "hv_source", DEFAULT_SETTINGS["hv_source"],
+    ) == "Bipolar DAC"
+    ntot_valve_enabled.value = settings.get("ntot_valve_enabled", legacy_bipolar_ntot)
+    pico_valve_port.value = settings.get("pico_valve_port", DEFAULT_SETTINGS["pico_valve_port"])
     n_scans_plot.value = settings.get("n_scans_plot", DEFAULT_SETTINGS["n_scans_plot"])
     Bipolar_toggle.value = settings.get(
         "Bipolar_toggle", DEFAULT_SETTINGS["Bipolar_toggle"]
@@ -781,6 +801,10 @@ def bipolar_log_sizes(size_range_value, n, order="negative_then_positive", bipol
     return neg + pos
 
 
+def is_monopolar_source(source):
+    return source == "Monopolar Spellman"
+
+
 def save_completed_scan(scan_rows, scan_number):
     global last_scan_saved
     if not scan_rows:
@@ -793,8 +817,15 @@ def save_completed_scan(scan_rows, scan_number):
     path = Path("logs/scans") / run_day / f"{scan_id}.csv"
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    expected_points = len(active_scan_settings["scan"]) if active_scan_settings else None
+    completed_rows = [{
+        **row,
+        "scan_complete": True,
+        "expected_scan_points": expected_points,
+    } for row in scan_rows]
+
     temporary_path = path.with_suffix(".tmp")
-    pd.DataFrame(scan_rows).to_csv(temporary_path, index=False)
+    pd.DataFrame(completed_rows).to_csv(temporary_path, index=False)
     temporary_path.replace(path)
     last_scan_saved = str(path)
     print(f"Saved completed scan: {path}", flush=True)
@@ -839,6 +870,7 @@ def load_initial_scans_to_table():
 
 
 def current_scan_settings():
+    monopolar = is_monopolar_source(hv_source.value)
     return {
         "range1": np.array(range1.value, dtype=float).tolist(), "sheath1": float(sheath1.value), "steps1": int(steps1.value),
         "range2": np.array(range2.value, dtype=float).tolist(), "sheath2": float(sheath2.value), "steps2": int(steps2.value),
@@ -850,11 +882,13 @@ def current_scan_settings():
         "initial_point_pre_hold": float(initial_point_pre_hold.value),
         "settling_time": float(settling_time.value), "final_point_extra_hold": float(final_point_extra_hold.value),
         "smps_plot_step_shift": int(smps_plot_step_shift.value),
-        "polarity_switch_time": float(polarity_switch_time.value), "bipolar": bool(Bipolar_toggle.value),
+        "polarity_switch_time": float(polarity_switch_time.value), "bipolar": bool(Bipolar_toggle.value) and not monopolar,
         "hv_source": str(hv_source.value), "spellman_port": str(spellman_port.value),
         "spellman_baud": int(spellman_baud.value), "spellman_max_voltage": float(spellman_max_voltage.value),
         "ntot_time": float(Ntot_time.value), "ntot_every": int(ntot_every_n_scans.value),
         "ntot_rest_time": float(ntot_rest_time.value),
+        "ntot_valve_enabled": bool(ntot_valve_enabled.value) and not monopolar,
+        "pico_valve_port": str(pico_valve_port.value),
         "aerosol_flow_enabled": bool(aerosol_flow_enabled.value),
         "aerosol_flow_i2c_bus": int(aerosol_flow_i2c_bus.value),
         "aerosol_flow_i2c_address": str(aerosol_flow_i2c_address.value),
@@ -916,6 +950,19 @@ def update_scan_preview():
         scan_pane.object = f"Scan points ({len(sizes)}): {sizes}"
     except Exception as e:
         scan_pane.object = f"Scan parse error: {e}"
+
+
+def apply_hardware_profile(event=None):
+    monopolar = is_monopolar_source(hv_source.value)
+    if monopolar:
+        Bipolar_toggle.value = False
+        ntot_valve_enabled.value = False
+    Bipolar_toggle.disabled = monopolar
+    ntot_valve_enabled.disabled = monopolar
+    pico_valve_port.disabled = monopolar or not ntot_valve_enabled.value
+    Ntot_time.disabled = monopolar or not ntot_valve_enabled.value
+    ntot_every_n_scans.disabled = monopolar or not ntot_valve_enabled.value
+    ntot_rest_time.disabled = monopolar or not ntot_valve_enabled.value
 
 
 def update_cpc_timing_display():
@@ -995,6 +1042,13 @@ def setup_hv_source(settings=None):
             print(f"Previous bipolar HV shutdown failed: {e}", flush=True)
 
     if settings["hv_source"] == "Monopolar Spellman":
+        if not str(settings["spellman_port"]).strip():
+            hv_device = None
+            hv_target_voltage = 0.0
+            hv_runtime_status = "disabled: blank Spellman port"
+            active_hv_config = config
+            print("Spellman HV skipped: blank port", flush=True)
+            return
         hv_device = ctl.SpellmanHV(
             port=settings["spellman_port"], baud=settings["spellman_baud"],
             max_voltage=settings["spellman_max_voltage"],
@@ -1016,6 +1070,26 @@ def setup_hv_source(settings=None):
     hv_target_voltage = 0.0
     hv_runtime_status = "zeroed"
     active_hv_config = config
+
+
+def setup_inlet_valve(settings=None):
+    global inletValve
+    settings = settings or current_scan_settings()
+    enabled = settings.get("ntot_valve_enabled", False) and not is_monopolar_source(
+        settings["hv_source"]
+    )
+    if not enabled:
+        if inletValve is not None:
+            inletValve.off()
+            inletValve.close()
+            inletValve = None
+        print("Pico inlet valve skipped: Ntot valve disabled", flush=True)
+        return
+    if inletValve is None:
+        inletValve = ctl.PicoValve(
+            str(settings.get("pico_valve_port", "")).strip()
+            or DEFAULT_SETTINGS["pico_valve_port"]
+        )
 
 
 def zero_hv(disable=False):
@@ -1064,6 +1138,48 @@ def set_hv_for_point(point, generation):
             ctl.HV.voltage_set(dp, Q_sh_lpm=q_sheath)
         hv_target_voltage = float(point.get("hv_target_v", 0.0))
         hv_runtime_status = "enabled"
+
+
+def apply_manual_hv(event=None):
+    global hv_target_voltage, hv_runtime_status
+
+    if measurement_running.is_set() or start_button.value:
+        manual_hv_status.object = "Manual HV refused: stop measurement first"
+        return
+    if tuning_running.is_set() or calibration_running.is_set() or hardware_stop_pending:
+        manual_hv_status.object = "Manual HV refused: hardware is busy"
+        return
+    if active_hv_config is None:
+        manual_hv_status.object = "Manual HV refused: initialize hardware first"
+        return
+    lease = acquire_maintenance_lease()
+    if lease is None:
+        manual_hv_status.object = "Manual HV refused: software update is in progress"
+        return
+
+    voltage = max(0.0, min(10000.0, float(manual_hv_voltage.value or 0)))
+    manual_hv_voltage.value = int(voltage)
+    try:
+        with hv_io_lock:
+            if active_hv_config[0] == "Monopolar Spellman":
+                if hv_device is None:
+                    raise RuntimeError("Monopolar Spellman HV is not initialized")
+                if voltage <= 0:
+                    hv_device.zero()
+                    hv_runtime_status = "zeroed"
+                else:
+                    hv_device.set_voltage(voltage)
+                    hv_runtime_status = "manual test enabled"
+            else:
+                ctl.write_dac8551(ctl.DACValue(voltage))
+                hv_runtime_status = "manual test enabled" if voltage > 0 else "zeroed"
+            hv_target_voltage = voltage
+        manual_hv_status.object = f"Manual HV set to {voltage:.0f} V"
+    except Exception as e:
+        record_runtime_error(e)
+        manual_hv_status.object = f"Manual HV failed: {e}"
+    finally:
+        release_maintenance_lease(lease)
 
 
 def hardware_stop_and_zero():
@@ -1126,8 +1242,17 @@ def init_hardware_blocking():
     #dac.block()
     flowmeter = ctl.Flowmeter()
     blower = ctl.BlowerDAC()
-    cpc = ctl.CPC(cpc_com_port.value, cpc_type.value)
-    inletValve = ctl.PicoValve()
+    cpc_port = str(cpc_com_port.value).strip()
+    if cpc_port:
+        cpc = ctl.CPC(cpc_port, cpc_type.value)
+    else:
+        cpc = None
+        print("CPC skipped: blank port", flush=True)
+    try:
+        setup_inlet_valve(current_scan_settings())
+    except Exception as e:
+        inletValve = None
+        print(f"Pico inlet valve skipped: {e}", flush=True)
 
     setup_aerosol_flowmeter(current_scan_settings())
 
@@ -1155,6 +1280,8 @@ def init_done_callback(fut, start_after=False):
 
     try:
         fut.result()
+        if start_after and cpc is None:
+            raise RuntimeError("CPC is disabled; configure its serial port before measurement")
         set_cpc_controls_disabled(True)
         set_status_threadsafe("Status: hardware initialized")
         if start_after and start_button.value:
@@ -1200,9 +1327,16 @@ def init(start_after=False):
             ensure_cpc_reader_thread()
             settings = active_scan_settings or current_scan_settings()
             setup_hv_source(settings)
+            setup_inlet_valve(settings)
             setup_aerosol_flowmeter(settings)
             apply_idle_flow_setpoint()
             if start_after:
+                if cpc is None:
+                    start_button.value = False
+                    measurement_running.clear()
+                    release_measurement_maintenance_lock()
+                    status_text.object = "Status: CPC is disabled; configure its serial port before measurement"
+                    return
                 ensure_measurement_thread()
                 measurement_running.set()
                 status_text.object = "Status: running"
@@ -1705,7 +1839,7 @@ def build_health_payload():
         "phase": "tuning" if tuning_running.is_set() else "calibration" if calibration_running.is_set() else phase,
         "scan_number": int(scan_number),
         "hardware_initialized": all(
-            item is not None for item in (flowmeter, blower, flow_controller, cpc, inletValve)
+            item is not None for item in (flowmeter, blower, flow_controller)
         ) and active_hv_config is not None and bool(flow_diagnostics.get("connected")),
         "cpc": {
             "type": cpc_type.value,
@@ -2364,7 +2498,11 @@ def complete_scan(do_ntot, last_point):
 
 def run_ntot_measurement(scan_range, scan_number, q_sheath, settings):
     global inletValve, active_point_key, polarity_switch
+    if not settings.get("ntot_valve_enabled", False):
+        print("Skipping Ntot measurement: Ntot valve disabled", flush=True)
+        return []
     if inletValve is None:
+        print("Skipping Ntot measurement: Ntot valve is not initialized", flush=True)
         return []
 
     ntot_rows = []
@@ -2531,7 +2669,7 @@ def measurement_step(generation, debug=True):
                     Ntot = True
 
                     ntot_every = max(0, active_scan_settings["ntot_every"])
-                    do_ntot = ntot_every > 0 and (scan_number + 1) % ntot_every == 0
+                    do_ntot = active_scan_settings.get("ntot_valve_enabled", False) and ntot_every > 0 and (scan_number + 1) % ntot_every == 0
                     complete_scan(do_ntot, point)
                     scan_number += 1
 
@@ -2584,7 +2722,7 @@ def measurement_step(generation, debug=True):
             Ntot = True
 
             ntot_every = max(0, active_scan_settings["ntot_every"])
-            do_ntot = ntot_every > 0 and (scan_number + 1) % ntot_every == 0
+            do_ntot = active_scan_settings.get("ntot_valve_enabled", False) and ntot_every > 0 and (scan_number + 1) % ntot_every == 0
             complete_scan(do_ntot, point)
             scan_number += 1
     except Exception as e:
@@ -3041,6 +3179,7 @@ def runtime_snapshot():
         "current_cpc": current_cpc_pane.object,
         "current_flow": current_flow_pane.object,
         "current_hv": current_hv_pane.object,
+        "manual_hv_status": manual_hv_status.object,
         "current_aerosol_flow": current_aerosol_flow_pane.object,
         "latest_ntot": latest_ntot_pane.object,
         "table": table_pane.value.copy(),
@@ -3069,6 +3208,9 @@ def run_runtime_command(command, payload=None):
             stop_and_zero()
         elif command == "initialize":
             init(start_after=False)
+        elif command == "manual_hv":
+            manual_hv_voltage.value = int(payload)
+            apply_manual_hv()
         elif command == "setting":
             widget_name, value = payload
             widget = scan_setting_widgets_by_name.get(widget_name)
@@ -3109,6 +3251,7 @@ def sync_runtime_owner_view():
         current_cpc_pane.object = str(snapshot["current_cpc"])
         current_flow_pane.object = str(snapshot["current_flow"])
         current_hv_pane.object = str(snapshot["current_hv"])
+        manual_hv_status.object = str(snapshot["manual_hv_status"])
         current_aerosol_flow_pane.object = str(snapshot["current_aerosol_flow"])
         latest_ntot_pane.object = str(snapshot["latest_ntot"])
         for widget_name, setting in snapshot["settings"].items():
@@ -3140,6 +3283,11 @@ def on_runtime_follower_setting_change(event, widget_name):
     if runtime_syncing:
         return
     send_runtime_command("setting", (widget_name, event.new))
+
+
+def on_runtime_follower_manual_hv(event=None):
+    manual_hv_status.object = "Manual HV request sent"
+    send_runtime_command("manual_hv", int(manual_hv_voltage.value or 0))
 
 
 def send_runtime_command(command, payload=None):
@@ -3187,6 +3335,8 @@ scan_setting_widgets = [
     polarity_switch_time,
     Bipolar_toggle,
     Ntot_time,
+    ntot_valve_enabled,
+    pico_valve_port,
     ntot_every_n_scans,
     cpc_type,
     hv_source,
@@ -3208,6 +3358,8 @@ scan_setting_widgets = [
     cpc_diag_interval_sec,
 ]
 scan_setting_widgets_by_name = {widget.name: widget for widget in scan_setting_widgets}
+hv_source.param.watch(apply_hardware_profile, "value")
+ntot_valve_enabled.param.watch(apply_hardware_profile, "value")
 
 if runtime_owner:
     cpc_type.param.watch(update_cpc_diagnostic_options, "value")
@@ -3216,6 +3368,7 @@ if runtime_owner:
     start_button.param.watch(on_start_change, "value")
     init_button.on_click(lambda event: init(start_after=False))
     stop_button.on_click(lambda event: stop_and_zero())
+    manual_hv_apply_button.on_click(apply_manual_hv)
     cpc_diag_send_button.on_click(lambda event: run_cpc_diagnostic_command(event, auto=False))
     sheath_tune_start_button.on_click(start_sheath_tuning)
     sheath_tune_cancel_button.on_click(cancel_sheath_tuning)
@@ -3231,12 +3384,14 @@ else:
     start_button.param.watch(on_runtime_follower_start_change, "value")
     init_button.on_click(lambda event: send_runtime_command("initialize"))
     stop_button.on_click(lambda event: send_runtime_command("stop"))
+    manual_hv_apply_button.on_click(on_runtime_follower_manual_hv)
     for button in (
         cpc_diag_send_button, sheath_tune_start_button, sheath_tune_cancel_button,
         sheath_tune_apply_button, aerosol_calibration_button, git_update_button,
     ):
         button.disabled = True
 
+apply_hardware_profile()
 update_scan_preview()
 update_cpc_timing_display()
 
@@ -3246,6 +3401,7 @@ control_layout = pn.Column(
     pn.Row(git_update_status, git_update_button, sizing_mode="stretch_width"),
     pn.Row(cpc_com_port, cpc_type),
     pn.Row(hv_source, spellman_port, spellman_baud, spellman_max_voltage),
+    pn.Row(manual_hv_voltage, manual_hv_apply_button, manual_hv_status),
     pn.Row(aerosol_flow_enabled, aerosol_flow_i2c_bus, aerosol_flow_i2c_address, aerosol_flow_calibration),
     "# CPC / DMA control panel",
     pn.Row(start_button, status_text, init_button, stop_button),
@@ -3257,6 +3413,7 @@ control_layout = pn.Column(
     scan_pane,
     cpc_timing_pane,
     pn.Row(meas_time, cpc_poll_interval, Ntot_time, ntot_every_n_scans, ntot_rest_time, n_scans_plot),
+    pn.Row(ntot_valve_enabled, pico_valve_port),
     pn.Row(cpc_transport_delay_sec, cpc_response_window_sec, automatic_boundary_holds),
     pn.Row(settling_time, initial_point_pre_hold, final_point_extra_hold, smps_plot_step_shift, polarity_switch_time),
     pn.Row(current_cpc_pane, current_flow_pane, current_hv_pane, current_aerosol_flow_pane, latest_ntot_pane),

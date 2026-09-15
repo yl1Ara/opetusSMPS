@@ -27,7 +27,38 @@ def load_timing_helpers():
     return namespace
 
 
+def load_scan_helpers():
+    module = ast.parse(GUI_PATH.read_text())
+    nodes = [
+        node for node in module.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"bipolar_log_sizes", "is_monopolar_source"}
+    ]
+    namespace = {"np": np}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(GUI_PATH), "exec"), namespace)
+    return namespace
+
+
 class GuiSettingsTests(unittest.TestCase):
+    def test_monopolar_profile_is_positive_only(self):
+        helpers = load_scan_helpers()
+        sizes = helpers["bipolar_log_sizes"](
+            [10, 100], 4, bipolar=True, source="Monopolar Spellman",
+        )
+
+        self.assertTrue(helpers["is_monopolar_source"]("Monopolar Spellman"))
+        self.assertEqual(len(sizes), 4)
+        self.assertTrue(all(size > 0 for size in sizes))
+
+    def test_bipolar_profile_keeps_both_polarities(self):
+        sizes = load_scan_helpers()["bipolar_log_sizes"](
+            [10, 100], 4, bipolar=True, source="Bipolar DAC",
+        )
+
+        self.assertEqual(len(sizes), 8)
+        self.assertTrue(any(size < 0 for size in sizes))
+        self.assertTrue(any(size > 0 for size in sizes))
+
     def test_active_scan_snapshot_contains_step_shift(self):
         source = GUI_PATH.read_text()
         module = ast.parse(source)

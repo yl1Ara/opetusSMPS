@@ -150,6 +150,74 @@ def distribution_bin_coverage(size_nm, concentration, part_columns=None):
     return float(np.sum(widths[finite_width & available]) / total_width)
 
 
+def poisson_concentration_standard_deviation(
+    concentration_cm3, sample_flow_lpm, sample_duration_sec, sample_count=1,
+):
+    """Convert sqrt(N) counting noise to concentration standard deviation."""
+    concentration = np.asarray(concentration_cm3, dtype=float)
+    duration = np.asarray(sample_duration_sec, dtype=float)
+    volume_cm3 = float(sample_flow_lpm) * 1000.0 / 60.0 * duration * sample_count
+    valid = (
+        np.isfinite(concentration) & (concentration >= 0)
+        & np.isfinite(volume_cm3) & (volume_cm3 > 0)
+    )
+    uncertainty = np.full(np.broadcast_shapes(concentration.shape, volume_cm3.shape), np.nan)
+    concentration, volume_cm3 = np.broadcast_arrays(concentration, volume_cm3)
+    uncertainty[valid] = np.sqrt(concentration[valid] * volume_cm3[valid]) / volume_cm3[valid]
+    return uncertainty
+
+
+def nnls_counting_covariance(design_matrix, observation_covariance, solution):
+    """Linearized covariance conditional on the NNLS active set."""
+    matrix = np.asarray(design_matrix, dtype=float)
+    observation_covariance = np.asarray(observation_covariance, dtype=float)
+    solution = np.asarray(solution, dtype=float)
+    output = np.zeros((len(solution), len(solution)), dtype=float)
+    active = np.isfinite(solution) & (solution > 0)
+    if (
+        matrix.ndim != 2
+        or observation_covariance.shape != (matrix.shape[0], matrix.shape[0])
+        or not np.any(active)
+    ):
+        output[:] = np.nan
+        return output
+    if not np.all(np.isfinite(matrix)) or not np.all(np.isfinite(observation_covariance)):
+        output[:] = np.nan
+        return output
+    jacobian = np.linalg.pinv(matrix[:, active])
+    output[np.ix_(active, active)] = jacobian @ observation_covariance @ jacobian.T
+    return output
+
+
+def propagate_nnls_counting_uncertainty(design_matrix, observation_std, solution):
+    covariance = nnls_counting_covariance(
+        design_matrix, np.diag(np.square(observation_std)), solution,
+    )
+    return np.sqrt(np.maximum(np.diag(covariance), 0.0))
+
+
+def integrate_distribution_covariance(size_nm, covariance, part_columns=None):
+    """Propagate full bin covariance into integrated number concentration."""
+    covariance = np.asarray(covariance, dtype=float)
+    size_nm = np.asarray(size_nm, dtype=float)
+    if covariance.shape != (len(size_nm), len(size_nm)):
+        return np.nan
+    weights = np.asarray([
+        integrate_number_distribution(
+            size_nm, np.eye(len(size_nm))[index], part_columns=part_columns,
+        )
+        for index in range(len(size_nm))
+    ])
+    active = np.isfinite(weights) & (weights != 0)
+    if not np.any(active):
+        return np.nan
+    active_covariance = covariance[np.ix_(active, active)]
+    if not np.all(np.isfinite(active_covariance)):
+        return np.nan
+    variance = float(weights[active] @ active_covariance @ weights[active])
+    return float(np.sqrt(max(variance, 0.0)))
+
+
 def integrate_number_distribution(size_nm, concentration, part_columns=None):
     size_nm = np.asarray(size_nm, dtype=float)
     concentration = np.asarray(concentration, dtype=float)

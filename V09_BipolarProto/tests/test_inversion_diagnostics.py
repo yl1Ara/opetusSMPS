@@ -16,7 +16,10 @@ from DMPS_inversion_gui.diagnostics import (
     distribution_moments,
     fit_lognormal_modes,
     growth_models_from_settings,
+    integrate_distribution_covariance,
     integrate_number_distribution,
+    poisson_concentration_standard_deviation,
+    propagate_nnls_counting_uncertainty,
     range_overlap_metrics,
     select_lognormal_mode_fit,
     sulfuric_acid_condensation_sink,
@@ -27,6 +30,36 @@ from inv_funcs.cpc_loss import cpc_loss1
 
 
 class InversionDiagnosticTests(unittest.TestCase):
+    def test_poisson_concentration_uncertainty_uses_effective_count(self):
+        sigma = poisson_concentration_standard_deviation(
+            [60.0], sample_flow_lpm=1.0, sample_duration_sec=1.0,
+        )
+
+        self.assertAlmostEqual(sigma[0], np.sqrt(1000.0) / (1000.0 / 60.0))
+
+    def test_nnls_uncertainty_propagates_through_active_solution(self):
+        sigma = propagate_nnls_counting_uncertainty(
+            np.eye(2), [2.0, 3.0], [10.0, 20.0],
+        )
+
+        np.testing.assert_allclose(sigma, [2.0, 3.0])
+
+    def test_integrated_uncertainty_adds_independent_bins_in_quadrature(self):
+        sizes = np.geomspace(10.0, 100.0, 3)
+
+        self.assertAlmostEqual(
+            integrate_distribution_covariance(sizes, np.diag([4.0, 4.0, 4.0])),
+            np.sqrt(3.0),
+        )
+
+    def test_integrated_uncertainty_retains_bin_covariance(self):
+        sizes = np.geomspace(10.0, 100.0, 3)
+
+        self.assertAlmostEqual(
+            integrate_distribution_covariance(sizes, np.full((3, 3), 4.0)),
+            3.0,
+        )
+
     @staticmethod
     def polarity_consistency_fixture(ratios=(1.44, 1.44), cpc_types=("3010", "3010")):
         sizes = np.geomspace(20.0, 70.0, 12)

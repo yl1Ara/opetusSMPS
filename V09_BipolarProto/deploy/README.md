@@ -62,7 +62,31 @@ deploy/install-services.sh --origin customer-host.tailnet-name.ts.net --state-di
 
 The services then load code and dependencies from the Git checkout but retain `settings.json`, `settings_inversion.json`, `logs/`, and viewer state under the state directory.
 
-The installer acquires the instrument maintenance lock and refuses a busy or unverifiable running service before changing dependencies. It creates `.venv`, synchronizes locked application dependencies plus Raspberry Pi hardware dependencies, syntax-checks only the instrument application and hardware modules, installs `dmps`, enables only the hardware service, and verifies both its localhost endpoint and fresh process-matched `health.json` heartbeat. Before Panel starts, systemd writes calibrated midpoint code `32705` to the bipolar DAC; a failed midpoint write prevents the GUI from starting. Inversion code is not executed on the instrument.
+## Bipolar and monopolar installations
+
+The bipolar installation uses the SPI DAC and may use the Pico inlet valve for Ntot measurements. Keep SPI enabled, select `Bipolar DAC`, and enable the Ntot valve only when that valve is physically installed.
+
+The monopolar installation uses only positive scan points, does not use the bipolar SPI DAC, and never uses the Ntot valve. Disable SPI and enable the CPC and Spellman UARTs in `/boot/firmware/config.txt`:
+
+```ini
+## Monopolar MPS
+#dtparam=spi=on
+enable_uart=1
+dtoverlay=disable-bt-pi5
+dtoverlay=uart3
+```
+
+After rebooting, verify the serial devices before starting the GUI:
+
+```bash
+ls -l /dev/serial* /dev/ttyAMA* /dev/ttyS*
+```
+
+The verified `MPS` monopolar installation uses `/dev/serial0 -> /dev/ttyS0` on GPIO14/15 for the CPC and `/dev/ttyAMA3` on GPIO4/5 for the Spellman supply. Set `cpc_com_port` to `/dev/serial0`, `spellman_port` to `/dev/ttyAMA3`, and `hv_source` to `Monopolar Spellman`. Selecting that source forces positive-only scans and disables Ntot controls in the GUI.
+
+After changing overlays, reboot and confirm GPIO4/5 report `TXD3`/`RXD3`. Device aliases can vary with firmware, so verify the actual devices instead of assuming `/dev/serial1` exists.
+
+The installer acquires the instrument maintenance lock and refuses a busy or unverifiable running service before changing dependencies. It creates `.venv`, synchronizes locked application dependencies plus Raspberry Pi hardware dependencies, syntax-checks only the instrument application and hardware modules, installs `dmps`, enables only the hardware service, and verifies both its localhost endpoint and fresh process-matched `health.json` heartbeat. Before Panel starts, a bipolar installation writes calibrated midpoint code `32705` to its DAC; monopolar installations skip that startup action because SPI is disabled. Inversion code is not executed on the instrument.
 
 ## Operations and updates
 
@@ -72,13 +96,13 @@ dmps health
 dmps update
 ```
 
-`dmps update` operates on the complete monorepo. It acquires an exclusive maintenance lock, refuses a dirty tree or non-fast-forward pull, and reads a fresh `health.json` whose PID must match systemd's current process; it never opens a Panel session to determine whether measurement is idle. Measurement, initialization, tuning, and calibration hold shared maintenance leases, so they cannot begin or remain active during an update. If state cannot be verified, the update fails closed. After its final idle check, it stops the hardware service before changing the checkout or environment, runs dependency synchronization and Python syntax checks, installs runtime files, starts the service if it was previously active, and requires the new PID's localhost endpoint and heartbeat to pass. A failed update leaves the service stopped rather than running mixed old and new files.
+`dmps update` operates on the complete monorepo. It acquires an exclusive maintenance lock, refuses a dirty tree or non-fast-forward pull, and reads a fresh `health.json` whose PID must match systemd's current process; it never opens a Panel session to determine whether measurement is idle. Measurement, initialization, tuning, and calibration hold shared maintenance leases, so they cannot begin or remain active during an update. If state cannot be verified, the update fails closed. After its final idle check, it stops the hardware service before changing the checkout or environment, runs dependency synchronization and Python syntax checks, installs runtime files, starts the service if it was previously active, and requires the new PID's localhost endpoint and heartbeat to pass. A failed update leaves the service stopped rather than running mixed old and new files. Do not copy tracked source files into an installed checkout: publish changes to GitHub, keep runtime files under the configured state directory, and use `dmps update` so the checkout remains clean.
 
 Stop a measurement in the GUI and confirm it is idle before updating. Do not schedule `dmps update` from cron or a systemd timer. Do not manually run a second hardware GUI beside `tdmps@USER.service`.
 
 Service logs are available with `dmps log`. The existing `tdmps@USER.service` name is retained for compatibility.
 
-Stopping the service first invokes the application's idempotent safe shutdown. After the process exits, `ExecStopPost` independently commands the inlet valve off, both HV outputs safe, and the blower DAC to zero. This second layer never runs alongside the application.
+Stopping the service first invokes the application's idempotent safe shutdown. After the process exits, `ExecStopPost` independently attempts to command the inlet valve off, both HV outputs safe, and the blower DAC to zero, regardless of the currently saved profile. Missing hardware is reported but does not prevent the remaining safing attempts. This second layer never runs alongside the application.
 
 ## Tailscale exposure
 

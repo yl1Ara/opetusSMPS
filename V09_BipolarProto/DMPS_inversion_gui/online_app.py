@@ -117,6 +117,9 @@ DEFAULT_SETTINGS = {
     "smps_timing_match_tolerance_min": 15.0,
     "inversion_size_bin_decimals": 1,
     "cpc_gap_interpolation_enabled": True,
+    "counting_uncertainty_enabled": True,
+    "cpc_sample_flow_lpm": 1.0,
+    "cpc_counting_interval_sec": 1.0,
     "low_value_lift_enabled": False,
     "low_value_lift_ratio": 0.85,
     "low_value_lift_alpha": 1.0,
@@ -320,6 +323,9 @@ def save_settings():
         "smps_timing_match_tolerance_min": float(smps_timing_match_tolerance_min.value),
         "inversion_size_bin_decimals": int(inversion_size_bin_decimals.value),
         "cpc_gap_interpolation_enabled": bool(cpc_gap_interpolation_enabled.value),
+        "counting_uncertainty_enabled": bool(counting_uncertainty_enabled.value),
+        "cpc_sample_flow_lpm": float(cpc_sample_flow_lpm.value),
+        "cpc_counting_interval_sec": float(cpc_counting_interval_sec.value),
         "low_value_lift_enabled": bool(low_value_lift_enabled.value),
         "low_value_lift_ratio": float(low_value_lift_ratio.value),
         "low_value_lift_alpha": float(low_value_lift_alpha.value),
@@ -545,6 +551,17 @@ def save_data(event=None):
             heatmap_df.to_csv(
                 outdir / f"heatmap_{method_name}_{tr['polarity']}_{stamp}.csv"
             )
+            if "Z_std" in tr:
+                uncertainty_df = pd.DataFrame(
+                    np.asarray(tr["Z_std"], dtype=float).T,
+                    index=pd.to_datetime(tr["x"]),
+                    columns=np.asarray(tr["y"], dtype=float),
+                )
+                uncertainty_df.index.name = "time"
+                uncertainty_df.columns.name = "size_nm"
+                uncertainty_df.to_csv(
+                    outdir / f"heatmap_1sigma_{method_name}_{tr['polarity']}_{stamp}.csv"
+                )
             if "temperature_k" in tr and "pressure_pa" in tr:
                 pd.DataFrame({
                     "time": pd.to_datetime(tr["x"]),
@@ -561,6 +578,11 @@ def save_data(event=None):
                     "response_window_seconds": tr.get("response_window_seconds", np.nan),
                     "dwell_seconds": tr.get("dwell_seconds", np.nan),
                     "size_step_shift": tr.get("size_step_shift", np.nan),
+                    "counting_uncertainty": tr.get("counting_uncertainty", "disabled"),
+                    "cpc_sample_flow_lpm": tr.get("cpc_sample_flow_lpm", np.nan),
+                    "cpc_counting_interval_fallback_sec": tr.get(
+                        "cpc_counting_interval_fallback_sec", np.nan,
+                    ),
                 }).to_csv(
                     outdir / f"heatmap_conditions_{method_name}_{tr['polarity']}_{stamp}.csv",
                     index=False,
@@ -589,6 +611,8 @@ def save_data(event=None):
                 "time": pd.to_datetime(tr["x"]),
                 f"Ntot_{method_name}_{polarity}_inverted": tr["y"],
             })
+            if "y_std" in tr:
+                d[f"Ntot_{method_name}_{polarity}_1sigma"] = tr["y_std"]
             if polarity == "positive" and "y_measured" in tr and not measured_ntot_saved:
                 d["Ntot_measured"] = tr["y_measured"]
                 measured_ntot_saved = True
@@ -619,6 +643,7 @@ def save_data(event=None):
             "range_overlap_diagnostics",
             "ntot_closure_diagnostics",
             "kernel_sample_residuals",
+            "scan_completion_diagnostics",
         }:
             diagnostic_rows = tr.get("rows", [])
             if diagnostic_rows:
@@ -1584,13 +1609,119 @@ def apply_loaded_time_window(df):
     return df[(times >= start) & (times <= end)].copy()
 
 
+def filter_complete_scans(df):
+    """Reject incomplete scan groups while retaining valid scans in the same batch."""
+    if df.empty:
+        return df, []
+    group_key = "scan_id" if "scan_id" in df.columns else "scan_number"
+    accepted = []
+    diagnostics = []
+    for scan_id, group in df.groupby(group_key, sort=False):
+        measured = group[group["Ntot"] == False].copy()
+        metadata_present = (
+            measured["_completion_metadata_present"].fillna(False).astype(bool).any()
+            if "_completion_metadata_present" in measured else True
+        )
+        reason = None
+        if measured.empty:
+            reason = "no sizing rows"
+        if (
+            reason is None
+            and metadata_present
+            and "scan_complete" in measured
+            and measured["scan_complete"].notna().any()
+        ):
+            complete = measured["scan_complete"].astype(str).str.lower().isin({"true", "1", "yes"})
+            if not complete.all():
+                reason = "scan is not marked complete"
+        if (
+            reason is None
+            and metadata_present
+            and "expected_scan_points" in measured
+            and measured["expected_scan_points"].notna().any()
+        ):
+            expected_values = pd.to_numeric(
+                measured["expected_scan_points"], errors="coerce",
+            ).dropna().unique()
+            point_indices = pd.to_numeric(
+                measured.get("point_index", pd.Series(index=measured.index, dtype=float)),
+                errors="coerce",
+            ).dropna()
+            if len(expected_values) != 1:
+                reason = "missing or inconsistent expected point count"
+            else:
+                expected = int(expected_values[0])
+                observed = set(point_indices.astype(int))
+                if observed != set(range(expected)):
+                    reason = f"observed {len(observed)} of {expected} expected scan points"
+        if (
+            reason is None
+            and metadata_present
+            and "point_valid_until" in measured
+            and "point_index" in measured
+            and measured["point_index"].notna().any()
+        ):
+            final_index = pd.to_numeric(measured["point_index"], errors="coerce").max()
+            final_rows = measured[pd.to_numeric(measured["point_index"], errors="coerce") == final_index]
+            if final_rows["point_valid_until"].isna().all():
+                reason = "final scan point was not completed"
+        diagnostics.append({
+            "scan_id": str(scan_id),
+            "accepted": reason is None,
+            "reason": reason or "complete",
+        })
+        if reason is None:
+            accepted.append(group)
+    if not accepted:
+        return df.iloc[0:0].copy(), diagnostics
+    return pd.concat(accepted).sort_index(), diagnostics
+
+
 def load_selected_scans():
     dfs = []
+    load_diagnostics = []
+    required_columns = {
+        "time", "scan_range", "size_nm", "cpc_count", "Ntot", "sheath_setpoint",
+    }
 
     for f in scan_files.value:
         p = Path(f)
         try:
             d = pd.read_csv(p)
+            d["_completion_metadata_present"] = any(
+                column in d.columns
+                for column in ("scan_complete", "expected_scan_points", "point_valid_until")
+            )
+            missing = sorted(required_columns - set(d.columns))
+            if missing:
+                load_diagnostics.append({
+                    "scan_id": p.stem,
+                    "accepted": False,
+                    "reason": f"missing columns: {', '.join(missing)}",
+                })
+                continue
+            size_values = pd.to_numeric(d["size_nm"], errors="coerce")
+            sheath_values = pd.to_numeric(d["sheath_setpoint"], errors="coerce")
+            time_values = pd.to_datetime(d["time"], errors="coerce")
+            ntot_text = d["Ntot"].astype(str).str.strip().str.lower()
+            if size_values.isna().any() or sheath_values.isna().all() or time_values.isna().any():
+                load_diagnostics.append({
+                    "scan_id": p.stem,
+                    "accepted": False,
+                    "reason": "invalid size, sheath-flow setpoint, or timestamp values",
+                })
+                continue
+            if not ntot_text.isin({"true", "false", "1", "0"}).all():
+                load_diagnostics.append({
+                    "scan_id": p.stem,
+                    "accepted": False,
+                    "reason": "invalid Ntot flag values",
+                })
+                continue
+            d["size_nm"] = size_values
+            d["sheath_setpoint"] = sheath_values
+            d["time"] = time_values
+            d["Ntot"] = ntot_text.isin({"true", "1"})
             d["scan_id"] = p.stem
             dfs.append(d)
         except Exception as e:
@@ -1606,6 +1737,8 @@ def load_selected_scans():
     df["cpc_float"] = pd.to_numeric(df["cpc_count"], errors="coerce")
     df["abs_size_nm"] = pd.to_numeric(df["size_nm"], errors="coerce").abs()
     df["polarity"] = np.where(df["size_nm"] > 0, "positive", "negative")
+    df, completion_diagnostics = filter_complete_scans(df)
+    df.attrs["scan_completion_diagnostics"] = load_diagnostics + completion_diagnostics
     return df
 
 
@@ -1959,6 +2092,30 @@ cpc_gap_interpolation_enabled = pn.widgets.Checkbox(
         "cpc_gap_interpolation_enabled",
         DEFAULT_SETTINGS["cpc_gap_interpolation_enabled"],
     )),
+)
+counting_uncertainty_enabled = pn.widgets.Checkbox(
+    name="Propagate CPC counting uncertainty",
+    value=bool(settings.get(
+        "counting_uncertainty_enabled",
+        DEFAULT_SETTINGS["counting_uncertainty_enabled"],
+    )),
+)
+cpc_sample_flow_lpm = pn.widgets.FloatInput(
+    name="CPC sample flow (L/min)",
+    value=float(settings.get("cpc_sample_flow_lpm", DEFAULT_SETTINGS["cpc_sample_flow_lpm"])),
+    start=0.001,
+    step=0.1,
+    width=190,
+)
+cpc_counting_interval_sec = pn.widgets.FloatInput(
+    name="Counting interval fallback (s)",
+    value=float(settings.get(
+        "cpc_counting_interval_sec",
+        DEFAULT_SETTINGS["cpc_counting_interval_sec"],
+    )),
+    start=0.001,
+    step=0.1,
+    width=210,
 )
 low_value_lift_enabled = pn.widgets.Checkbox(
     name="Lift low/zero artifacts",
@@ -2774,6 +2931,63 @@ def smooth_ion_ratio_points(ion_points):
     return smoothed_points
 
 
+def counting_covariance_by_size(d, sizes_nm):
+    sizes_nm = np.asarray(sizes_nm, dtype=float)
+    if not counting_uncertainty_enabled.value:
+        return np.full((len(sizes_nm), len(sizes_nm)), np.nan)
+    rows = d[d["Ntot"] == False].copy()
+    rows["_size"] = merged_abs_size_nm(rows[inversion_size_column(rows)])
+    rows["_concentration"] = pd.to_numeric(rows["cpc_count"], errors="coerce")
+    if "cpc_sample_id" in rows:
+        valid_ids = pd.to_numeric(rows["cpc_sample_id"], errors="coerce")
+        identified = rows[valid_ids.notna() & (valid_ids > 0)].drop_duplicates("cpc_sample_id")
+        unidentified = rows[~(valid_ids.notna() & (valid_ids > 0))]
+        rows = pd.concat([identified, unidentified], ignore_index=True)
+    fallback = max(float(cpc_counting_interval_sec.value), 0.001)
+    if "cpc_response_window_sec" in rows:
+        duration = pd.to_numeric(rows["cpc_response_window_sec"], errors="coerce")
+        rows["_duration"] = duration.where(duration > 0, fallback).fillna(fallback)
+    else:
+        rows["_duration"] = fallback
+    sample_volume = max(float(cpc_sample_flow_lpm.value), 0.001) * 1000.0 / 60.0 * rows["_duration"]
+    rows["_variance"] = rows["_concentration"].clip(lower=0) / sample_volume
+    grouped = rows.dropna(subset=["_size", "_variance"]).groupby("_size")["_variance"].agg(["sum", "count"])
+    if grouped.empty:
+        return np.full((len(sizes_nm), len(sizes_nm)), np.nan)
+    grouped["variance"] = grouped["sum"] / np.square(grouped["count"])
+    source_sizes = grouped.index.to_numpy(dtype=float)
+    source_variance = grouped["variance"].to_numpy(dtype=float)
+    order = np.argsort(source_sizes)
+    interpolation = log_interpolation_matrix(source_sizes[order], sizes_nm)
+    covariance = interpolation @ np.diag(source_variance[order]) @ interpolation.T
+    covered = interpolation.sum(axis=1) > 0
+    covariance[~covered, :] = np.nan
+    covariance[:, ~covered] = np.nan
+    return covariance
+
+
+def log_interpolation_matrix(source_sizes, target_sizes):
+    source = np.log10(np.asarray(source_sizes, dtype=float))
+    target = np.log10(np.asarray(target_sizes, dtype=float))
+    matrix = np.zeros((len(target), len(source)), dtype=float)
+    for row, value in enumerate(target):
+        if value < source[0] or value > source[-1]:
+            continue
+        upper = int(np.searchsorted(source, value, side="left"))
+        if upper == 0:
+            matrix[row, 0] = 1.0
+        elif upper == len(source):
+            matrix[row, -1] = 1.0
+        elif np.isclose(value, source[upper]):
+            matrix[row, upper] = 1.0
+        else:
+            lower = upper - 1
+            fraction = (value - source[lower]) / (source[upper] - source[lower])
+            matrix[row, lower] = 1.0 - fraction
+            matrix[row, upper] = fraction
+    return matrix
+
+
 def invert_one_scan(
     d,
     polarity,
@@ -2797,6 +3011,19 @@ def invert_one_scan(
     if response_kernel is not None:
         dp_meas_nm = response_kernel.sizes_nm.copy()
         y = response_kernel.sample_values.copy()
+        counting_duration = np.asarray(response_kernel.support_ends) - np.asarray(
+            response_kernel.support_starts
+        )
+        counting_duration = np.where(
+            np.isfinite(counting_duration) & (counting_duration > 0),
+            counting_duration,
+            max(float(cpc_counting_interval_sec.value), 0.001),
+        )
+        observation_std = diag.poisson_concentration_standard_deviation(
+            np.maximum(y, 0.0),
+            max(float(cpc_sample_flow_lpm.value), 0.001),
+            counting_duration,
+        )
         kernel_smoothness = float(smps_kernel_smoothness.value)
         rejection_reason = response_kernel_rejection_reason(response_kernel)
         if rejection_reason:
@@ -2828,6 +3055,8 @@ def invert_one_scan(
                 y_series = y_series[y_series > 0]
             dp_meas_nm = y_series.index.to_numpy(dtype=float)
             y = y_series.to_numpy(dtype=float)
+
+        observation_covariance = counting_covariance_by_size(d, dp_meas_nm)
 
     if len(dp_meas_nm) < 2 or len(y) == 0:
         return pd.DataFrame(columns=["abs_size_nm", "N_GWalpha"])
@@ -2929,6 +3158,13 @@ def invert_one_scan(
             where=coverage > 0,
         )
         y = y_binned
+        solution_jacobian = solve_diagnostics.pop("_solution_jacobian")
+        observation_covariance = (
+            observation_std[:, None]
+            * response_kernel.correlation
+            * observation_std[None, :]
+        )
+        x_covariance = solution_jacobian @ observation_covariance @ solution_jacobian.T
         assignment_diagnostics = {
             **(assignment_diagnostics or {}),
             **response_kernel.diagnostics,
@@ -2948,6 +3184,14 @@ def invert_one_scan(
     else:
         x, _ = nnls(A, y)
         y_fit = A @ x
+        x_covariance = diag.nnls_counting_covariance(
+            A, observation_covariance, x,
+        )
+    if counting_uncertainty_enabled.value:
+        x_std = np.sqrt(np.maximum(np.diag(x_covariance), 0.0))
+    else:
+        x_std = np.full(x.shape, np.nan)
+        x_covariance = np.full((len(x), len(x)), np.nan)
     residual = y - y_fit
     residual_rel = np.divide(
         residual,
@@ -2959,6 +3203,7 @@ def invert_one_scan(
     result = pd.DataFrame({
         "abs_size_nm": dp_grid_nm,
         "N_GWalpha": x,
+        "N_GWalpha_std": x_std,
         "measured_cpc": y,
         "fitted_cpc": y_fit,
         "residual_cpc": residual,
@@ -2966,6 +3211,7 @@ def invert_one_scan(
     })
     if assignment_diagnostics is not None:
         result.attrs["assignment_diagnostics"] = assignment_diagnostics
+    result.attrs["counting_covariance"] = x_covariance
     if response_kernel is not None:
         result.attrs["sample_residual_rows"] = [
             {
@@ -2991,7 +3237,11 @@ def invert_one_scan(
 
 
 def run_inversion_calculation(df):
-    df = df.copy()
+    existing_completion = list(df.attrs.get("scan_completion_diagnostics", []))
+    df, completion_diagnostics = filter_complete_scans(df.copy())
+    completion_diagnostics = existing_completion or completion_diagnostics
+    if df.empty:
+        return [{"kind": "scan_completion_diagnostics", "rows": completion_diagnostics}]
     df["time"] = pd.to_datetime(df["time"], errors="coerce")
     df["abs_size_nm"] = pd.to_numeric(df["size_nm"], errors="coerce").abs()
     df["polarity"] = np.where(df["size_nm"] > 0, "positive", "negative")
@@ -3075,6 +3325,7 @@ def run_inversion_calculation(df):
             dd = df[df["polarity"] == polarity].copy()
 
             heat_cols = []
+            heat_std_cols = []
             heat_part_columns = []
             heat_times = []
             heat_flow_rel_rmse = []
@@ -3087,6 +3338,7 @@ def run_inversion_calculation(df):
             heat_cpc_types = []
             heat_cpc_type_mixed = []
             ntot_vals = []
+            ntot_std_vals = []
             ntot_measured = []
             residual_rows = []
 
@@ -3100,6 +3352,8 @@ def run_inversion_calculation(df):
                     # scan-derived Gunn-Woessner estimate.
                     zratio = float(zratio_widget.value)
                 scan_parts = []
+                scan_std_parts = []
+                scan_failed = False
                 ntot_scan = 0.0
                 conditions = conditions_by_scan[scan_id]
                 temp = float(conditions["temperature_k"])
@@ -3154,24 +3408,40 @@ def run_inversion_calculation(df):
                             (scan_id, polarity, range_value)
                         )
                         if response_kernel is None:
-                            continue
+                            completion_diagnostics.append({
+                                "scan_id": str(scan_id),
+                                "accepted": False,
+                                "reason": f"missing response kernel for range {range_value} ({polarity})",
+                            })
+                            scan_failed = True
+                            break
                         group_assignment_diagnostics = {
                             **response_kernel_result.diagnostics,
                             "scan_id": str(scan_id),
                             "scan_range": range_value,
                             "polarity": polarity,
                         }
-                    invdf = invert_one_scan(
-                        g_range,
-                        polarity=polarity,
-                        zratio=zratio,
-                        temp=temp,
-                        press=press,
-                        inversion_method=inversion_method,
-                        cpc_series_override=cpc_series_override,
-                        assignment_diagnostics=group_assignment_diagnostics,
-                        response_kernel=response_kernel,
-                    )
+                    try:
+                        invdf = invert_one_scan(
+                            g_range,
+                            polarity=polarity,
+                            zratio=zratio,
+                            temp=temp,
+                            press=press,
+                            inversion_method=inversion_method,
+                            cpc_series_override=cpc_series_override,
+                            assignment_diagnostics=group_assignment_diagnostics,
+                            response_kernel=response_kernel,
+                        )
+                    except Exception as error:
+                        completion_diagnostics.append({
+                            "scan_id": str(scan_id),
+                            "accepted": False,
+                            "reason": f"range inversion skipped: {error}",
+                        })
+                        print(f"Skipping invalid scan range {scan_id}: {error}", flush=True)
+                        scan_failed = True
+                        break
                     assignment = invdf.attrs.get("assignment_diagnostics")
                     for sample_row in invdf.attrs.get("sample_residual_rows", []):
                         kernel_sample_residuals.append({
@@ -3192,10 +3462,21 @@ def run_inversion_calculation(df):
                         print(f"SMPS CPC assignment: {assignment}", flush=True)
 
                     if invdf.empty:
-                        continue
+                        completion_diagnostics.append({
+                            "scan_id": str(scan_id),
+                            "accepted": False,
+                            "reason": (
+                                f"range {g_range['scan_range'].iloc[0]} ({polarity}) "
+                                "did not produce an invertible distribution"
+                            ),
+                        })
+                        scan_failed = True
+                        break
 
                     dp_inv = invdf["abs_size_nm"].to_numpy(dtype=float)
                     n_inv = invdf["N_GWalpha"].to_numpy(dtype=float)
+                    n_std = invdf["N_GWalpha_std"].to_numpy(dtype=float)
+                    n_covariance = invdf.attrs["counting_covariance"]
                     if low_value_lift_enabled.value:
                         n_inv = one_sided_low_value_lift(n_inv)
 
@@ -3215,15 +3496,19 @@ def run_inversion_calculation(df):
 
                     order = np.argsort(dp_inv)
                     scan_parts.append((dp_inv[order], n_inv[order]))
+                    scan_std_parts.append((
+                        dp_inv[order], n_std[order], n_covariance[np.ix_(order, order)],
+                    ))
 
-                if not scan_parts:
+                if scan_failed or not scan_parts:
                     continue
 
                 full_sum = np.zeros(len(size_axis), dtype=float)
                 full_count = np.zeros(len(size_axis), dtype=float)
+                full_covariance_sum = np.zeros((len(size_axis), len(size_axis)), dtype=float)
                 part_columns = []
 
-                for dp_inv, n_inv in scan_parts:
+                for (dp_inv, n_inv), (_, _, n_covariance) in zip(scan_parts, scan_std_parts):
                     mask = (size_axis >= np.nanmin(dp_inv)) & (size_axis <= np.nanmax(dp_inv))
                     interpolated = np.interp(
                         np.log10(size_axis[mask]),
@@ -3234,6 +3519,8 @@ def run_inversion_calculation(df):
                     mask_indices = np.flatnonzero(mask)
                     full_sum[mask_indices[valid_interp]] += interpolated[valid_interp]
                     full_count[mask_indices[valid_interp]] += 1
+                    interpolation = log_interpolation_matrix(dp_inv, size_axis)
+                    full_covariance_sum += interpolation @ n_covariance @ interpolation.T
                     part_column = np.full(len(size_axis), np.nan)
                     part_column[mask_indices[valid_interp]] = interpolated[valid_interp]
                     part_columns.append(part_column)
@@ -3244,11 +3531,26 @@ def run_inversion_calculation(df):
                     out=np.full(len(size_axis), np.nan),
                     where=full_count > 0,
                 )
+                full_std = np.divide(
+                    np.sqrt(np.maximum(np.diag(full_covariance_sum), 0.0)), full_count,
+                    out=np.full(len(size_axis), np.nan),
+                    where=full_count > 0,
+                )
+                count_outer = np.outer(full_count, full_count)
+                full_covariance = np.divide(
+                    full_covariance_sum,
+                    count_outer,
+                    out=np.full(full_covariance_sum.shape, np.nan),
+                    where=count_outer > 0,
+                )
                 if low_value_lift_enabled.value:
                     full_col = one_sided_low_value_lift(full_col)
 
                 ntot_scan = diag.integrate_number_distribution(
                     size_axis, full_col, part_columns=part_columns
+                )
+                ntot_std = diag.integrate_distribution_covariance(
+                    size_axis, full_covariance, part_columns=part_columns,
                 )
                 ntot_bin_coverage = diag.distribution_bin_coverage(
                     size_axis, full_col, part_columns=part_columns
@@ -3277,6 +3579,7 @@ def run_inversion_calculation(df):
                     "method": inversion_method,
                     "polarity": polarity,
                     "inverted_ntot": ntot_scan,
+                    "inverted_ntot_std": ntot_std,
                     "inverted_bin_coverage": ntot_bin_coverage,
                     "measured_ntot_raw": measured_ntot_raw,
                     "measured_ntot": measured_ntot,
@@ -3294,6 +3597,7 @@ def run_inversion_calculation(df):
                 })
 
                 heat_cols.append(full_col)
+                heat_std_cols.append(full_std)
                 heat_part_columns.append([
                     np.asarray(column, dtype=float).copy() for column in part_columns
                 ])
@@ -3313,6 +3617,7 @@ def run_inversion_calculation(df):
                 if np.isfinite(ntot_limit) and ntot_limit > 0 and ntot_scan > ntot_limit:
                     ntot_scan = np.nan
                 ntot_vals.append(ntot_scan)
+                ntot_std_vals.append(ntot_std)
                 ntot_measured.append(measured_ntot)
 
             if heat_cols:
@@ -3321,6 +3626,10 @@ def run_inversion_calculation(df):
                     "method": inversion_method,
                     "polarity": polarity,
                     "Z": np.column_stack(heat_cols),
+                    **(
+                        {"Z_std": np.column_stack(heat_std_cols)}
+                        if counting_uncertainty_enabled.value else {}
+                    ),
                     "x": heat_times,
                     "y": size_axis,
                     "flow_rel_rmse": heat_flow_rel_rmse,
@@ -3340,6 +3649,12 @@ def run_inversion_calculation(df):
                     "response_window_seconds": float(smps_response_window_sec.value),
                     "dwell_seconds": float(smps_dwell_sec.value),
                     "size_step_shift": int(smps_size_step_shift.value),
+                    "counting_uncertainty": (
+                        "Poisson sqrt(effective counts), linearized on NNLS active set"
+                        if counting_uncertainty_enabled.value else "disabled"
+                    ),
+                    "cpc_sample_flow_lpm": float(cpc_sample_flow_lpm.value),
+                    "cpc_counting_interval_fallback_sec": float(cpc_counting_interval_sec.value),
                     "part_columns": heat_part_columns,
                 })
 
@@ -3349,6 +3664,7 @@ def run_inversion_calculation(df):
                     "polarity": polarity,
                     "x": heat_times,
                     "y": ntot_vals,
+                    **({"y_std": ntot_std_vals} if counting_uncertainty_enabled.value else {}),
                     "y_measured": ntot_measured,
                 })
 
@@ -3368,6 +3684,10 @@ def run_inversion_calculation(df):
         "scan_id": [x[4] for x in ion_points],
     })
 
+    output.append({
+        "kind": "scan_completion_diagnostics",
+        "rows": completion_diagnostics,
+    })
     output.append({
         "kind": "scan_health",
         "rows": diag.build_scan_health(df, group_key),
@@ -4045,9 +4365,15 @@ def plot_inversion_result(result):
             method = tr.get("method", "gunn woessner mod")
             row = heatmap_rows[(method, tr["polarity"])]
             z = np.clip(tr["Z"], 0, float(heatmap_clip.value))
+            uncertainty_hover = (
+                "<br>counting 1-sigma=%{customdata:.2f}" if "Z_std" in tr else ""
+            )
 
             fig.add_heatmap(
                 z=z,
+                customdata=np.asarray(
+                    tr.get("Z_std", np.full(np.asarray(z).shape, np.nan)), dtype=float,
+                ),
                 x=tr["x"],
                 y=tr["y"],
                 zmin=0,
@@ -4062,7 +4388,9 @@ def plot_inversion_result(result):
                 hovertemplate=(
                     "time=%{x|%Y-%m-%d %H:%M}<br>"
                     "dp=%{y:.2f} nm<br>"
-                    "dN/dlog10Dp=%{z:.2f}<extra></extra>"
+                    "dN/dlog10Dp=%{z:.2f}"
+                    + uncertainty_hover
+                    + "<extra></extra>"
                 ),
                 row=row,
                 col=1,
@@ -4139,6 +4467,9 @@ def plot_inversion_result(result):
 
         elif tr["kind"] == "ntot":
             method = tr.get("method", "gunn woessner mod")
+            uncertainty_hover = (
+                "<br>counting 1-sigma=%{error_y.array:.2f}" if "y_std" in tr else ""
+            )
             y_ntot = diag.guard_diagnostic_values(
                 tr["y"],
                 float(ntot_plot_max.value),
@@ -4148,12 +4479,21 @@ def plot_inversion_result(result):
             fig.add_scatter(
                 x=tr["x"],
                 y=y_ntot,
+                error_y=dict(
+                    type="data",
+                    array=np.asarray(
+                        tr.get("y_std", np.full(len(y_ntot), np.nan)), dtype=float,
+                    ),
+                    visible="y_std" in tr,
+                ),
                 mode="lines+markers",
                 name=f"{method_label(method)} Ntot {tr['polarity']}",
                 hovertemplate=(
                     f"inversion={method_label(method)} {tr['polarity']}<br>"
                     "time=%{x|%Y-%m-%d %H:%M}<br>"
-                    "inverted Ntot=%{y:.2f}<extra></extra>"
+                    "inverted Ntot=%{y:.2f}"
+                    + uncertainty_hover
+                    + "<extra></extra>"
                 ),
                 row=ntot_row,
                 col=1,
@@ -5409,6 +5749,14 @@ def run_inversion(event=None):
                 else:
                     status_text = "Inversion finished."
 
+                completion_rows = next(
+                    (item["rows"] for item in result if item.get("kind") == "scan_completion_diagnostics"),
+                    [],
+                )
+                skipped_scans = sum(not row.get("accepted", False) for row in completion_rows)
+                if skipped_scans:
+                    status_text += f" Skipped {skipped_scans} incomplete or invalid scan entries."
+
                 assignment_rows = next(
                     (item["rows"] for item in result if item.get("kind") == "cpc_assignment_diagnostics"),
                     [],
@@ -5687,6 +6035,9 @@ for w in [
     smps_timing_match_tolerance_min,
     inversion_size_bin_decimals,
     cpc_gap_interpolation_enabled,
+    counting_uncertainty_enabled,
+    cpc_sample_flow_lpm,
+    cpc_counting_interval_sec,
     low_value_lift_enabled,
     low_value_lift_ratio,
     low_value_lift_alpha,
@@ -5718,6 +6069,7 @@ inversion_controls = pn.Column(
     ),
     pn.Row(smps_size_step_shift, inversion_methods),
     pn.Row(inversion_size_bin_decimals, cpc_gap_interpolation_enabled, low_value_lift_enabled),
+    pn.Row(counting_uncertainty_enabled, cpc_sample_flow_lpm, cpc_counting_interval_sec),
     pn.Row(low_value_lift_ratio, low_value_lift_alpha),
     tube_segments,
 )
