@@ -1,6 +1,6 @@
 _dmps_complete()
 {
-    local commands="start stop restart status health log logs event events viewer update process ps url shell help"
+    local commands="start stop restart status health log logs event events diagnose-reboot viewer update process ps url shell help"
     local service_commands="start stop restart status health log logs"
     if [[ "${COMP_WORDS[1]}" == "viewer" ]]; then
         COMPREPLY=($(compgen -W "${service_commands}" -- "${COMP_WORDS[2]}"))

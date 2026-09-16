@@ -95,6 +95,7 @@ The installer acquires the instrument maintenance lock and refuses a busy or unv
 ```bash
 dmps status
 dmps health
+dmps diagnose-reboot
 dmps update
 ```
 
@@ -102,7 +103,7 @@ dmps update
 
 Stop a measurement in the GUI and confirm it is idle before updating. Do not schedule `dmps update` from cron or a systemd timer. Do not manually run a second hardware GUI beside `tdmps@USER.service`.
 
-Service logs are available with `dmps log`. Installation overrides Raspberry Pi OS's volatile-journal default and retains up to 200 MB or three months of system journals across reboots. `dmps events` shows the latest persistent JSONL runtime events from `logs/runtime/`, including panel sessions, measurement transitions, one-minute hardware heartbeats, scan QC, failures, and shutdown results. The existing `tdmps@USER.service` name is retained for compatibility.
+Service logs are available with `dmps log`. Installation overrides Raspberry Pi OS's volatile-journal default and retains up to 200 MB or three months of system journals across reboots. After an unexplained reboot or outage, `dmps diagnose-reboot` prints boot history, current Pi throttling flags, current and previous boot power/reset kernel messages, and retained previous-boot TDMPS service logs. `dmps events` shows the latest persistent JSONL runtime events from `logs/runtime/`, including panel sessions, measurement transitions, one-minute hardware heartbeats, scan QC, failures, and shutdown results. The existing `tdmps@USER.service` name is retained for compatibility.
 
 Stopping the service first invokes the application's idempotent safe shutdown. After the process exits, `ExecStopPost` independently attempts to command the inlet valve off, both HV outputs safe, and the blower DAC to zero, regardless of the currently saved profile. Missing hardware is reported but does not prevent the remaining safing attempts. This second layer never runs alongside the application.
 
