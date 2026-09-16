@@ -2,6 +2,7 @@ import json
 import math
 import os
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -31,6 +32,44 @@ def atomic_write_json(path, value):
         file.write("\n")
         file.flush()
     os.replace(temporary, path)
+
+
+class RuntimeEventLog:
+    """Append infrequent operational events to durable, daily JSONL files."""
+
+    def __init__(self, directory, component):
+        self.directory = Path(directory)
+        self.component = str(component)
+        self._lock = threading.Lock()
+        try:
+            self.boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        except OSError:
+            self.boot_id = "unknown"
+
+    def write(self, event, **fields):
+        now = datetime.now(timezone.utc)
+        record = json_safe({
+            "timestamp": now.isoformat(),
+            "event": str(event),
+            "component": self.component,
+            "boot_id": self.boot_id,
+            "pid": os.getpid(),
+            **fields,
+        })
+        path = self.directory / f"runtime-events-{now:%Y%m%d}.jsonl"
+        try:
+            line = json.dumps(record, separators=(",", ":"), allow_nan=False) + "\n"
+            with self._lock:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with open(path, "a", encoding="utf-8") as file:
+                    file.write(line)
+                    file.flush()
+                    os.fsync(file.fileno())
+        except Exception as error:
+            print(f"Runtime event log write failed: {error}", flush=True)
+            return False
+        print(f"DMPS event: {event}", flush=True)
+        return True
 
 
 class ShutdownCoordinator:

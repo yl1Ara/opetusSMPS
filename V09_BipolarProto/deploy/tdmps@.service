@@ -9,8 +9,9 @@ StartLimitBurst=3
 [Service]
 Type=simple
 User=%i
+Environment=DMPS_PANEL_PORT=5006
 EnvironmentFile=/etc/dmps/%i.env
-ExecCondition=/usr/local/libexec/dmps-port-available 127.0.0.1 5006
+ExecCondition=/usr/local/libexec/dmps-port-available 127.0.0.1 ${DMPS_PANEL_PORT}
 ExecStartPre=/usr/local/libexec/dmps-zero-bipolar
 ExecStart=/usr/bin/env /usr/local/libexec/dmps-run-panel main
 ExecStopPost=/usr/local/libexec/dmps-force-safe

@@ -28,6 +28,8 @@ SETTINGS_FILE = Path("settings.json")
 STATE_DIR = Path(os.environ.get("DMPS_STATE_DIR", ".")).resolve()
 HEALTH_FILE = STATE_DIR / "health.json"
 HEALTH_INTERVAL_SEC = 2.0
+RUNTIME_HEARTBEAT_INTERVAL_SEC = 60.0
+event_log = ctl.RuntimeEventLog(STATE_DIR / "logs/runtime", "panel")
 
 DEFAULT_SETTINGS = {
     "cpc_com_port": "/dev/ttyAMA0",
@@ -564,6 +566,26 @@ aerosol_cache_lock = threading.Lock()
 aerosol_cache = {"flow": np.nan, "pressure": np.nan, "temperature": np.nan, "error": None}
 aerosol_poll_thread = None
 health_thread = None
+last_runtime_heartbeat = 0.0
+
+
+def current_panel_session_id():
+    try:
+        context = pn.state.curdoc.session_context
+        return context.id if context is not None else None
+    except Exception:
+        return None
+
+
+def runtime_event(event, **fields):
+    bridge = globals().get("runtime_bridge") or {}
+    event_log.write(
+        event,
+        runtime_id=bridge.get("owner_id"),
+        acquisition_session_id=ACQUISITION_SESSION_ID,
+        panel_session_id=current_panel_session_id(),
+        **fields,
+    )
 
 
 def record_runtime_error(error):
@@ -1219,6 +1241,7 @@ def hardware_stop_and_zero():
     import traceback as _traceback
 
     try:
+        runtime_event("output_safing_started", phase=phase)
         with measurement_step_lock:
             try:
                 if inletValve is not None:
@@ -1233,9 +1256,14 @@ def hardware_stop_and_zero():
                 zero_hv(disable=True)
 
         set_status_threadsafe("Status: stopped, HV zeroed")
+        runtime_event("output_safing_finished", result="success")
     except Exception as e:
         _traceback.print_exc()
         record_runtime_error(e)
+        runtime_event(
+            "output_safing_finished", result="error", error=str(e),
+            traceback=_traceback.format_exc(),
+        )
         set_status_threadsafe(f"Stop/zero failed: {e}")
     finally:
         release_measurement_maintenance_lock()
@@ -1245,6 +1273,7 @@ def hardware_stop_and_zero():
 def stop_and_zero():
     global phase, current_size_index, phase_start_time, dac, active_point_key, hardware_stop_pending
 
+    runtime_event("measurement_stop_requested", phase=phase, scan_number=scan_number)
     advance_measurement_generation()
     measurement_running.clear()
     tuning_cancel_event.set()
@@ -1320,11 +1349,16 @@ def init_done_callback(fut, start_after=False):
             ensure_measurement_thread()
             measurement_running.set()
             set_status_threadsafe("Status: running")
+            runtime_event("measurement_started", scan_number=scan_number)
         elif start_after:
             release_measurement_maintenance_lock()
     except Exception as e:
         _traceback.print_exc()
         record_runtime_error(e)
+        runtime_event(
+            "hardware_initialization_failed", error=str(e),
+            traceback=_traceback.format_exc(), start_after=bool(start_after),
+        )
         measurement_running.clear()
         release_measurement_maintenance_lock()
         set_cpc_controls_disabled(False)
@@ -1372,6 +1406,7 @@ def init(start_after=False):
                 ensure_measurement_thread()
                 measurement_running.set()
                 status_text.object = "Status: running"
+                runtime_event("measurement_started", scan_number=scan_number)
             else:
                 status_text.object = "Status: hardware initialized"
         finally:
@@ -1406,11 +1441,41 @@ def measurement_loop(_stop_event=app_stop_event, _measurement_running=measuremen
                     measurement_step(current_measurement_generation())
         except Exception as e:
             _traceback.print_exc()
+            fail_measurement(e, _traceback.format_exc())
             try:
                 set_status_threadsafe(f"Measurement loop error: {e}")
             except Exception:
                 pass
         _time.sleep(0.05)
+
+
+def fail_measurement(error, traceback_text=None):
+    global phase, hardware_stop_pending, active_point_key
+
+    if not measurement_running.is_set() and hardware_stop_pending:
+        return
+    advance_measurement_generation()
+    measurement_running.clear()
+    phase = "error"
+    active_point_key = None
+    record_runtime_error(error)
+    runtime_event(
+        "measurement_failed", error=str(error), traceback=traceback_text,
+        scan_number=scan_number, size_index=current_size_index,
+        hv_target_v=hv_target_voltage,
+    )
+    set_status_threadsafe(f"Measurement failed; safing outputs: {error}")
+
+    def clear_start_toggle():
+        if start_button.value:
+            start_button.value = False
+
+    owner_document = runtime_bridge.get("owner_document")
+    if owner_document is not None:
+        owner_document.add_next_tick_callback(clear_start_toggle)
+    if not hardware_stop_pending:
+        hardware_stop_pending = True
+        hardware_executor.submit(hardware_stop_and_zero)
 
 
 def cpc_reader_loop(
@@ -1842,6 +1907,18 @@ def build_health_payload():
         sheath_setpoint = float(flow_controller.pid.setpoint) if flow_controller is not None else np.nan
     except Exception:
         sheath_setpoint = np.nan
+    try:
+        blower_output = float(flow_controller.out) if flow_controller is not None else np.nan
+        controller_running = bool(flow_controller.running)
+        controller_thread_alive = bool(
+            flow_controller.thread is not None and flow_controller.thread.is_alive()
+        )
+        controller_error_count = int(flow_controller.flow_error_count)
+    except Exception:
+        blower_output = np.nan
+        controller_running = False
+        controller_thread_alive = False
+        controller_error_count = 0
     disk = shutil.disk_usage(STATE_DIR)
     with last_runtime_error_lock:
         runtime_error = last_runtime_error
@@ -1870,6 +1947,9 @@ def build_health_payload():
         "scan_active": bool(measurement_running.is_set()),
         "phase": "tuning" if tuning_running.is_set() else "calibration" if calibration_running.is_set() else phase,
         "scan_number": int(scan_number),
+        "scan_started": scan_started_wall,
+        "scan_point_index": int(current_size_index),
+        "scan_buffered_rows": len(scan_rows),
         "hardware_initialized": all(
             item is not None for item in (flowmeter, blower, flow_controller)
         ) and active_hv_config is not None and bool(flow_diagnostics.get("connected")),
@@ -1881,6 +1961,10 @@ def build_health_payload():
         "sheath": {
             "flow_lpm": sheath_flow, "setpoint_lpm": sheath_setpoint,
             "error_lpm": sheath_flow - sheath_setpoint,
+            "blower_output_v": blower_output,
+            "controller_running": controller_running,
+            "controller_thread_alive": controller_thread_alive,
+            "controller_error_count": controller_error_count,
         },
         "flowmeter": flow_diagnostics,
         "aerosol": {
@@ -1899,13 +1983,31 @@ def build_health_payload():
 
 
 def write_health():
-    ctl.atomic_write_runtime_json(HEALTH_FILE, build_health_payload())
+    payload = build_health_payload()
+    ctl.atomic_write_runtime_json(HEALTH_FILE, payload)
+    return payload
 
 
 def health_loop(_stop_event=app_stop_event):
+    global last_runtime_heartbeat
     while not _stop_event.is_set():
         try:
-            write_health()
+            payload = write_health()
+            now = time.monotonic()
+            if now - last_runtime_heartbeat >= RUNTIME_HEARTBEAT_INTERVAL_SEC:
+                runtime_event(
+                    "runtime_heartbeat",
+                    runtime_state=payload["runtime_state"],
+                    scan_active=payload["scan_active"],
+                    phase=payload["phase"],
+                    scan_number=payload["scan_number"],
+                    sheath=payload["sheath"],
+                    cpc=payload["cpc"],
+                    hv=payload["hv"],
+                    flowmeter=payload["flowmeter"],
+                    disk_free_bytes=payload["disk_free_bytes"],
+                )
+                last_runtime_heartbeat = now
         except Exception as error:
             record_runtime_error(f"health write failed: {error}")
             print(f"Health write failed: {error}", flush=True)
@@ -1918,6 +2020,7 @@ def _safe_shutdown_impl(reason):
     global init_maintenance_fd, tuning_maintenance_fd, calibration_maintenance_fd
 
     print(f"Safe shutdown started: {reason}", flush=True)
+    runtime_event("runtime_shutdown_started", reason=reason)
     measurement_running.clear()
     tuning_cancel_event.set()
     app_stop_event.set()
@@ -1995,6 +2098,7 @@ def _safe_shutdown_impl(reason):
         record_runtime_error("; ".join(errors))
     attempt("final health write", write_health)
     print("Safe shutdown finished", flush=True)
+    runtime_event("runtime_shutdown_finished", reason=reason, errors=errors)
 
 
 shutdown_coordinator = ctl.ShutdownCoordinator(_safe_shutdown_impl)
@@ -2505,6 +2609,13 @@ def begin_scan():
     scan_started_wall = datetime.now().isoformat()
     scan_serial_error_start = spellman_snapshot()["serial_errors"]
     pending_settings_pane.object = "Settings: active scan snapshot"
+    runtime_event(
+        "scan_started", scan_number=scan_number,
+        scan_started=scan_started_wall,
+        point_count=len(active_scan_settings["scan"]),
+        hv_source=active_scan_settings["hv_source"],
+        sheath_setpoints=sorted({point["sheath"] for point in active_scan_settings["scan"]}),
+    )
 
 
 def complete_scan(do_ntot, last_point):
@@ -2529,6 +2640,10 @@ def complete_scan(do_ntot, last_point):
     active_scan_settings = None
     phase = "idle"
     pending_settings_pane.object = "Settings: next scan snapshot will be applied"
+    runtime_event(
+        "scan_completed", scan_number=scan_number,
+        saved_path=last_scan_saved, qc=qc,
+    )
 
 
 def run_ntot_measurement(scan_range, scan_number, q_sheath, settings):
@@ -2776,6 +2891,7 @@ def measurement_step(generation, debug=True):
         status_text.object = f"Measurement error: {e}"
         print(f"Measurement error: {e}", flush=True)
         record_runtime_error(e)
+        fail_measurement(e, _traceback.format_exc())
 
 
 def append_row_csv(path, row):
@@ -2884,17 +3000,21 @@ def on_start_change(event):
     global phase, phase_start_time, current_size_index, active_scan_settings, scan_started_monotonic
 
     if event.new:
+        runtime_event("measurement_start_requested")
         if hardware_stop_pending:
             start_button.value = False
             status_text.object = "Status: start refused until HV stop/zero finishes"
+            runtime_event("measurement_start_refused", reason="output safing is active")
             return
         if tuning_running.is_set() or calibration_running.is_set():
             start_button.value = False
             status_text.object = "Status: start refused while tuning/calibration is active"
+            runtime_event("measurement_start_refused", reason="tuning or calibration is active")
             return
         if not acquire_measurement_maintenance_lock():
             start_button.value = False
             status_text.object = "Status: start refused while software update is in progress"
+            runtime_event("measurement_start_refused", reason="software update is active")
             return
         advance_measurement_generation()
         scan_rows.clear()
@@ -3237,6 +3357,7 @@ def publish_runtime_snapshot():
 
 def run_runtime_command(command, payload=None):
     try:
+        runtime_event("panel_command", command=command)
         if command == "start" and not start_button.value:
             start_button.value = True
         elif command == "stop":
@@ -3504,9 +3625,17 @@ if runtime_owner:
         target=health_loop, daemon=True, name="health-writer",
     )
     health_thread.start()
+    runtime_event("panel_session_opened", role="owner")
+    runtime_event("runtime_ready", role="owner", software=software_identity())
+else:
+    runtime_event("panel_session_opened", role="follower")
 
 
-def runtime_owner_session_destroyed(session_context):
+def runtime_session_destroyed(session_context):
+    runtime_event(
+        "panel_session_destroyed", destroyed_session_id=session_context.id,
+        role="owner" if runtime_owner else "follower",
+    )
     if not runtime_owner:
         return
     owner_document = runtime_bridge["owner_document"]
@@ -3525,7 +3654,9 @@ def runtime_owner_session_destroyed(session_context):
 
 
 if runtime_owner:
-    pn.state.on_session_destroyed(runtime_owner_session_destroyed)
+    pn.state.on_session_destroyed(runtime_session_destroyed)
+else:
+    pn.state.on_session_destroyed(runtime_session_destroyed)
 
 
 def _termination_handler(signum, frame):

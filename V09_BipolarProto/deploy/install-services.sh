@@ -3,21 +3,28 @@ set -euo pipefail
 export PATH="${HOME}/.local/bin:${PATH}"
 
 usage() {
-    printf 'Usage: %s --origin HOST[:PORT] [--state-dir PATH] [--user USER]\n' "$0"
+    printf 'Usage: %s --origin HOST[:PORT] [--port PORT] [--state-dir PATH] [--user USER]\n' "$0"
 }
 
 user_name="${SUDO_USER:-$USER}"
 main_origin=""
 state_dir=""
+panel_port=5006
 while (($#)); do
     case "$1" in
         --origin) main_origin="${2:?missing origin}"; shift 2 ;;
         --state-dir) state_dir="${2:?missing state directory}"; shift 2 ;;
+        --port) panel_port="${2:?missing port}"; shift 2 ;;
         --user) user_name="${2:?missing user}"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; exit 2 ;;
     esac
 done
+
+if [[ ! "${panel_port}" =~ ^[0-9]+$ ]] || ((panel_port < 1024 || panel_port > 65535)); then
+    printf 'Panel port must be an integer from 1024 through 65535.\n' >&2
+    exit 2
+fi
 
 if [[ ! "${main_origin}" =~ ^([A-Za-z0-9-]+\.)*[A-Za-z0-9-]+(:[0-9]{1,5})?$ ]]; then
     printf 'Use an exact websocket origin such as host.example.ts.net (no scheme, path, or wildcard).\n' >&2
@@ -72,10 +79,11 @@ uv pip install --python "${app_dir}/.venv/bin/python" -r requirements-hardware.t
 
 config_tmp="$(mktemp)"
 trap 'rm -f "${config_tmp}"' EXIT
-printf 'APP_DIR="%s"\nDMPS_STATE_DIR="%s"\nDMPS_WEBSOCKET_ORIGIN_MAIN="%s"\n' \
-    "${app_dir}" "${state_dir}" "${main_origin}" >"${config_tmp}"
+printf 'APP_DIR="%s"\nDMPS_STATE_DIR="%s"\nDMPS_WEBSOCKET_ORIGIN_MAIN="%s"\nDMPS_PANEL_PORT="%s"\n' \
+    "${app_dir}" "${state_dir}" "${main_origin}" "${panel_port}" >"${config_tmp}"
 
-sudo install -d -o root -g root -m 0755 /etc/dmps /usr/local/libexec
+sudo install -d -o root -g root -m 0755 /etc/dmps /usr/local/libexec /etc/systemd/journald.conf.d
+sudo install -d -o root -g systemd-journal -m 2755 /var/log/journal
 sudo install -o root -g root -m 0644 "${config_tmp}" "/etc/dmps/${user_name}.env"
 sudo install -o root -g root -m 0755 "${script_dir}/run-panel.sh" /usr/local/libexec/dmps-run-panel
 sudo install -o root -g root -m 0755 "${script_dir}/run-force-safe.sh" /usr/local/libexec/dmps-force-safe
@@ -83,6 +91,7 @@ sudo install -o root -g root -m 0755 "${script_dir}/run-zero-bipolar.sh" /usr/lo
 sudo install -o root -g root -m 0755 "${script_dir}/check-port-available.py" /usr/local/libexec/dmps-port-available
 sudo install -o root -g root -m 0644 "${script_dir}/tdmps@.service" /etc/systemd/system/tdmps@.service
 sudo install -o root -g root -m 0644 "${script_dir}/tdmps-serve@.service" /etc/systemd/system/tdmps-serve@.service
+sudo install -o root -g root -m 0644 "${script_dir}/60-tdmps-persistent-journal.conf" /etc/systemd/journald.conf.d/60-tdmps-persistent-journal.conf
 install -d -m 0755 "${HOME}/bin"
 install -m 0755 "${script_dir}/dmps" "${HOME}/bin/dmps"
 install -m 0644 "${script_dir}/dmps-completion.bash" "${HOME}/.dmps-complete"
@@ -91,10 +100,12 @@ if ! command grep -qxF 'source ~/.dmps-complete' "${HOME}/.bashrc"; then
 fi
 
 sudo systemctl daemon-reload
+sudo systemctl restart systemd-journald
+sudo journalctl --flush
 sudo systemctl disable --now "tdmps-viewer@${user_name}.service" >/dev/null 2>&1 || true
 sudo systemctl disable tdmps.service tdmps-serve.service >/dev/null 2>&1 || true
 sudo systemctl enable --now "${main_service}"
 "${HOME}/bin/dmps" health
 
 printf 'Installed TDMPS from %s\n' "${app_dir}"
-printf 'Main:   http://127.0.0.1:5006/gui\n'
+printf 'Main:   http://127.0.0.1:%s/gui\n' "${panel_port}"

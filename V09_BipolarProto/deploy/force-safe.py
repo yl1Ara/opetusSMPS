@@ -10,6 +10,13 @@ import DmpsControl as ctl
 
 def main():
     state_dir = Path(os.environ.get("DMPS_STATE_DIR", "."))
+    event_log = ctl.RuntimeEventLog(state_dir / "logs/runtime", "force-safe")
+    event_log.write(
+        "force_safe_started",
+        service_result=os.environ.get("SERVICE_RESULT"),
+        exit_code=os.environ.get("EXIT_CODE"),
+        exit_status=os.environ.get("EXIT_STATUS"),
+    )
     try:
         settings = json.loads((state_dir / "settings.json").read_text())
     except Exception:
@@ -70,6 +77,7 @@ def main():
         print("Force-safe completed with errors: " + "; ".join(errors), flush=True)
     else:
         print("Force-safe completed", flush=True)
+    event_log.write("force_safe_finished", errors=errors)
     return 0
 
 

@@ -2,12 +2,12 @@
 
 This deployment keeps all source files in one SSH-cloned monorepo checkout, but runs only the hardware GUI on an instrument Raspberry Pi:
 
-- Hardware GUI: `gui.py`, systemd `tdmps@USER.service`, localhost port 5006
+- Hardware GUI: `gui.py`, systemd `tdmps@USER.service`, localhost port 5006 by default
 - Online inversion files remain available for deployment on a separate analysis computer; they are not started on the Pi.
 
 The hardware service restarts after process failures so its web interface remains available. Restarting the web process does not automatically initialize hardware or resume a scan. The server binds only to localhost and accepts only its configured exact websocket origin; wildcards are not used.
 
-The templated hardware unit conflicts with the legacy `tdmps.service`, checks that port 5006 is free before touching hardware, and rate-limits failed starts. Installation disables inactive legacy service names. If a legacy service is active, `dmps start`, `dmps restart`, and `dmps update` fail closed until it is stopped and disabled.
+The templated hardware unit conflicts with the legacy `tdmps.service`, checks that the configured panel port is free before touching hardware, and rate-limits failed starts. Installation disables inactive legacy service names. If a legacy service is active, `dmps start`, `dmps restart`, and `dmps update` fail closed until it is stopped and disabled.
 
 ## SSH deploy key
 
@@ -53,6 +53,8 @@ Install `uv` if it is not already available, then install with the system's exac
 curl -LsSf https://astral.sh/uv/install.sh | sh
 deploy/install-services.sh --origin customer-host.tailnet-name.ts.net
 ```
+
+Use `--port 5008` when an installation should use a non-default local Panel port. The systemd port guard, Panel launcher, health command, and Tailscale proxy all read the resulting `DMPS_PANEL_PORT` setting.
 
 By default, runtime settings and logs remain under `V09_BipolarProto`. To preserve an existing absolute collection path while running code from a clean clone, pass an existing writable state directory:
 
@@ -100,7 +102,7 @@ dmps update
 
 Stop a measurement in the GUI and confirm it is idle before updating. Do not schedule `dmps update` from cron or a systemd timer. Do not manually run a second hardware GUI beside `tdmps@USER.service`.
 
-Service logs are available with `dmps log`. The existing `tdmps@USER.service` name is retained for compatibility.
+Service logs are available with `dmps log`. Installation overrides Raspberry Pi OS's volatile-journal default and retains up to 200 MB or three months of system journals across reboots. `dmps events` shows the latest persistent JSONL runtime events from `logs/runtime/`, including panel sessions, measurement transitions, one-minute hardware heartbeats, scan QC, failures, and shutdown results. The existing `tdmps@USER.service` name is retained for compatibility.
 
 Stopping the service first invokes the application's idempotent safe shutdown. After the process exits, `ExecStopPost` independently attempts to command the inlet valve off, both HV outputs safe, and the blower DAC to zero, regardless of the currently saved profile. Missing hardware is reported but does not prevent the remaining safing attempts. This second layer never runs alongside the application.
 
@@ -121,7 +123,7 @@ The route is:
 https://customer-host.tailnet-name.ts.net/gui
 ```
 
-Use Tailscale ACLs/grants to limit customer access. Do not open ports 5006 or 5007 in the host firewall and do not bind Panel to `0.0.0.0`.
+Use Tailscale ACLs/grants to limit customer access. Do not open the local Panel port in the host firewall and do not bind Panel to `0.0.0.0`.
 
 ## One-time migration from the copied TDMPS directory
 

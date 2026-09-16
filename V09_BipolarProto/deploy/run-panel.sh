@@ -6,7 +6,7 @@ set -euo pipefail
 case "${1:-}" in
     main)
         app="gui.py"
-        port=5006
+        port="${DMPS_PANEL_PORT:-5006}"
         origin="${DMPS_WEBSOCKET_ORIGIN_MAIN:?main websocket origin is not configured}"
         extra=(--keep-alive 10000 --reuse-sessions --check-unused-sessions 60000 --unused-session-lifetime 3600000)
         ;;

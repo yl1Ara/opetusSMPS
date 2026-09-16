@@ -15,7 +15,7 @@ main_service="tdmps@${user_name}.service"
 legacy_service="tdmps.service"
 
 health_url() {
-    printf 'http://127.0.0.1:5006/gui'
+    printf 'http://127.0.0.1:%s/gui' "${DMPS_PANEL_PORT:-5006}"
 }
 
 check_health() {
@@ -71,6 +71,17 @@ control() {
     esac
 }
 
+show_events() {
+    local files
+    shopt -s nullglob
+    files=("${DMPS_STATE_DIR:-${APP_DIR}}"/logs/runtime/runtime-events-*.jsonl)
+    if ((${#files[@]} == 0)); then
+        printf 'No runtime event logs found.\n' >&2
+        return 1
+    fi
+    tail -n 200 "${files[${#files[@]} - 1]}"
+}
+
 measurement_is_idle() {
     local main_pid
     if ! systemctl is-active --quiet "${main_service}"; then
@@ -86,15 +97,20 @@ measurement_is_idle() {
 }
 
 sync_runtime_files() {
+    sudo install -d -o root -g root -m 0755 /etc/systemd/journald.conf.d
+    sudo install -d -o root -g systemd-journal -m 2755 /var/log/journal
     sudo install -o root -g root -m 0755 "${APP_DIR}/deploy/check-port-available.py" /usr/local/libexec/dmps-port-available
     sudo install -o root -g root -m 0755 "${APP_DIR}/deploy/run-panel.sh" /usr/local/libexec/dmps-run-panel
     sudo install -o root -g root -m 0755 "${APP_DIR}/deploy/run-force-safe.sh" /usr/local/libexec/dmps-force-safe
     sudo install -o root -g root -m 0755 "${APP_DIR}/deploy/run-zero-bipolar.sh" /usr/local/libexec/dmps-zero-bipolar
     sudo install -o root -g root -m 0644 "${APP_DIR}/deploy/tdmps@.service" /etc/systemd/system/tdmps@.service
     sudo install -o root -g root -m 0644 "${APP_DIR}/deploy/tdmps-serve@.service" /etc/systemd/system/tdmps-serve@.service
+    sudo install -o root -g root -m 0644 "${APP_DIR}/deploy/60-tdmps-persistent-journal.conf" /etc/systemd/journald.conf.d/60-tdmps-persistent-journal.conf
     install -m 0755 "${APP_DIR}/deploy/dmps" "${HOME}/bin/dmps"
     install -m 0644 "${APP_DIR}/deploy/dmps-completion.bash" "${HOME}/.dmps-complete"
     sudo systemctl daemon-reload
+    sudo systemctl restart systemd-journald
+    sudo journalctl --flush
     if ! systemctl is-active --quiet tdmps.service; then
         sudo systemctl disable tdmps.service tdmps-serve.service >/dev/null 2>&1 || true
     fi
@@ -149,6 +165,7 @@ update_app() {
 
 case "${1:-help}" in
     start|stop|restart|status|health|log|logs) control "$1" ;;
+    event|events) show_events ;;
     update) update_app ;;
     process|ps) systemctl show "${main_service}" -p MainPID -p NRestarts -p ActiveState -p SubState ;;
     url) printf 'Main: https://%s/gui\n' "${DMPS_WEBSOCKET_ORIGIN_MAIN}" ;;
@@ -156,9 +173,10 @@ case "${1:-help}" in
     help|-help|--help|-h)
         cat <<'EOF'
 Usage:
-  dmps start|stop|restart|status|health|log
+  dmps start|stop|restart|status|health|log|events
   dmps update       Fast-forward a clean, idle checkout and safely restart
   dmps process      Show the main service process state
+  dmps events       Show the latest persistent runtime events
   dmps url          Print configured Tailscale URLs
   dmps shell        Open a shell in V09_BipolarProto
 EOF

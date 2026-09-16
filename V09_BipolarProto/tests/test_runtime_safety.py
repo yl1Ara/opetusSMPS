@@ -38,12 +38,14 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertNotIn("previous_app_stop_event.set()", source)
         self.assertNotIn("previous_flow_controller.stop()", source)
         self.assertIn('if runtime_owner:', source)
+        self.assertIn('"runtime_heartbeat"', source)
+        self.assertIn("fail_measurement(e, _traceback.format_exc())", source)
         self.assertNotIn("runtime_command_thread", source)
         self.assertIn("owner_document.add_next_tick_callback", source)
         self.assertIn("owner_document.add_periodic_callback(drain_ui_updates", source)
         self.assertIn("serve_gui", entrypoint)
         self.assertIn("_OWNER_NAMESPACE = namespace", runtime_host)
-        self.assertIn("pn.state.on_session_destroyed(runtime_owner_session_destroyed)", source)
+        self.assertIn("pn.state.on_session_destroyed(runtime_session_destroyed)", source)
         run_panel = (root / "deploy" / "run-panel.sh").read_text()
         self.assertIn("--reuse-sessions", run_panel)
 
@@ -55,6 +57,18 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertFalse(shutdown.run("process exit"))
         self.assertEqual(calls, ["SIGTERM"])
         self.assertTrue(shutdown.started)
+
+    def test_runtime_event_log_is_durable_jsonl(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = runtime.RuntimeEventLog(Path(directory), "test")
+            self.assertTrue(log.write("measurement_started", value=float("nan")))
+            path = next(Path(directory).glob("runtime-events-*.jsonl"))
+            event = json.loads(path.read_text())
+
+            self.assertEqual(event["event"], "measurement_started")
+            self.assertEqual(event["component"], "test")
+            self.assertIsNone(event["value"])
+            self.assertIn("boot_id", event)
 
     def test_port_guard_detects_existing_listener(self):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
@@ -69,7 +83,12 @@ class RuntimeSafetyTests(unittest.TestCase):
         ).read_text()
         self.assertIn("Conflicts=tdmps.service", service)
         self.assertIn("StartLimitBurst=3", service)
+        self.assertIn("${DMPS_PANEL_PORT}", service)
         self.assertLess(service.index("ExecCondition="), service.index("ExecStartPre="))
+        journal_config = (
+            Path(__file__).parents[1] / "deploy" / "60-tdmps-persistent-journal.conf"
+        ).read_text()
+        self.assertIn("Storage=persistent", journal_config)
         force_safe = (
             Path(__file__).parents[1] / "deploy" / "run-force-safe.sh"
         ).read_text()
