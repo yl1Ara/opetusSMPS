@@ -236,6 +236,7 @@ class SpellmanHV:
         self.max_voltage = float(max_voltage)
         self.lock = threading.Lock()
         self.voltage = 0.0
+        self.enabled = False
 
     def checksum(self, body):
         total = 0
@@ -272,13 +273,18 @@ class SpellmanHV:
         return self.command("0106CF=1")
 
     def enable(self):
-        return self.command("0106EN=1")
+        response = self.command("0106EN=1")
+        self.enabled = True
+        return response
 
     def disable(self):
+        self.enabled = False
         return self.command("0106EN=0")
 
     def set_voltage(self, voltage):
         voltage = max(0.0, min(self.max_voltage, abs(float(voltage))))
+        if voltage > 0 and not self.enabled:
+            self.enable()
         body = "0106V1=" + f"{voltage:07.1f}"
         self.command(body)
         self.voltage = voltage
