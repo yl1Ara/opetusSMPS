@@ -89,8 +89,10 @@ sudo install -o root -g root -m 0755 "${script_dir}/run-panel.sh" /usr/local/lib
 sudo install -o root -g root -m 0755 "${script_dir}/run-force-safe.sh" /usr/local/libexec/dmps-force-safe
 sudo install -o root -g root -m 0755 "${script_dir}/run-zero-bipolar.sh" /usr/local/libexec/dmps-zero-bipolar
 sudo install -o root -g root -m 0755 "${script_dir}/check-port-available.py" /usr/local/libexec/dmps-port-available
+sudo install -o root -g root -m 0755 "${script_dir}/log-system-health.py" /usr/local/libexec/dmps-log-system-health
 sudo install -o root -g root -m 0644 "${script_dir}/tdmps@.service" /etc/systemd/system/tdmps@.service
 sudo install -o root -g root -m 0644 "${script_dir}/tdmps-serve@.service" /etc/systemd/system/tdmps-serve@.service
+sudo install -o root -g root -m 0644 "${script_dir}/tdmps-health-log@.service" /etc/systemd/system/tdmps-health-log@.service
 sudo install -o root -g root -m 0644 "${script_dir}/60-tdmps-persistent-journal.conf" /etc/systemd/journald.conf.d/60-tdmps-persistent-journal.conf
 install -d -m 0755 "${HOME}/bin"
 install -m 0755 "${script_dir}/dmps" "${HOME}/bin/dmps"
@@ -104,6 +106,7 @@ sudo systemctl restart systemd-journald
 sudo journalctl --flush
 sudo systemctl disable --now "tdmps-viewer@${user_name}.service" >/dev/null 2>&1 || true
 sudo systemctl disable tdmps.service tdmps-serve.service >/dev/null 2>&1 || true
+sudo systemctl enable --now "tdmps-health-log@${user_name}.service"
 sudo systemctl enable --now "${main_service}"
 "${HOME}/bin/dmps" health
 

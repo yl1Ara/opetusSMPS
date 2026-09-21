@@ -82,6 +82,17 @@ show_events() {
     tail -n 200 "${files[${#files[@]} - 1]}"
 }
 
+show_system_health() {
+    local files
+    shopt -s nullglob
+    files=("${DMPS_STATE_DIR:-${APP_DIR}}"/logs/system/system-health-*.jsonl)
+    if ((${#files[@]} == 0)); then
+        printf 'No system health logs found.\n' >&2
+        return 1
+    fi
+    tail -n 20 "${files[${#files[@]} - 1]}"
+}
+
 section() {
     printf '\n== %s ==\n' "$1"
 }
@@ -96,14 +107,27 @@ diagnose_reboot() {
 
     section "Current Raspberry Pi power flags"
     if command -v vcgencmd >/dev/null 2>&1; then
+        vcgencmd measure_temp || true
         vcgencmd get_throttled || true
     else
         printf 'vcgencmd not installed; cannot read Raspberry Pi throttling flags.\n'
     fi
 
+    section "Hardware watchdog policy"
+    busctl get-property org.freedesktop.systemd1 /org/freedesktop/systemd1 \
+        org.freedesktop.systemd1.Manager RuntimeWatchdogUSec || true
+
+    section "System health logger"
+    systemctl --no-pager --full status "tdmps-health-log@${user_name}.service" || true
+    show_system_health || true
+
+    section "Tailscale state"
+    tailscale version || true
+    tailscale status || true
+
     section "Current boot kernel power/reset messages"
     journalctl -b -k --no-pager -n 200 \
-        -g '([Uu]nder.?voltage|throttl|watchdog|reset|power|EXT4-fs|orphan)' || true
+        -g '([Uu]nder.?voltage|thermal|temperature|throttl|watchdog|reset|power|EXT4-fs|orphan)' || true
 
     section "Previous boot TDMPS service log"
     if journalctl -b -1 -n 1 --no-pager >/dev/null 2>&1; then
@@ -115,7 +139,7 @@ diagnose_reboot() {
     section "Previous boot kernel power/reset messages"
     if journalctl -b -1 -n 1 --no-pager >/dev/null 2>&1; then
         journalctl -b -1 -k --no-pager -n 200 \
-            -g '([Uu]nder.?voltage|throttl|watchdog|reset|power|EXT4-fs|orphan)' || true
+            -g '([Uu]nder.?voltage|thermal|temperature|throttl|watchdog|reset|power|EXT4-fs|orphan)' || true
     else
         printf 'No previous boot journal found.\n'
     fi
@@ -142,12 +166,15 @@ sync_runtime_files() {
     sudo install -o root -g root -m 0755 "${APP_DIR}/deploy/run-panel.sh" /usr/local/libexec/dmps-run-panel
     sudo install -o root -g root -m 0755 "${APP_DIR}/deploy/run-force-safe.sh" /usr/local/libexec/dmps-force-safe
     sudo install -o root -g root -m 0755 "${APP_DIR}/deploy/run-zero-bipolar.sh" /usr/local/libexec/dmps-zero-bipolar
+    sudo install -o root -g root -m 0755 "${APP_DIR}/deploy/log-system-health.py" /usr/local/libexec/dmps-log-system-health
     sudo install -o root -g root -m 0644 "${APP_DIR}/deploy/tdmps@.service" /etc/systemd/system/tdmps@.service
     sudo install -o root -g root -m 0644 "${APP_DIR}/deploy/tdmps-serve@.service" /etc/systemd/system/tdmps-serve@.service
+    sudo install -o root -g root -m 0644 "${APP_DIR}/deploy/tdmps-health-log@.service" /etc/systemd/system/tdmps-health-log@.service
     sudo install -o root -g root -m 0644 "${APP_DIR}/deploy/60-tdmps-persistent-journal.conf" /etc/systemd/journald.conf.d/60-tdmps-persistent-journal.conf
     install -m 0755 "${APP_DIR}/deploy/dmps" "${HOME}/bin/dmps"
     install -m 0644 "${APP_DIR}/deploy/dmps-completion.bash" "${HOME}/.dmps-complete"
     sudo systemctl daemon-reload
+    sudo systemctl enable --now "tdmps-health-log@${user_name}.service"
     sudo systemctl restart systemd-journald
     sudo journalctl --flush
     if ! systemctl is-active --quiet tdmps.service; then
@@ -206,6 +233,7 @@ case "${1:-help}" in
     start|stop|restart|status|health|log|logs) control "$1" ;;
     diagnose-reboot) diagnose_reboot ;;
     event|events) show_events ;;
+    system-health|temperature|temp) show_system_health ;;
     update) update_app ;;
     process|ps) systemctl show "${main_service}" -p MainPID -p NRestarts -p ActiveState -p SubState ;;
     url) printf 'Main: https://%s/gui\n' "${DMPS_WEBSOCKET_ORIGIN_MAIN}" ;;
@@ -217,6 +245,7 @@ Usage:
   dmps update       Fast-forward a clean, idle checkout and safely restart
   dmps process      Show the main service process state
   dmps events       Show the latest persistent runtime events
+  dmps system-health  Show recent temperature, power, load, and network records
   dmps diagnose-reboot  Print retained logs useful after power loss or reset
   dmps url          Print configured Tailscale URLs
   dmps shell        Open a shell in V09_BipolarProto

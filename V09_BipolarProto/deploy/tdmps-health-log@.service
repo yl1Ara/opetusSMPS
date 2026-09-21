@@ -1,0 +1,14 @@
+[Unit]
+Description=TDMPS system health logger
+After=local-fs.target tailscaled.service
+
+[Service]
+Type=simple
+User=%i
+EnvironmentFile=/etc/dmps/%i.env
+ExecStart=/usr/local/libexec/dmps-log-system-health ${DMPS_STATE_DIR}/logs/system
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 
 spec = importlib.util.spec_from_file_location(
@@ -26,6 +27,13 @@ port_spec = importlib.util.spec_from_file_location(
 )
 check_port_available = importlib.util.module_from_spec(port_spec)
 port_spec.loader.exec_module(check_port_available)
+
+health_log_spec = importlib.util.spec_from_file_location(
+    "log_system_health",
+    Path(__file__).parents[1] / "deploy" / "log-system-health.py",
+)
+log_system_health = importlib.util.module_from_spec(health_log_spec)
+health_log_spec.loader.exec_module(log_system_health)
 
 class RuntimeSafetyTests(unittest.TestCase):
     def test_gui_refresh_uses_single_owner_bridge_without_stopping_previous_runtime(self):
@@ -96,6 +104,46 @@ class RuntimeSafetyTests(unittest.TestCase):
         for script_name in ("dmps", "install-services.sh"):
             script = (Path(__file__).parents[1] / "deploy" / script_name).read_text()
             self.assertIn('${HOME}/.local/bin:${PATH}', script)
+
+    def test_system_health_log_is_persistent_jsonl(self):
+        with tempfile.TemporaryDirectory() as directory:
+            record = {
+                "timestamp": "2026-09-21T00:00:00+00:00",
+                "cpu_temperature_c": 64.5,
+                "throttling": {"raw": "0x0"},
+            }
+            path = log_system_health.append_record(Path(directory), record)
+
+            self.assertEqual(json.loads(path.read_text()), record)
+            self.assertEqual(path.name, "system-health-20260921.jsonl")
+
+    def test_cpu_temperature_uses_cpu_thermal_zone(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "thermal_zone0").mkdir()
+            (root / "thermal_zone0" / "type").write_text("cpu-thermal\n")
+            (root / "thermal_zone0" / "temp").write_text("81500\n")
+
+            self.assertEqual(log_system_health.cpu_temperature_celsius(root), 81.5)
+
+    def test_throttling_flags_include_historical_soft_temperature_limit(self):
+        with mock.patch.object(log_system_health.subprocess, "run") as run:
+            run.return_value.stdout = "throttled=0x80000\n"
+
+            status = log_system_health.throttling_status()
+
+        self.assertTrue(status["soft_temperature_limit_occurred"])
+        self.assertFalse(status["soft_temperature_limit_now"])
+
+    def test_system_health_service_is_installed_and_enabled(self):
+        root = Path(__file__).parents[1]
+        service = (root / "deploy" / "tdmps-health-log@.service").read_text()
+        self.assertIn("DMPS_STATE_DIR", service)
+        self.assertIn("Restart=on-failure", service)
+        for script_name in ("dmps", "install-services.sh"):
+            script = (root / "deploy" / script_name).read_text()
+            self.assertIn("tdmps-health-log@", script)
+            self.assertIn("dmps-log-system-health", script)
 
     def test_health_json_is_atomic_and_strict(self):
         with tempfile.TemporaryDirectory() as directory:
