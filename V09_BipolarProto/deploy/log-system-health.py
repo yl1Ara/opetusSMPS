@@ -72,8 +72,10 @@ def tailscale_status():
             timeout=5, check=True,
         ).stdout)
         return {
+            "version": status.get("Version"),
             "backend_state": status.get("BackendState"),
             "online": status.get("Self", {}).get("Online"),
+            "health": status.get("Health"),
         }
     except (FileNotFoundError, json.JSONDecodeError, subprocess.SubprocessError) as error:
         return {"backend_state": None, "online": None, "error": str(error)}
@@ -89,6 +91,8 @@ def health_record():
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "boot_id": read_text("/proc/sys/kernel/random/boot_id"),
         "cpu_temperature_c": cpu_temperature_celsius(),
+        "cpu_max_frequency_hz": frequency_khz("scaling_max_freq"),
+        "cpu_current_frequency_hz": frequency_khz("scaling_cur_freq"),
         "throttling": throttling_status(),
         "uptime_sec": float(uptime.split()[0]) if uptime else None,
         "load_1m": load[0],
@@ -97,6 +101,14 @@ def health_record():
         "memory": memory_status(),
         "tailscale": tailscale_status(),
     }
+
+
+def frequency_khz(name, cpufreq_root=Path("/sys/devices/system/cpu/cpufreq")):
+    for policy in sorted(cpufreq_root.glob("policy*")):
+        value = read_text(policy / name)
+        if value is not None:
+            return int(value) * 1000
+    return None
 
 
 def append_record(log_directory, record):
