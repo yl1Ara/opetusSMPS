@@ -1,6 +1,7 @@
 from datetime import date
 import copy
 import json
+import re
 from statistics import LinearRegression
 import sys
 import time
@@ -8,7 +9,7 @@ import traceback
 import threading
 from pathlib import Path
 from types import SimpleNamespace
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
@@ -160,6 +161,8 @@ pn.extension("plotly")
 inversion_executor = ThreadPoolExecutor(max_workers=1)
 inversion_lock = threading.Lock()
 inversion_running = False
+inversion_cancel_event = threading.Event()
+inversion_future = None
 latest_inversion = None
 latest_difference_diagnostics = None
 latest_growth_diagnostics = []
@@ -937,6 +940,15 @@ def get_scan_size_axis(df):
     return np.asarray(sizes, dtype=float)
 
 
+class InversionCancelled(Exception):
+    pass
+
+
+def check_inversion_cancelled(cancel_event):
+    if cancel_event is not None and cancel_event.is_set():
+        raise InversionCancelled("inversion stopped by user")
+
+
 def one_sided_low_value_lift(values):
     y = np.asarray(values, dtype=float)
     lifted = y.copy()
@@ -1222,6 +1234,9 @@ def dmps_loss_correction_factor_from_distribution(
 import requests
 
 SMEAR_API = "https://smear-backend-avaa-smear-prod.2.rahtiapp.fi"
+SMEARIII_TO_RPI_TIME_OFFSET = pd.Timedelta(hours=1)
+
+
 def load_smeariii_cpc_concentration(start, end):
     url = f"{SMEAR_API}/search/timeseries"
     start = pd.to_datetime(start)
@@ -1274,7 +1289,7 @@ def load_smeariii_sum_file(path):
                 hour=int(size_parts[3]),
                 minute=int(size_parts[4]),
                 second=int(size_parts[5]),
-            )
+            ) + SMEARIII_TO_RPI_TIME_OFFSET
             sizes = np.asarray(size_parts[9:], dtype=float)
             concs = np.asarray(conc_parts[9:], dtype=float)
         except ValueError:
@@ -1292,7 +1307,9 @@ def load_smeariii_sum_range(start, end):
     root = APP_ROOT / "SMEARIII"
     tables = []
 
-    for day in pd.date_range(start.normalize(), end.normalize(), freq="D"):
+    source_start = start - SMEARIII_TO_RPI_TIME_OFFSET
+    source_end = end - SMEARIII_TO_RPI_TIME_OFFSET
+    for day in pd.date_range(source_start.normalize(), source_end.normalize(), freq="D"):
         path = root / f"DMPS007_{day:%Y%m%d}.sum"
         if path.exists():
             tables.append(load_smeariii_sum_file(path))
@@ -1306,6 +1323,143 @@ def load_smeariii_sum_range(start, end):
         return pd.DataFrame(columns=["time", "size_nm", "smear_conc"])
 
     return df.sort_values(["time", "size_nm"])
+
+
+def parse_smeariii_scan_file(path):
+    path = Path(path)
+    rows = []
+    scan_number = None
+    scan_start = None
+    header = None
+    polarity = "positive"
+    serial = path.stem.split("_")[0]
+    dma = {"dma_length_m": np.nan, "dma_r1_m": np.nan, "dma_r2_m": np.nan}
+    sheath_flow_lpm = np.nan
+
+    def repeated_column_positions(names, target):
+        return [index for index, name in enumerate(names) if name == target]
+
+    def parse_time(line):
+        text = line[1:].strip() if line.startswith("T") else line.strip()
+        parts = text.split()
+        parsed = pd.to_datetime(" ".join(parts[:2]), errors="coerce")
+        if pd.isna(parsed):
+            return pd.NaT
+        return parsed
+
+    def parse_dma(line):
+        parsed = {}
+        length = re.search(r"length\s+([0-9.]+)\s+\(m\)", line)
+        inner = re.search(r"inner diameter\s+([0-9.]+)\s+\(m\)", line)
+        outer = re.search(r"outer diameter\s+([0-9.]+)\s+\(m\)", line)
+        sheath = re.search(r"sheat[h]? flow:\s+([0-9.]+)\s+\(LPM\)", line)
+        if length:
+            parsed["dma_length_m"] = float(length.group(1))
+        if inner:
+            parsed["dma_r1_m"] = float(inner.group(1))
+        if outer:
+            parsed["dma_r2_m"] = float(outer.group(1))
+        return parsed, float(sheath.group(1)) if sheath else np.nan
+
+    with path.open() as file:
+        for raw_line in file:
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            if line.startswith("SCAN "):
+                parts = line.split()
+                scan_number = parts[1] if len(parts) > 1 else None
+                scan_start = None
+                header = None
+                polarity = "positive"
+                dma = {"dma_length_m": np.nan, "dma_r1_m": np.nan, "dma_r2_m": np.nan}
+                sheath_flow_lpm = np.nan
+                continue
+
+            if line.startswith("S/N:"):
+                match = re.search(r"S/N:\s*([^,]+)", line)
+                if match:
+                    serial = match.group(1).strip()
+                continue
+
+            if line.startswith("DMA:"):
+                parsed_dma, parsed_sheath = parse_dma(line)
+                dma.update(parsed_dma)
+                sheath_flow_lpm = parsed_sheath
+                continue
+
+            if line.startswith("T") and len(line) > 1 and line[1].isdigit():
+                scan_start = parse_time(line)
+                continue
+
+            if line == "Positive polarity":
+                polarity = "positive"
+                continue
+
+            if line == "Negative polarity":
+                polarity = "negative"
+                continue
+
+            if line.startswith("time_s "):
+                header = line.split()
+                continue
+
+            if header is None or scan_start is None or scan_number is None:
+                continue
+
+            values = line.split()
+            if len(values) != len(header):
+                continue
+
+            try:
+                numbers = [float(value) for value in values]
+            except ValueError:
+                continue
+
+            column = {name: numbers[index] for index, name in enumerate(header)}
+            concentration_indices = repeated_column_positions(header, "counts_per_volume")
+            count_indices = repeated_column_positions(header, "counts")
+            cpc_index = concentration_indices[-1] if concentration_indices else None
+            count_index = count_indices[-1] if count_indices else None
+            diameter_nm = column.get("diameter_nm", np.nan)
+            if not np.isfinite(diameter_nm):
+                continue
+
+            sign = 1.0 if polarity == "positive" else -1.0
+            sample_time = (
+                scan_start
+                + SMEARIII_TO_RPI_TIME_OFFSET
+                + pd.to_timedelta(column.get("time_s", np.nan), unit="s")
+            )
+            rows.append({
+                "time": sample_time,
+                "scan_number": scan_number,
+                "scan_id": f"{path.stem}_{scan_number}",
+                "scan_range": "default",
+                "size_nm": sign * diameter_nm,
+                "cpc_count": numbers[cpc_index] if cpc_index is not None else np.nan,
+                "raw_counts": numbers[count_index] if count_index is not None else np.nan,
+                "Ntot": False,
+                "sheath_flow": column.get("tsi_4043_f_LPM", sheath_flow_lpm),
+                "sheath_setpoint": sheath_flow_lpm,
+                "cpc_sample_id": f"{path.stem}_{scan_number}_{len(rows)}",
+                "cpc_response_window_sec": np.nan,
+                "cpc_type": "3750" if "UFSMPS" in serial.upper() else "3750",
+                "source_file": str(path),
+                "point_index": len(rows),
+                "scan_complete": True,
+                "expected_scan_points": np.nan,
+                **dma,
+            })
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    df["point_index"] = df.groupby(["scan_id", "scan_range"]).cumcount()
+    df["expected_scan_points"] = df.groupby(["scan_id", "scan_range"])["scan_id"].transform("size")
+    return df
 
 
 def result_time_range(result):
@@ -1516,13 +1670,13 @@ def build_scan_smeariii_comparison_heatmaps(result):
 
 def list_scan_files(min_age_sec=0):
     root = app_path(scan_root.value)
-    files = root.glob("*/*.csv")
+    files = list(root.glob("*/*.csv")) + list(root.glob("*.scan")) + list(root.glob("*/*.scan"))
 
     if min_age_sec > 0:
         now = pd.Timestamp.now().timestamp()
         files = [p for p in files if now - p.stat().st_mtime >= min_age_sec]
 
-    return sorted(files, key=lambda p: (p.parent.name, p.stem))
+    return sorted(set(files), key=lambda p: (p.parent.name, p.stem))
 
 
 def scan_date_bounds():
@@ -1545,6 +1699,12 @@ def scan_file_time_range(path):
         stamp = pd.to_datetime(path.stem, format="%Y%m%d_%H%M%S", errors="raise")
         return stamp, stamp
     except Exception:
+        match = re.search(r"(20\d{6})", path.stem)
+        if match:
+            stamp = pd.to_datetime(match.group(1), format="%Y%m%d", errors="coerce")
+            if not pd.isna(stamp):
+                stamp += SMEARIII_TO_RPI_TIME_OFFSET
+                return stamp, stamp + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
         return pd.NaT, pd.NaT
 
 
@@ -1708,7 +1868,10 @@ def load_selected_scans():
     for f in scan_files.value:
         p = Path(f)
         try:
-            d = pd.read_csv(p)
+            if p.suffix.lower() == ".scan":
+                d = parse_smeariii_scan_file(p)
+            else:
+                d = pd.read_csv(p)
             d["_completion_metadata_present"] = any(
                 column in d.columns
                 for column in ("scan_complete", "expected_scan_points", "point_valid_until")
@@ -1743,7 +1906,8 @@ def load_selected_scans():
             d["sheath_setpoint"] = sheath_values
             d["time"] = time_values
             d["Ntot"] = ntot_text.isin({"true", "1"})
-            d["scan_id"] = p.stem
+            if "scan_id" not in d:
+                d["scan_id"] = p.stem
             dfs.append(d)
         except Exception as e:
             status.object = f"Could not read {p}: {e}"
@@ -1860,6 +2024,9 @@ refresh_button = pn.widgets.Button(name="Refresh scan list", button_type="primar
 select_last_button = pn.widgets.Button(name="Select last N", button_type="primary")
 plot_button = pn.widgets.Button(name="Plot raw selected scans", button_type="success")
 invert_button = pn.widgets.Button(name="Run inversion", button_type="danger")
+stop_inversion_button = pn.widgets.Button(
+    name="Stop inversion", button_type="warning", disabled=True,
+)
 smps_timing_button = pn.widgets.Button(name="Update SMPS timing plot", button_type="primary")
 
 dma_L = pn.widgets.FloatInput(name="DMA L (m)", value=float(settings.get("dma_L", 0.28)), step=0.01)
@@ -3019,7 +3186,9 @@ def invert_one_scan(
     cpc_series_override=None,
     assignment_diagnostics=None,
     response_kernel=None,
+    cancel_event=None,
 ):
+    check_inversion_cancelled(cancel_event)
     d = d.copy()
     d = d[d["Ntot"] == False]
     d["cpc_float"] = pd.to_numeric(d["cpc_count"], errors="coerce")
@@ -3119,6 +3288,7 @@ def invert_one_scan(
     zn = zratio * zp
 
     for i, dp_nm in enumerate(dp_meas_nm):
+        check_inversion_cancelled(cancel_event)
         voltage = voltage_from_size(
             dp_nm if polarity == "positive" else -dp_nm,
             q_sh_lpm=q_sheath_lpm,
@@ -3257,7 +3427,8 @@ def invert_one_scan(
     return result
 
 
-def run_inversion_calculation(df):
+def run_inversion_calculation(df, cancel_event=None):
+    check_inversion_cancelled(cancel_event)
     existing_completion = list(df.attrs.get("scan_completion_diagnostics", []))
     df, completion_diagnostics = filter_complete_scans(df.copy())
     completion_diagnostics = existing_completion or completion_diagnostics
@@ -3326,6 +3497,7 @@ def run_inversion_calculation(df):
 
     zratios = {}
     for scan_id, g_scan in df.groupby(group_key):
+        check_inversion_cancelled(cancel_event)
         conditions = conditions_by_scan[scan_id]
         zratio, selected_dp = estimate_ion_mobility_ratio_for_scan(
             g_scan,
@@ -3342,7 +3514,9 @@ def run_inversion_calculation(df):
 
     inversion_method_values = selected_inversion_methods()
     for inversion_method in inversion_method_values:
+        check_inversion_cancelled(cancel_event)
         for polarity in ["positive", "negative"]:
+            check_inversion_cancelled(cancel_event)
             dd = df[df["polarity"] == polarity].copy()
 
             heat_cols = []
@@ -3367,6 +3541,7 @@ def run_inversion_calculation(df):
             residual_rows = []
 
             for scan_id, g_scan in dd.groupby(group_key):
+                check_inversion_cancelled(cancel_event)
                 zratio = zratios.get(scan_id, np.nan)
                 if (
                     inversion_method == "fuchs" or use_zratio_checkbox.value
@@ -3407,6 +3582,7 @@ def run_inversion_calculation(df):
                 scan_cpc_type_mixed = cpc_type_values.nunique() > 1
 
                 for _, g_range in g_scan.groupby("scan_range"):
+                    check_inversion_cancelled(cancel_event)
                     cpc_series_override = None
                     group_assignment_diagnostics = None
                     response_kernel = None
@@ -3456,7 +3632,10 @@ def run_inversion_calculation(df):
                             cpc_series_override=cpc_series_override,
                             assignment_diagnostics=group_assignment_diagnostics,
                             response_kernel=response_kernel,
+                            cancel_event=cancel_event,
                         )
+                    except InversionCancelled:
+                        raise
                     except Exception as error:
                         completion_diagnostics.append({
                             "scan_id": str(scan_id),
@@ -5738,8 +5917,32 @@ def update_smps_timing_plot(event=None):
     return plot_smps_timing_diagnostics()
 
 
+def set_inversion_controls(running):
+    invert_button.disabled = bool(running)
+    stop_inversion_button.disabled = not bool(running)
+
+
+def stop_inversion(event=None):
+    global auto_pending_signature
+
+    with inversion_lock:
+        running = inversion_running
+        future = inversion_future
+    if not running:
+        status.object = "No inversion is running."
+        return
+
+    inversion_cancel_event.set()
+    if future is not None:
+        future.cancel()
+    auto_pending_signature = None
+    stop_inversion_button.disabled = True
+    status.object = "Stopping inversion..."
+    publish_shared_state(status_text="Stopping inversion...")
+
+
 def run_inversion(event=None):
-    global inversion_running
+    global inversion_running, inversion_future
 
     df = load_selected_scans()
     if df.empty:
@@ -5751,16 +5954,21 @@ def run_inversion(event=None):
             status.object = "Inversion already running."
             return
         inversion_running = True
+        inversion_cancel_event.clear()
 
     status.object = "Running inversion..."
+    set_inversion_controls(True)
 
-    fut = inversion_executor.submit(run_inversion_calculation, df)
+    fut = inversion_executor.submit(run_inversion_calculation, df, inversion_cancel_event)
+    with inversion_lock:
+        inversion_future = fut
 
     doc = pn.state.curdoc
     def done_callback(future):
-        global inversion_running, latest_inversion, auto_pending_signature
+        global inversion_running, inversion_future, latest_inversion, auto_pending_signature
         try:
             result = future.result()
+            check_inversion_cancelled(inversion_cancel_event)
             latest_inversion = result
             def finish_success():
                 global auto_pending_signature
@@ -5856,6 +6064,7 @@ def run_inversion(event=None):
                     status_text += f" Median inverted-bin coverage {100 * np.median(coverage):.0f}%."
 
                 status.object = status_text
+                set_inversion_controls(False)
                 publish_shared_state(
                     inversion_fig=fig,
                     residual_fig=residual_fig,
@@ -5874,18 +6083,32 @@ def run_inversion(event=None):
                 doc.add_next_tick_callback(finish_success)
             else:
                 finish_success()
+        except (CancelledError, InversionCancelled):
+            auto_pending_signature = None
+
+            def finish_stopped():
+                status.object = "Inversion stopped. Previous results were kept."
+                set_inversion_controls(False)
+                publish_shared_state(status_text=status.object)
+
+            if doc is not None:
+                doc.add_next_tick_callback(finish_stopped)
+            else:
+                finish_stopped()
         except Exception:
             auto_pending_signature = None
             traceback.print_exc()
-            if doc is not None:
-                doc.add_next_tick_callback(
-                    lambda: setattr(status, "object", "Inversion failed. Check terminal.")
-                )
-            else:
+            def finish_failed():
                 status.object = "Inversion failed. Check terminal."
+                set_inversion_controls(False)
+            if doc is not None:
+                doc.add_next_tick_callback(finish_failed)
+            else:
+                finish_failed()
         finally:
             with inversion_lock:
                 inversion_running = False
+                inversion_future = None
 
     fut.add_done_callback(done_callback)
 
@@ -5986,6 +6209,7 @@ def run_auto_worker():
 
 save_button.on_click(save_data)
 invert_button.on_click(run_inversion)
+stop_inversion_button.on_click(stop_inversion)
 smps_timing_button.on_click(update_smps_timing_plot)
 charge_comparison_button.on_click(update_charge_comparison)
 clear_rois_button.on_click(clear_saved_rois)
@@ -6136,7 +6360,10 @@ controls = pn.Column(
         ("Automation / Save", automation_controls),
         dynamic=True,
     ),
-    pn.Row(plot_button, invert_button, smps_timing_button, save_button, status),
+    pn.Row(
+        plot_button, invert_button, stop_inversion_button,
+        smps_timing_button, save_button, status,
+    ),
 )
 
 plot_tabs = pn.Tabs(
