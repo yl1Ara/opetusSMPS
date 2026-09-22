@@ -39,7 +39,45 @@ def load_scan_helpers():
     return namespace
 
 
+def load_session_helpers():
+    module = ast.parse(GUI_PATH.read_text())
+    nodes = [
+        node for node in module.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "document_has_connected_clients"
+    ]
+    namespace = {}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(GUI_PATH), "exec"), namespace)
+    return namespace
+
+
 class GuiSettingsTests(unittest.TestCase):
+    def test_document_updates_require_a_connected_websocket(self):
+        connected = load_session_helpers()["document_has_connected_clients"]
+
+        class Value:
+            pass
+
+        document = Value()
+        document.session_context = Value()
+        document.session_context.id = "owner"
+        document.session_context.server_context = Value()
+        session = Value()
+        session.id = "owner"
+        session.connection_count = 0
+        document.session_context.server_context.sessions = [session]
+
+        self.assertFalse(connected(document))
+        session.connection_count = 1
+        self.assertTrue(connected(document))
+
+    def test_live_memory_buffers_are_bounded(self):
+        source = GUI_PATH.read_text()
+
+        self.assertIn("rows = deque(maxlen=500)", source)
+        self.assertIn("tool_ui_updates = deque(maxlen=100)", source)
+        self.assertNotIn("completed_scans =", source)
+
     def test_monopolar_profile_is_positive_only(self):
         helpers = load_scan_helpers()
         sizes = helpers["bipolar_log_sizes"](

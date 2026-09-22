@@ -210,7 +210,7 @@ tuning_cancel_event = threading.Event()
 tuning_running = threading.Event()
 tuning_result_lock = threading.Lock()
 pending_tuning_result = None
-tool_ui_updates = deque()
+tool_ui_updates = deque(maxlen=100)
 calibration_running = threading.Event()
 git_check_running = threading.Event()
 last_git_check_time = 0.0
@@ -512,7 +512,7 @@ qc_table = pn.widgets.DataFrame(
     width=1450,
 )
 
-rows = []
+rows = deque(maxlen=500)
 current_size_index = 0
 phase = "idle"
 phase_start_time = time.time()
@@ -520,7 +520,6 @@ point_set_time = phase_start_time
 point_valid_from_time = phase_start_time
 point_measurement_start_time = phase_start_time
 scan_rows = []
-completed_scans = []
 scan_number = 0
 active_point_key = None
 next_sample_time = 0.0
@@ -575,6 +574,19 @@ def current_panel_session_id():
         return context.id if context is not None else None
     except Exception:
         return None
+
+
+def document_has_connected_clients(document):
+    try:
+        context = document.session_context
+        if context is None or context.server_context is None:
+            return False
+        return any(
+            session.id == context.id and session.connection_count > 0
+            for session in context.server_context.sessions
+        )
+    except Exception:
+        return False
 
 
 def runtime_event(event, **fields):
@@ -2113,9 +2125,13 @@ def queue_ui_row(row):
 
 
 def drain_ui_updates():
+    owner_document = runtime_bridge.get("owner_document")
+    if owner_document is None or not document_has_connected_clients(owner_document):
+        return
+
     rows_changed = False
     if ui_rows_pending:
-        latest_df = pd.DataFrame(rows[-100:])
+        latest_df = pd.DataFrame(list(rows)[-100:])
         table_pane.value = latest_df
         last_row_pane.object = str(ui_rows_pending[-1])
         ui_rows_pending.clear()
@@ -2631,7 +2647,6 @@ def complete_scan(do_ntot, last_point):
         scan_rows.extend(run_ntot_measurement(last_point["scan_range"], scan_number, last_point["sheath"], settings))
         active_point_key = None
     save_completed_scan(scan_rows, scan_number)
-    completed_scans.append(pd.DataFrame(scan_rows.copy()))
     serial_errors = spellman_snapshot()["serial_errors"] - scan_serial_error_start
     qc = scan_qc(scan_rows, settings, time.monotonic() - scan_started_monotonic, serial_errors)
     completed_qc_rows.append(qc)
@@ -3297,14 +3312,6 @@ def startup_load():
         print(f"Startup loaded {len(df0)} rows", flush=True)
 
         table_pane.value = df0.tail(100)
-
-        # also populate memory cache
-        completed_scans.clear()
-
-        group_key = "scan_id" if "scan_id" in df0.columns else "scan_number"
-
-        for sn, g in df0.groupby(group_key):
-            completed_scans.append(g.copy())
 
     else:
         print("No startup scans found", flush=True)

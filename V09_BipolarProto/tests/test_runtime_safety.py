@@ -92,6 +92,9 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertIn("Conflicts=tdmps.service", service)
         self.assertIn("StartLimitBurst=3", service)
         self.assertIn("${DMPS_PANEL_PORT}", service)
+        self.assertIn("MemoryHigh=768M", service)
+        self.assertIn("MemoryMax=1G", service)
+        self.assertIn("MemorySwapMax=256M", service)
         self.assertLess(service.index("ExecCondition="), service.index("ExecStartPre="))
         journal_config = (
             Path(__file__).parents[1] / "deploy" / "60-tdmps-persistent-journal.conf"
@@ -144,6 +147,13 @@ class RuntimeSafetyTests(unittest.TestCase):
             script = (root / "deploy" / script_name).read_text()
             self.assertIn("tdmps-health-log@", script)
             self.assertIn("dmps-log-system-health", script)
+
+    def test_reboot_diagnostics_include_kernel_oom_records(self):
+        script = (Path(__file__).parents[1] / "deploy" / "dmps").read_text()
+
+        self.assertIn("[Oo]ut of memory", script)
+        self.assertIn("oom-killer", script)
+        self.assertIn("Killed process", script)
 
     def test_health_json_is_atomic_and_strict(self):
         with tempfile.TemporaryDirectory() as directory:

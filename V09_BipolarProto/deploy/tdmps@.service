@@ -17,6 +17,9 @@ ExecStart=/usr/bin/env /usr/local/libexec/dmps-run-panel main
 ExecStopPost=/usr/local/libexec/dmps-force-safe
 Restart=on-failure
 RestartSec=5
+MemoryHigh=768M
+MemoryMax=1G
+MemorySwapMax=256M
 KillMode=control-group
 TimeoutStopSec=30
 

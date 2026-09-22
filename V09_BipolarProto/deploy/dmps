@@ -127,7 +127,7 @@ diagnose_reboot() {
 
     section "Current boot kernel power/reset messages"
     journalctl -b -k --no-pager -n 200 \
-        -g '([Uu]nder.?voltage|thermal|temperature|throttl|watchdog|reset|power|EXT4-fs|orphan)' || true
+        -g '([Uu]nder.?voltage|thermal|temperature|throttl|watchdog|reset|power|[Oo]ut of memory|oom-killer|Killed process|EXT4-fs|orphan)' || true
 
     section "Previous boot TDMPS service log"
     if journalctl -b -1 -n 1 --no-pager >/dev/null 2>&1; then
@@ -139,7 +139,7 @@ diagnose_reboot() {
     section "Previous boot kernel power/reset messages"
     if journalctl -b -1 -n 1 --no-pager >/dev/null 2>&1; then
         journalctl -b -1 -k --no-pager -n 200 \
-            -g '([Uu]nder.?voltage|thermal|temperature|throttl|watchdog|reset|power|EXT4-fs|orphan)' || true
+            -g '([Uu]nder.?voltage|thermal|temperature|throttl|watchdog|reset|power|[Oo]ut of memory|oom-killer|Killed process|EXT4-fs|orphan)' || true
     else
         printf 'No previous boot journal found.\n'
     fi
