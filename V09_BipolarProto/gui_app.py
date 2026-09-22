@@ -579,12 +579,8 @@ def current_panel_session_id():
 def document_has_connected_clients(document):
     try:
         context = document.session_context
-        if context is None or context.server_context is None:
-            return False
-        return any(
-            session.id == context.id and session.connection_count > 0
-            for session in context.server_context.sessions
-        )
+        session = context.session if context is not None else None
+        return session is not None and session.connection_count > 0
     except Exception:
         return False
 

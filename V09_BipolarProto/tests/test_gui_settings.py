@@ -60,12 +60,9 @@ class GuiSettingsTests(unittest.TestCase):
 
         document = Value()
         document.session_context = Value()
-        document.session_context.id = "owner"
-        document.session_context.server_context = Value()
         session = Value()
-        session.id = "owner"
         session.connection_count = 0
-        document.session_context.server_context.sessions = [session]
+        document.session_context.session = session
 
         self.assertFalse(connected(document))
         session.connection_count = 1
