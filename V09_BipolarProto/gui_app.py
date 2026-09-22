@@ -539,6 +539,7 @@ cpc_diag_ui_pending = deque(maxlen=50)
 cpc_diag_query_pending = False
 last_cpc_diag_auto_time = 0.0
 last_plot_update_time = 0.0
+runtime_live_state = {}
 PLOT_REFRESH_INTERVAL_SEC = 1.0
 latest_cpc_lock = threading.Lock()
 latest_cpc = {
@@ -2120,15 +2121,91 @@ def queue_ui_row(row):
     ui_rows_pending.append(row)
 
 
+def collect_runtime_live_state():
+    value, age, duration, error, sample_id, _ = latest_cpc_snapshot()
+    cpc_value = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if np.isfinite(cpc_value):
+        current_cpc = f"Current CPC: {cpc_value:.0f} cm^-3 | sample {sample_id} | age {age:.2f}s | read {duration:.3f}s"
+    elif error:
+        current_cpc = f"Current CPC: nan | error: {error}"
+    else:
+        current_cpc = "Current CPC: nan"
+
+    if flow_controller is not None and flowmeter is not None:
+        flow = read_flow_value()
+        flow_diag = flowmeter.diagnostics()
+        try:
+            setpoint = float(flow_controller.pid.setpoint)
+        except Exception:
+            setpoint = np.nan
+        try:
+            blower_v = float(flow_controller.out)
+        except Exception:
+            blower_v = np.nan
+        if np.isfinite(flow):
+            error_value = flow - setpoint if np.isfinite(setpoint) else np.nan
+            if np.isfinite(error_value):
+                current_flow = (
+                    f"Current sheath flow: {flow:.2f} L/min | "
+                    f"set {setpoint:.2f} | error {error_value:+.2f} | blower {blower_v:.2f} V | "
+                    f"SFM {'connected' if flow_diag['connected'] else 'DISCONNECTED'}, "
+                    f"errors {flow_diag['error_count']} (CRC {flow_diag['crc_error_count']}), "
+                    f"reconnects {flow_diag['reconnect_count']}, serial {flow_diag['serial_number']}"
+                )
+            else:
+                current_flow = f"Current sheath flow: {flow:.2f} L/min"
+        else:
+            current_flow = "Current sheath flow: nan"
+    else:
+        current_flow = "Current sheath flow: not initialized"
+
+    maybe_query_spellman()
+    if active_hv_config and active_hv_config[0] == "Monopolar Spellman":
+        if hv_device is None:
+            current_hv = "Current HV: Spellman not initialized"
+        else:
+            cache = spellman_snapshot()
+            voltage = cache["voltage"]
+            current_hv = f"Current HV: Spellman {voltage:.0f} V" if np.isfinite(voltage) else f"Current HV: Spellman unavailable ({cache['error'] or 'waiting'})"
+    else:
+        current_hv = "Current HV: bipolar DAC"
+
+    aerosol_flow, aerosol_dp, aerosol_temp, aerosol_error = aerosol_snapshot()
+    if aerosol_flowmeter is not None and np.isfinite(aerosol_flow):
+        flow_error = aerosol_flow - 1.0
+        state = "OK" if abs(flow_error) <= 0.1 else "CHECK"
+        current_aerosol_flow = (
+            f"Current aerosol flow: {aerosol_flow:.3f} L/min | target 1.000 | "
+            f"error {flow_error:+.3f} | {state} | {aerosol_dp:.2f} Pa | {aerosol_temp:.1f} C"
+        )
+    elif aerosol_flow_enabled.value:
+        current_aerosol_flow = f"Current aerosol flow: unavailable ({aerosol_error or 'waiting'})"
+    else:
+        current_aerosol_flow = "Current aerosol flow: disabled"
+
+    return {
+        "current_cpc": current_cpc,
+        "current_flow": current_flow,
+        "current_hv": current_hv,
+        "current_aerosol_flow": current_aerosol_flow,
+        "scan_progress": scan_progress_text(),
+        "table": pd.DataFrame(list(rows)[-100:]) if rows else table_pane.value.copy(),
+    }
+
+
 def drain_ui_updates():
+    global runtime_live_state
+
+    runtime_live_state = collect_runtime_live_state()
+    publish_runtime_snapshot()
+
     owner_document = runtime_bridge.get("owner_document")
     if owner_document is None or not document_has_connected_clients(owner_document):
         return
 
     rows_changed = False
     if ui_rows_pending:
-        latest_df = pd.DataFrame(list(rows)[-100:])
-        table_pane.value = latest_df
+        table_pane.value = runtime_live_state["table"]
         last_row_pane.object = str(ui_rows_pending[-1])
         ui_rows_pending.clear()
         rows_changed = True
@@ -2181,68 +2258,11 @@ def drain_ui_updates():
             git_update_status.alert_type = update["alert_type"]
             git_update_button.disabled = False
 
-    value, age, duration, error, sample_id, _ = latest_cpc_snapshot()
-    cpc_value = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
-    if np.isfinite(cpc_value):
-        current_cpc_pane.object = f"Current CPC: {cpc_value:.0f} cm^-3 | sample {sample_id} | age {age:.2f}s | read {duration:.3f}s"
-    elif error:
-        current_cpc_pane.object = f"Current CPC: nan | error: {error}"
-    else:
-        current_cpc_pane.object = "Current CPC: nan"
-
-    if flow_controller is not None and flowmeter is not None:
-        flow = read_flow_value()
-        flow_diag = flowmeter.diagnostics()
-        try:
-            setpoint = float(flow_controller.pid.setpoint)
-        except Exception:
-            setpoint = np.nan
-        try:
-            blower_v = float(flow_controller.out)
-        except Exception:
-            blower_v = np.nan
-        if np.isfinite(flow):
-            error_value = flow - setpoint if np.isfinite(setpoint) else np.nan
-            if np.isfinite(error_value):
-                current_flow_pane.object = (
-                    f"Current sheath flow: {flow:.2f} L/min | "
-                    f"set {setpoint:.2f} | error {error_value:+.2f} | blower {blower_v:.2f} V | "
-                    f"SFM {'connected' if flow_diag['connected'] else 'DISCONNECTED'}, "
-                    f"errors {flow_diag['error_count']} (CRC {flow_diag['crc_error_count']}), "
-                    f"reconnects {flow_diag['reconnect_count']}, serial {flow_diag['serial_number']}"
-                )
-            else:
-                current_flow_pane.object = f"Current sheath flow: {flow:.2f} L/min"
-        else:
-            current_flow_pane.object = "Current sheath flow: nan"
-    else:
-        current_flow_pane.object = "Current sheath flow: not initialized"
-
-    maybe_query_spellman()
-    if active_hv_config and active_hv_config[0] == "Monopolar Spellman":
-        if hv_device is None:
-            current_hv_pane.object = "Current HV: Spellman not initialized"
-        else:
-            cache = spellman_snapshot()
-            voltage = cache["voltage"]
-            current_hv_pane.object = f"Current HV: Spellman {voltage:.0f} V" if np.isfinite(voltage) else f"Current HV: Spellman unavailable ({cache['error'] or 'waiting'})"
-    else:
-        current_hv_pane.object = "Current HV: bipolar DAC"
-
-    aerosol_flow, aerosol_dp, aerosol_temp, aerosol_error = aerosol_snapshot()
-    if aerosol_flowmeter is not None and np.isfinite(aerosol_flow):
-        flow_error = aerosol_flow - 1.0
-        state = "OK" if abs(flow_error) <= 0.1 else "CHECK"
-        current_aerosol_flow_pane.object = (
-            f"Current aerosol flow: {aerosol_flow:.3f} L/min | target 1.000 | "
-            f"error {flow_error:+.3f} | {state} | {aerosol_dp:.2f} Pa | {aerosol_temp:.1f} C"
-        )
-    elif aerosol_flow_enabled.value:
-        current_aerosol_flow_pane.object = f"Current aerosol flow: unavailable ({aerosol_error or 'waiting'})"
-    else:
-        current_aerosol_flow_pane.object = "Current aerosol flow: disabled"
-
-    update_scan_progress()
+    current_cpc_pane.object = runtime_live_state["current_cpc"]
+    current_flow_pane.object = runtime_live_state["current_flow"]
+    current_hv_pane.object = runtime_live_state["current_hv"]
+    current_aerosol_flow_pane.object = runtime_live_state["current_aerosol_flow"]
+    scan_progress_pane.object = runtime_live_state["scan_progress"]
     update_cpc_timing_display()
 
     if rows_changed:
@@ -2537,19 +2557,22 @@ def expected_scan_duration(settings, scan, include_ntot=False):
     return duration
 
 
-def update_scan_progress():
+def scan_progress_text():
     if not active_scan_settings or scan_started_monotonic is None or phase == "idle":
-        scan_progress_pane.object = "Scan progress: idle"
-        return
+        return "Scan progress: idle"
     scan = active_scan_settings["scan"]
     point = scan[min(current_size_index, len(scan) - 1)]
     elapsed = time.monotonic() - scan_started_monotonic
     expected = expected_scan_duration(active_scan_settings, scan)
     eta = max(0.0, expected - elapsed)
-    scan_progress_pane.object = (
+    return (
         f"Scan {scan_number + 1} | range {point['scan_range']} | point "
         f"{min(current_size_index + 1, len(scan))}/{len(scan)} | {phase} | ETA {eta:.0f} s"
     )
+
+
+def update_scan_progress():
+    scan_progress_pane.object = scan_progress_text()
 
 
 def scan_qc(scan_data, settings, actual_duration, serial_errors):
@@ -3327,20 +3350,21 @@ pn.state.onload(startup_load)
 
 
 def runtime_snapshot():
+    live_state = runtime_live_state
     return {
         "owner_id": runtime_bridge["owner_id"],
         "scan_active": bool(measurement_running.is_set()),
         "phase": phase,
         "status": status_text.object,
-        "scan_progress": scan_progress_pane.object,
+        "scan_progress": live_state.get("scan_progress", scan_progress_pane.object),
         "pending_settings": pending_settings_pane.object,
-        "current_cpc": current_cpc_pane.object,
-        "current_flow": current_flow_pane.object,
-        "current_hv": current_hv_pane.object,
+        "current_cpc": live_state.get("current_cpc", current_cpc_pane.object),
+        "current_flow": live_state.get("current_flow", current_flow_pane.object),
+        "current_hv": live_state.get("current_hv", current_hv_pane.object),
         "manual_hv_status": manual_hv_status.object,
-        "current_aerosol_flow": current_aerosol_flow_pane.object,
+        "current_aerosol_flow": live_state.get("current_aerosol_flow", current_aerosol_flow_pane.object),
         "latest_ntot": latest_ntot_pane.object,
-        "table": table_pane.value.copy(),
+        "table": live_state.get("table", table_pane.value).copy(),
         "qc": qc_table.value.copy(),
         "settings": {
             widget.name: {

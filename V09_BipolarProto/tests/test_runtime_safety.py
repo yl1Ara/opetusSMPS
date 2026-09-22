@@ -51,6 +51,13 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertNotIn("runtime_command_thread", source)
         self.assertIn("owner_document.add_next_tick_callback", source)
         self.assertIn("owner_document.add_periodic_callback(drain_ui_updates", source)
+        collect_position = source.index("runtime_live_state = collect_runtime_live_state()")
+        connection_gate_position = source.index(
+            'if owner_document is None or not document_has_connected_clients(owner_document):',
+            collect_position,
+        )
+        self.assertLess(collect_position, connection_gate_position)
+        self.assertIn('live_state.get("table", table_pane.value).copy()', source)
         self.assertIn("serve_gui", entrypoint)
         self.assertIn("_OWNER_NAMESPACE = namespace", runtime_host)
         self.assertIn("pn.state.on_session_destroyed(runtime_session_destroyed)", source)
