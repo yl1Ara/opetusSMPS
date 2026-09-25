@@ -1692,6 +1692,11 @@ def load_smeariii_cpc_for_times(times):
         t0 - pd.Timedelta(hours=1),
         t1 - pd.Timedelta(hours=1),
     )
+    if totalconc.empty:
+        return pd.DataFrame({
+            "time": pd.Series(dtype="datetime64[ns]"),
+            "SMEARIII_CPC": pd.Series(dtype=float),
+        })
     totalconc["time"] = totalconc["time"] + pd.Timedelta(hours=1)
     return totalconc[totalconc["time"].between(t0, t1)].copy()
 

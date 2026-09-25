@@ -218,6 +218,17 @@ class OnlineInteractionTests(unittest.TestCase):
         self.assertEqual(len(matched), 2)
         self.assertEqual(matched["SMEARIII_CPC"].tolist(), [100.0, 200.0])
 
+    def test_empty_smear_cpc_reference_does_not_break_a_short_inversion(self):
+        with patch.object(
+            online_app, "load_smeariii_cpc_concentration",
+            return_value=pd.DataFrame(columns=["time", "SMEARIII_CPC"]),
+        ):
+            result = online_app.load_smeariii_cpc_for_times([
+                "2026-09-24 01:03:31", "2026-09-24 01:03:31",
+            ])
+        self.assertTrue(result.empty)
+        self.assertEqual(str(result["time"].dtype), "datetime64[ns]")
+
     def test_plot_failure_clears_running_state_and_reenables_controls(self):
         previous_result = online_app.latest_inversion
         previous_status = online_app.status.object
