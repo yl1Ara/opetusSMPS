@@ -1403,6 +1403,44 @@ def weighted_log_diameter_quantile(sizes, concentration, quantile):
     return float(10 ** crossing)
 
 
+def fit_selected_roi_growth(times, diameters_nm):
+    """Robust descriptive slope for a user-selected ROI's D50 diameters."""
+    times = pd.DatetimeIndex(pd.to_datetime(times))
+    dp = np.asarray(diameters_nm, dtype=float)
+    valid = (~times.isna()) & np.isfinite(dp) & (dp > 0)
+    times = times[valid]
+    dp = dp[valid]
+    if len(dp) < 4 or len(pd.unique(times)) < 4:
+        return {"status": "insufficient", "reason": "select at least four scans with valid D50"}
+    order = np.argsort(times)
+    times = times[order]
+    dp = dp[order]
+    hours = np.asarray((times - times[0]).total_seconds(), dtype=float) / 3600.0
+    if hours[-1] < 0.25:
+        return {"status": "insufficient", "reason": "selected scans span less than 15 minutes"}
+    slopes = []
+    for index in range(len(hours) - 1):
+        dt = hours[index + 1:] - hours[index]
+        usable = dt > 1 / 60
+        slopes.extend(((dp[index + 1:][usable] - dp[index]) / dt[usable]).tolist())
+    if not slopes:
+        return {"status": "insufficient", "reason": "selected scans have no distinct times"}
+    slope = float(np.median(slopes))
+    fitted = np.median(dp - slope * hours) + slope * hours
+    total = float(np.sum((dp - np.mean(dp)) ** 2))
+    r2 = 1.0 - float(np.sum((dp - fitted) ** 2)) / total if total > 0 else np.nan
+    return {
+        "status": "ok" if slope > 0 and np.isfinite(r2) and r2 >= 0.3 else "weak",
+        "growth_rate_nm_h": slope,
+        "r2": r2,
+        "n_scans": len(dp),
+        "time": times,
+        "diameter_nm": dp,
+        "fitted_nm": fitted,
+        "semantics": "selected ROI D50 apparent slope; not an independent growth-rate measurement",
+    }
+
+
 def build_growth_rate_diagnostics(
     result,
     *,
@@ -1576,6 +1614,11 @@ def build_growth_rate_diagnostics(
         event_sizes = event_sizes[order]
         event_z = event_z[order, :]
         threshold_fraction = np.clip(float(growth_threshold_fraction), 0.0, 1.0)
+        diameter_resolution = float(np.nanmedian(np.diff(event_sizes)))
+        # A narrow mode on the Pi's sparse 11, 14, 17, 20, 25... nm grid
+        # cannot occupy three adjacent bins. Keep the stronger three-bin
+        # coherence check on finely resolved distributions.
+        minimum_component_bins = 2 if diameter_resolution >= 2.0 else 3
 
         label = method_label(tr.get('method', 'gunn woessner mod'))
         source_method = tr.get('method', 'gunn woessner mod')
@@ -1614,7 +1657,7 @@ def build_growth_rate_diagnostics(
             run_length = 0
             for enabled in significant:
                 run_length = run_length + 1 if enabled else 0
-                if run_length >= 3:
+                if run_length >= minimum_component_bins:
                     coherent_signal[time_index] = True
                     break
         active_activity = np.isfinite(integrated) & coherent_signal
@@ -1645,7 +1688,6 @@ def build_growth_rate_diagnostics(
             previous_ridge = None
             previous_time = None
             ridge_history = []
-            diameter_resolution = float(np.nanmedian(np.diff(event_sizes)))
             for time_index in segment:
                 col = enhancement[:, time_index]
                 finite = np.isfinite(col) & (col > 0)
@@ -1659,7 +1701,7 @@ def build_growth_rate_diagnostics(
                         component_start = size_index
                     elif not enabled and component_start is not None:
                         left, right = component_start, size_index - 1
-                        if right - left + 1 >= 3:
+                        if right - left + 1 >= minimum_component_bins:
                             peak_index = left + int(np.nanargmax(col[left:right + 1]))
                             ridge = interpolated_ridge(
                                 event_sizes[max(0, peak_index - 1):min(len(event_sizes), peak_index + 2)],
@@ -1735,6 +1777,8 @@ def build_growth_rate_diagnostics(
                         "event_end": times[segment[-1]],
                         "event_threshold_snr": detection_threshold_snr,
                         "background_method": "per-size 20th percentile",
+                        "diameter_resolution_nm": diameter_resolution,
+                        "minimum_component_bins": minimum_component_bins,
                         "background_scan_fraction": float(np.mean(background_scans)),
                         "background_quality": (
                             "adequate" if np.count_nonzero(background_scans) >= max(3, int(0.2 * len(times)))

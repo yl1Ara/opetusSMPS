@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 import panel as pn
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 from DMPS_inversion_gui import online_app
 
@@ -89,12 +90,89 @@ class OnlineInteractionTests(unittest.TestCase):
 
         self.assertEqual(analysis["selected_cell_count"], 40)
         self.assertEqual(analysis["selected_scan_count"], 2)
+        selected_status = pn.pane.Markdown()
+        selected_plot = pn.pane.Plotly()
+        online_app.render_roi_analysis(
+            analysis, plot_pane=selected_plot, status_pane=selected_status,
+            store=False,
+        )
+        self.assertIn("Selected ROI", selected_status.object)
+        self.assertIsNotNone(selected_plot.object)
+        self.assertEqual(online_app.saved_roi_analyses, [])
         self.assertEqual(len(analysis["scan_fits"]), 2)
         self.assertIn("exact Plotly-selected cells retained", analysis["selection_semantics"])
 
         online_app.render_roi_analysis(analysis)
         self.assertEqual(len(online_app.saved_roi_analyses), 1)
         self.assertEqual(online_app.saved_roi_analyses[0]["roi_id"], "ROI-1")
+
+    def test_browser_selectable_layer_maps_points_back_to_heatmap_cells(self):
+        result, heatmap = self.heatmap_fixture()
+        figure = make_subplots(rows=1, cols=1)
+        figure.add_trace(heatmap.data[0], row=1, col=1)
+        online_app.add_heatmap_selection_layer(figure, result[0], row=1)
+        layer = figure.data[1]
+        self.assertEqual(layer.type, "scattergl")
+        self.assertEqual(layer.meta["kind"], "inversion_selection")
+        points = []
+        for point_index, (size_index, time_index, value) in enumerate(layer.customdata):
+            if 35 <= size_index < 55:
+                # Panel forwards scalar pointNumber and customdata for scatter
+                # selection; it discards heatmap's array-valued pointNumber.
+                points.append({
+                    "curveNumber": 1,
+                    "pointNumber": point_index,
+                    "customdata": [size_index, time_index, value],
+                })
+        analysis = online_app.analyze_heatmap_roi(
+            {"points": points}, figure, result, "1",
+        )
+        self.assertEqual(analysis["selected_cell_count"], 40)
+        self.assertEqual(analysis["selected_scan_count"], 2)
+
+        second_scan_index = next(
+            index for index, data in enumerate(layer.customdata)
+            if int(data[0]) == 75 and int(data[1]) == 1
+        )
+        click = online_app.analyze_heatmap_click(
+            {"points": [{"curveNumber": 1, "pointNumber": second_scan_index}]},
+            figure, result, "1", 6.5, 80.0,
+        )
+        self.assertEqual(click["status"], "ok")
+        self.assertAlmostEqual(click["components"][0]["mode_diameter_nm"], 40.0, delta=0.5)
+
+    def test_selected_growth_roi_reports_measured_d50_slope(self):
+        sizes = np.geomspace(5.0, 30.0, 80)
+        times = pd.date_range("2026-09-25", periods=8, freq="30min")
+        z = np.column_stack([
+            10 + 300 * np.exp(-0.5 * ((sizes - (8 + index)) / 1.2) ** 2)
+            for index in range(len(times))
+        ])
+        result = [{
+            "kind": "heatmap", "method": "test", "polarity": "positive",
+            "x": times, "y": sizes, "Z": z,
+        }]
+        figure = go.Figure(go.Heatmap(
+            x=times, y=sizes, z=z,
+            meta={"kind": "inversion_heatmap", "method": "test", "polarity": "positive"},
+        ))
+        points = [
+            {"curveNumber": 0, "pointNumber": [size_index, time_index]}
+            for time_index in range(len(times))
+            for size_index in range(len(sizes)) if 6 <= sizes[size_index] <= 21
+        ]
+        analysis = online_app.analyze_heatmap_roi({"points": points}, figure, result, "1")
+        growth = analysis["selected_growth"]
+        self.assertEqual(growth["status"], "ok")
+        self.assertAlmostEqual(growth["growth_rate_nm_h"], 2.0, delta=0.35)
+
+        status, plot, growth_plot = pn.pane.Markdown(), pn.pane.Plotly(), pn.pane.Plotly()
+        online_app.render_roi_analysis(
+            analysis, plot_pane=plot, status_pane=status,
+            growth_plot_pane=growth_plot, store=False,
+        )
+        self.assertIn("apparent D50 slope", status.object)
+        self.assertEqual(len(growth_plot.object.data), 2)
 
     def test_heatmap_roi_does_not_fit_across_unselected_size_gap(self):
         result, figure = self.heatmap_fixture()

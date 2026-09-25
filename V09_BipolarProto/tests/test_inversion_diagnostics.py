@@ -287,6 +287,32 @@ class InversionDiagnosticTests(unittest.TestCase):
             np.nanmedian(by_model["Upper edge D75"]["dp"]),
         )
 
+    def test_narrow_growth_on_sparse_monopolar_grid_is_detected(self):
+        sizes = np.array([5, 6, 7, 9, 11, 14, 17, 20, 25, 30, 34], dtype=float)
+        times = pd.date_range("2026-09-25", periods=30, freq="20min")
+        columns = []
+        for index in range(len(times)):
+            center = 11 + 1.5 * index / 3
+            columns.append(
+                5 + 3000 * np.exp(-0.5 * ((sizes - center) / 1.5) ** 2)
+                if index >= 3 else np.full(len(sizes), 5.0)
+            )
+        tracks = build_growth_rate_diagnostics(
+            [{
+                "kind": "heatmap", "method": "test", "polarity": "positive",
+                "x": times, "y": sizes, "Z": np.column_stack(columns),
+            }],
+            growth_min_size_nm=6.5, growth_max_size_nm=30,
+            growth_threshold_fraction=0.35,
+            growth_models=["Center D50", "Ridge peak"], method_label=str,
+            growth_min_event_scans=4,
+        )
+        self.assertEqual({track["model"] for track in tracks}, {"Center D50", "Ridge peak"})
+        for track in tracks:
+            self.assertAlmostEqual(track["growth_rate"], 1.5, delta=0.4)
+            self.assertEqual(track["minimum_component_bins"], 2)
+            self.assertGreaterEqual(track["n_points"], 4)
+
     def test_flat_heatmap_does_not_claim_growth_event(self):
         result = [{
             "kind": "heatmap",

@@ -285,3 +285,11 @@ Exports from UFSMPS, SMPS, and the monopolar Pi are kept in separate
 subdirectories under the configured save folder. Check each instrument's
 flows, CPC, size cutoff, timing correction, and inlet/tube-loss settings
 before interpreting or comparing inverted distributions.
+
+In an instrument's **Inversion** tab, choose Rectangle or Freehand and drag
+across heatmap cells to inspect a region. The **Saved ROIs** tab shows the
+selected distributions and, for at least four scans spanning 15 minutes, a
+descriptive D50-vs-time slope. On **Global Live**, selection appears in its
+**Selected ROI** tab instead. The growth status above each inversion heatmap
+explains when automatic tracks were rejected; marginal tracks show points
+without a fitted line.

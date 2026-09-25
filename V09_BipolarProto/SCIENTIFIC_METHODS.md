@@ -50,6 +50,12 @@ growth-rate cross-check.
   presenting extrapolated modal tails or internal gaps as measured concentration.
 - MCC is an experimental distinct-estimator cross-check on the same inversion data. It is disabled by default
   and does not accept or reject the primary geometric growth tracks.
+- Automatic growth tracks are heuristic and depend on measured diameter
+  coverage, coherent enhancement, temporal continuity, and fit quality. Sparse
+  diameter grids use a two-bin coherence requirement; marginal tracks appear
+  as observed points without a fitted overlay. A user-selected heatmap ROI
+  also reports a descriptive D50 slope from its selected cells when at least
+  four scans span 15 minutes; it is not an independent growth measurement.
 - Particle formation diagnostics report a three-term apparent budget in
   `cm-3 s-1`:
   accumulation `dN/dt`, growth outflux `GR*N/(d2-d1)`, and neutral Brownian

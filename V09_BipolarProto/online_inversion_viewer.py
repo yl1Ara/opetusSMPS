@@ -133,12 +133,23 @@ def _global_live_tab():
     settings_json = pn.pane.JSON({}, depth=2, sizing_mode="stretch_width")
     raw_plot = pn.pane.Plotly(height=750, width=1300)
     inversion_plot = pn.pane.Plotly(width=1300)
+    growth_status = pn.pane.Markdown()
+    roi_feedback = pn.pane.Markdown("Drag across heatmap cells to inspect an ROI.")
+    roi_tool = pn.widgets.Select(
+        name="ROI tool", options={"Rectangle": "select", "Freehand": "lasso"},
+        value=global_app.roi_selection_tool.value,
+    )
     residual_plot = pn.pane.Plotly(width=1300, height=1200)
     smps_timing_plot = pn.pane.Plotly(width=1300, height=1100)
     aerosol_plot = pn.pane.Plotly(width=1300, height=2000)
     difference_plot = pn.pane.Plotly(width=1300)
     modal_plot = pn.pane.Plotly(width=1000, height=650)
     modal_status = pn.pane.Markdown("Click an inverted heatmap to inspect its size distribution.")
+    roi_plot = pn.pane.Plotly(width=1000, height=650)
+    roi_growth_plot = pn.pane.Plotly(width=1000, height=450)
+    roi_status = pn.pane.Markdown(
+        "Draw a rectangle or freehand selection on the inversion heatmap to inspect an ROI."
+    )
     refresh_button = pn.widgets.Button(name="Refresh global view", button_type="primary")
     controls_status = pn.pane.Markdown(
         "Global controls are loaded on demand so the live page opens quickly."
@@ -156,6 +167,7 @@ def _global_live_tab():
         with global_app.shared_state["lock"]:
             version = global_app.shared_state.get("version", 0)
             status_text = global_app.shared_state.get("status", "Status: idle")
+            growth_diagnostics = list(global_app.shared_state.get("growth_diagnostics", []))
             if version != local["version"]:
                 raw_fig = copy.deepcopy(global_app.shared_state.get("raw_fig"))
                 inversion_fig = copy.deepcopy(global_app.shared_state.get("inversion_fig"))
@@ -177,6 +189,17 @@ def _global_live_tab():
         local["version"] = version
 
         local["result"] = inversion_result
+        if inversion_fig is not None:
+            inversion_fig.update_layout(dragmode=roi_tool.value)
+        if inversion_result is None:
+            growth_status.object = "Run an inversion to evaluate growth tracks."
+        elif growth_diagnostics:
+            growth_status.object = (
+                f"Automatic growth tracks: **{len(growth_diagnostics)}**. "
+                "Marginal candidates are shown as points only."
+            )
+        else:
+            growth_status.object = "No automatic growth track accepted for the current result."
         raw_plot.object = raw_fig
         inversion_plot.object = inversion_fig
         residual_plot.object = residual_fig
@@ -185,6 +208,10 @@ def _global_live_tab():
         difference_plot.object = difference_fig
         modal_plot.object = None
         modal_status.object = "Click an inverted heatmap to inspect its size distribution."
+        roi_plot.object = None
+        roi_growth_plot.object = None
+        roi_status.object = "Draw on the inversion heatmap to inspect an ROI."
+        roi_feedback.object = "Drag across heatmap cells to inspect an ROI."
 
     def load_controls(event=None):
         if controls_loaded["value"]:
@@ -210,11 +237,35 @@ def _global_live_tab():
         global_app.render_modal_analysis(analysis, modal_plot, modal_status)
 
     inversion_plot.param.watch(inspect_click, "click_data")
+
+    def inspect_selection(event):
+        result = local["result"]
+        if result is None:
+            return
+        analysis = global_app.analyze_heatmap_roi(
+            event.new, inversion_plot.object, result,
+            global_app.modal_fit_modes.value,
+        )
+        global_app.render_roi_analysis(
+            analysis, plot_pane=roi_plot, status_pane=roi_status,
+            growth_plot_pane=roi_growth_plot, store=False,
+        )
+        if analysis is not None:
+            roi_feedback.object = "ROI selected — open the Selected ROI tab for distributions and growth."
+
+    inversion_plot.param.watch(inspect_selection, "selected_data")
+
+    def update_roi_tool(event):
+        if inversion_plot.object is not None:
+            inversion_plot.object.update_layout(dragmode=event.new)
+            inversion_plot.param.trigger("object")
+
+    roi_tool.param.watch(update_roi_tool, "value")
     refresh()
     pn.state.add_periodic_callback(refresh, period=2000, start=True)
 
     live_tabs = pn.Tabs(
-        ("Current Inversion", pn.Column(inversion_plot)),
+        ("Current Inversion", pn.Column(pn.Row(roi_tool, roi_feedback), growth_status, inversion_plot)),
         ("Clicked Distribution", pn.Column(modal_status, modal_plot)),
         ("Aerosol Properties", pn.Column(aerosol_plot)),
         ("Current Raw Data", pn.Column(raw_plot)),
@@ -223,6 +274,7 @@ def _global_live_tab():
         ("Difference Diagnostics", pn.Column(difference_plot)),
         ("Global Controls", controls_container),
         ("Settings", pn.Column(settings_json)),
+        ("Selected ROI", pn.Column(roi_status, roi_plot, roi_growth_plot)),
         dynamic=True,
     )
 

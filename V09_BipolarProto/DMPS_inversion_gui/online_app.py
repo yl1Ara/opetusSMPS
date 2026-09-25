@@ -2651,7 +2651,12 @@ roi_plot = pn.pane.Plotly(height=650, width=1000)
 roi_status = pn.pane.Markdown(
     "Use rectangle or freehand selection on an inversion heatmap to save an ROI analysis."
 )
+roi_feedback = pn.pane.Markdown(
+    "Choose Rectangle or Freehand, then drag across inverted heatmap cells to analyze an ROI."
+)
+growth_status = pn.pane.Markdown("Automatic growth-track results appear after inversion.")
 roi_history = pn.pane.DataFrame(pd.DataFrame(), width=1100, height=260)
+roi_growth_plot = pn.pane.Plotly(width=1000, height=450)
 clear_rois_button = pn.widgets.Button(name="Clear saved ROIs", button_type="warning")
 
 
@@ -2815,6 +2820,7 @@ def sync_shared_state():
     if difference_diagnostics is not None:
         latest_difference_diagnostics = difference_diagnostics
     latest_growth_diagnostics = growth_diagnostics
+    update_growth_status(growth_diagnostics)
     latest_growth_settings = growth_settings
     latest_aerosol_properties = aerosol_properties
     if inversion_result is not None:
@@ -4178,6 +4184,26 @@ def scan_polarity_label(polarity):
     return f"{polarity}-voltage scan"
 
 
+def update_growth_status(growth_diagnostics):
+    if not growth_models.value:
+        growth_status.object = "Automatic growth tracking is off: select a model in Diagnostics."
+    elif growth_diagnostics:
+        marginal = sum(item["fit_quality"] == "marginal" for item in growth_diagnostics)
+        growth_status.object = (
+            f"**Growth tracks:** {len(growth_diagnostics)} candidate(s) in "
+            f"{growth_min_size_nm.value:g}–{growth_max_size_nm.value:g} nm; "
+            f"{marginal} marginal candidate(s) shown as points without a fitted line. "
+            "These are heuristic tracks, not independently measured growth rates."
+        )
+    else:
+        growth_status.object = (
+            f"**No automatic growth track accepted** in {growth_min_size_nm.value:g}–"
+            f"{growth_max_size_nm.value:g} nm. The detector needs at least "
+            f"{growth_min_event_scans.value} scans with coherent enhancement, "
+            f"positive growth ≤{growth_max_rate_nm_h.value:g} nm/h and a consistent fit."
+        )
+
+
 def plot_aerosol_property_diagnostics(result):
     global latest_aerosol_properties, latest_mode_tracks
     latest_aerosol_properties = diag.build_aerosol_property_diagnostics(
@@ -4260,40 +4286,118 @@ def plot_aerosol_property_diagnostics(result):
     return fig
 
 
+def selected_heatmap_cell(point, figure):
+    """Resolve a Plotly point to (heatmap trace, size bin, scan column).
+
+    Panel omits array-valued heatmap pointNumber from browser events. Scatter
+    selection points carry their two grid indices in customdata instead.
+    """
+    if figure is None:
+        return None
+    try:
+        curve_number = int(point["curveNumber"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not 0 <= curve_number < len(figure.data):
+        return None
+    selected_trace = figure.data[curve_number]
+    metadata = selected_trace.meta
+    if not isinstance(metadata, dict):
+        return None
+    if metadata.get("kind") == "inversion_selection":
+        grid_index = point.get("customdata")
+        if grid_index is None:
+            point_index = point.get("pointNumber", point.get("pointIndex"))
+            try:
+                grid_index = selected_trace.customdata[int(point_index)]
+            except (TypeError, ValueError, IndexError):
+                return None
+        curve_number = next((index for index, trace in enumerate(figure.data)
+                             if isinstance(trace.meta, dict)
+                             and trace.meta.get("kind") == "inversion_heatmap"
+                             and trace.meta.get("method") == metadata.get("method")
+                             and trace.meta.get("polarity") == metadata.get("polarity")), None)
+        if curve_number is None:
+            return None
+    elif metadata.get("kind") == "inversion_heatmap":
+        grid_index = point.get("pointNumber", point.get("pointIndex"))
+        if not isinstance(grid_index, (list, tuple, np.ndarray)) or len(grid_index) != 2:
+            trace = figure.data[curve_number]
+            try:
+                clicked_time = pd.Timestamp(point["x"])
+                clicked_size = float(point["y"])
+                times = pd.DatetimeIndex(pd.to_datetime(trace.x, errors="coerce"))
+                sizes = np.asarray(trace.y, dtype=float)
+                if pd.isna(clicked_time) or not np.isfinite(clicked_size) or times.isna().all():
+                    return None
+                if times.tz is not None and clicked_time.tz is None:
+                    clicked_time = clicked_time.tz_localize(times.tz)
+                elif times.tz is None and clicked_time.tz is not None:
+                    clicked_time = clicked_time.tz_localize(None)
+                grid_index = (
+                    int(np.nanargmin(abs(sizes - clicked_size))),
+                    int(np.nanargmin(abs((times - clicked_time).total_seconds()))),
+                )
+            except (KeyError, TypeError, ValueError):
+                return None
+    else:
+        return None
+
+    try:
+        size_index, time_index = (int(grid_index[0]), int(grid_index[1]))
+    except (TypeError, ValueError, IndexError):
+        return None
+    z = np.asarray(figure.data[curve_number].z)
+    if z.ndim != 2 or not (0 <= size_index < z.shape[0] and 0 <= time_index < z.shape[1]):
+        return None
+    return curve_number, size_index, time_index
+
+
+def add_heatmap_selection_layer(figure, trace, row):
+    """Plotly supports selection on scatter, but not on heatmap traces."""
+    z = np.asarray(trace["Z"], dtype=float)
+    if z.ndim != 2 or not z.size:
+        return
+    size_indices, time_indices = np.nonzero(np.isfinite(z))
+    if not len(size_indices):
+        return
+    figure.add_scattergl(
+        x=np.asarray(trace["x"])[time_indices],
+        y=np.asarray(trace["y"])[size_indices],
+        customdata=np.column_stack((size_indices, time_indices, z[size_indices, time_indices])),
+        mode="markers",
+        marker=dict(size=6, color="rgba(255,255,255,0.02)"),
+        name="Select inverted cells",
+        showlegend=False,
+        meta={
+            "kind": "inversion_selection",
+            "method": trace.get("method", "gunn woessner mod"),
+            "polarity": trace["polarity"],
+        },
+        hovertemplate=(
+            "time=%{x|%Y-%m-%d %H:%M}<br>dp=%{y:.2f} nm<br>"
+            "dN/dlog10Dp=%{customdata[2]:.2f}<extra></extra>"
+        ),
+        row=row, col=1,
+    )
+
+
 def analyze_heatmap_click(click_data, figure, result, mode_setting, min_nm, max_nm):
     if not click_data or figure is None or not click_data.get("points"):
         return None
     point = click_data["points"][0]
-    curve_number = point.get("curveNumber")
-    if curve_number is None or curve_number < 0 or curve_number >= len(figure.data):
+    cell = selected_heatmap_cell(point, figure)
+    if cell is None:
         return None
+    curve_number, _, time_index = cell
     metadata = figure.data[curve_number].meta
-    if not isinstance(metadata, dict) or metadata.get("kind") != "inversion_heatmap":
-        return None
     trace = next((item for item in result if item.get("kind") == "heatmap"
                   and item.get("method", "gunn woessner mod") == metadata["method"]
                   and item.get("polarity") == metadata["polarity"]), None)
     if trace is None:
         return None
     times = pd.DatetimeIndex(pd.to_datetime(trace["x"], errors="coerce"))
-    if len(times) == 0 or times.isna().all():
-        return None
-    clicked_time = pd.Timestamp(point.get("x"))
-    if pd.isna(clicked_time) and not isinstance(
-        point.get("pointNumber", point.get("pointIndex")),
-        (list, tuple, np.ndarray),
-    ):
-        return None
-    if times.tz is not None and clicked_time.tz is None:
-        clicked_time = clicked_time.tz_localize(times.tz)
-    elif times.tz is None and clicked_time.tz is not None:
-        clicked_time = clicked_time.tz_localize(None)
-    point_number = point.get("pointNumber", point.get("pointIndex"))
-    if isinstance(point_number, (list, tuple, np.ndarray)) and len(point_number) == 2:
-        time_index = int(point_number[1])
-    else:
-        time_index = int(np.nanargmin(np.abs((times - clicked_time).total_seconds())))
-    if time_index < 0 or time_index >= len(times):
+    if time_index >= len(times) or pd.isna(times[time_index]):
         return None
     sizes = np.asarray(trace["y"], dtype=float)
     concentration = np.asarray(trace["Z"], dtype=float)[:, time_index]
@@ -4359,17 +4463,11 @@ def analyze_heatmap_roi(selection_data, figure, result, mode_setting):
         return None
     selected_by_curve = {}
     for point in selection_data["points"]:
-        curve_number = point.get("curveNumber")
-        point_number = point.get("pointNumber", point.get("pointIndex"))
-        if (
-            curve_number is None
-            or not isinstance(point_number, (list, tuple, np.ndarray))
-            or len(point_number) != 2
-        ):
+        cell = selected_heatmap_cell(point, figure)
+        if cell is None:
             continue
-        selected_by_curve.setdefault(int(curve_number), []).append(
-            (int(point_number[0]), int(point_number[1]))
-        )
+        curve_number, size_index, time_index = cell
+        selected_by_curve.setdefault(curve_number, []).append((size_index, time_index))
 
     curve_number = next((
         number for number in selected_by_curve
@@ -4398,6 +4496,8 @@ def analyze_heatmap_roi(selection_data, figure, result, mode_setting):
         return None
 
     scan_fits = []
+    roi_center_times = []
+    roi_center_sizes = []
     selected_values = np.full_like(z, np.nan, dtype=float)
     support_by_scan = trace.get("part_columns", [])
     selected_time_indices = np.array(sorted({cell[1] for cell in valid_cells}), dtype=int)
@@ -4432,6 +4532,13 @@ def analyze_heatmap_roi(selection_data, figure, result, mode_setting):
         selected_index_sets.append(set(raw_size_indices))
         selected_values[raw_size_indices, time_index] = z[raw_size_indices, time_index]
         size_indices = longest_connected(raw_size_indices, [time_index])
+        center_nm = (
+            diag.weighted_log_diameter_quantile(
+                sizes[size_indices], z[size_indices, time_index], 0.5,
+            ) if len(size_indices) >= 2 else np.nan
+        )
+        roi_center_times.append(times[time_index])
+        roi_center_sizes.append(center_nm)
         part_columns = (
             support_by_scan[time_index]
             if time_index < len(support_by_scan) else None
@@ -4458,6 +4565,7 @@ def analyze_heatmap_roi(selection_data, figure, result, mode_setting):
             "r2": fitted.get("r2", np.nan),
             "selected_cell_count": len(raw_size_indices),
             "fit_cell_count": len(size_indices),
+            "selected_d50_nm": center_nm,
         }
         if fitted.get("status") == "ok":
             row["components"] = fitted["components"]
@@ -4497,6 +4605,7 @@ def analyze_heatmap_roi(selection_data, figure, result, mode_setting):
         "median_concentration": aggregate,
         "aggregate_fit": aggregate_fit,
         "scan_fits": scan_fits,
+        "selected_growth": diag.fit_selected_roi_growth(roi_center_times, roi_center_sizes),
         "selection_semantics": (
             "exact Plotly-selected cells retained; each fit uses its longest "
             "contiguous run and the aggregate uses common contiguous support"
@@ -4518,13 +4627,16 @@ def _roi_history_frame():
     } for item in saved_roi_analyses])
 
 
-def render_roi_analysis(analysis):
+def render_roi_analysis(
+    analysis, plot_pane=None, status_pane=None, growth_plot_pane=None, store=True,
+):
     if analysis is None:
         return
     analysis = copy.deepcopy(analysis)
-    analysis["roi_id"] = f"ROI-{len(saved_roi_analyses) + 1}"
-    saved_roi_analyses.append(analysis)
-    roi_history.object = _roi_history_frame()
+    analysis["roi_id"] = f"ROI-{len(saved_roi_analyses) + 1}" if store else "Selected ROI"
+    if store:
+        saved_roi_analyses.append(analysis)
+        roi_history.object = _roi_history_frame()
     aggregate_fit = analysis["aggregate_fit"]
     fig = go.Figure()
     fig.add_scatter(
@@ -4543,13 +4655,42 @@ def render_roi_analysis(analysis):
         xaxis={"title": "Particle diameter (nm)", "type": "log"},
         yaxis={"title": "dN/dlog10Dp (cm-3)"},
     )
-    roi_plot.object = fig
+    (plot_pane or roi_plot).object = fig
     successful = sum(row["status"] == "ok" for row in analysis["scan_fits"])
-    roi_status.object = (
-        f"**{analysis['roi_id']} saved:** {analysis['selected_scan_count']} scans, "
+    text = (
+        f"**{analysis['roi_id']}{' saved' if store else ''}:** {analysis['selected_scan_count']} scans, "
         f"{analysis['selected_cell_count']} cells, {successful} successful per-scan "
         f"modal fits; {analysis['size_min_nm']:.1f}-{analysis['size_max_nm']:.1f} nm."
     )
+    growth = analysis.get("selected_growth", {})
+    if growth.get("status") in {"ok", "weak"}:
+        text += (
+            f" Selected ROI apparent D50 slope {growth['growth_rate_nm_h']:.2f} nm/h "
+            f"(R²={growth['r2']:.2f}, {growth['n_scans']} scans; "
+            f"{'candidate growth' if growth['status'] == 'ok' else 'weak fit, not accepted as growth'})."
+        )
+        growth_figure = go.Figure()
+        growth_figure.add_scatter(
+            x=growth["time"], y=growth["diameter_nm"], mode="markers+lines",
+            name="Selected ROI D50",
+        )
+        if growth["status"] == "ok":
+            growth_figure.add_scatter(
+                x=growth["time"], y=growth["fitted_nm"], mode="lines",
+                line={"dash": "dash", "color": "black"}, name="Robust apparent slope",
+            )
+        growth_figure.update_layout(
+            title="Selected ROI D50 versus time (descriptive, not independently measured GR)",
+            xaxis={"title": "Time"}, yaxis={"title": "Dp (nm)"},
+        )
+        if store or growth_plot_pane is not None:
+            (growth_plot_pane if growth_plot_pane is not None else roi_growth_plot).object = growth_figure
+    elif store or growth_plot_pane is not None:
+        (growth_plot_pane if growth_plot_pane is not None else roi_growth_plot).object = None
+        text += f" ROI growth slope unavailable: {growth.get('reason', 'insufficient selected data')}."
+    (status_pane or roi_status).object = text
+    if store:
+        roi_feedback.object = text + " View details in the Saved ROIs tab."
 
 
 def on_inversion_heatmap_selection(event):
@@ -4563,7 +4704,9 @@ def clear_saved_rois(event=None):
     saved_roi_analyses.clear()
     roi_history.object = pd.DataFrame()
     roi_plot.object = None
+    roi_growth_plot.object = None
     roi_status.object = "Saved ROI analyses cleared for this explorer."
+    roi_feedback.object = "Drag across inverted heatmap cells to analyze a new ROI."
 
 
 def update_roi_selection_tool(event=None):
@@ -4622,7 +4765,9 @@ def plot_inversion_result(result):
     saved_roi_analyses.clear()
     roi_history.object = pd.DataFrame()
     roi_plot.object = None
+    roi_growth_plot.object = None
     roi_status.object = "ROI history reset for the new inversion result."
+    roi_feedback.object = "Drag across inverted heatmap cells to analyze an ROI."
     modal_fit_plot.object = None
     modal_fit_status.object = "Click an inverted heatmap to inspect and fit that scan's size distribution."
     heatmaps = [tr for tr in result if tr["kind"] == "heatmap"]
@@ -4654,6 +4799,7 @@ def plot_inversion_result(result):
             minimum_correlation=float(mcc_min_correlation.value),
         ))
     latest_growth_diagnostics = growth_diagnostics
+    update_growth_status(growth_diagnostics)
     latest_growth_settings = {
         "models": list(growth_models.value),
         "min_size_nm": float(growth_min_size_nm.value),
@@ -4853,13 +4999,14 @@ def plot_inversion_result(result):
                     fig.add_scatter(
                         x=growth_diag["time"],
                         y=growth_diag["dp"],
-                        mode="lines+markers",
+                        mode=("markers" if growth_diag["fit_quality"] == "marginal"
+                              else "lines+markers"),
                         marker=dict(size=5, color=track_color),
                         line=dict(width=2, color=track_color),
                         name=(
                             f"Event {growth_diag['event_number']} {growth_diag['model']} "
                             f"{tr['polarity']} "
-                            f"({growth_diag['growth_rate']:.2f} nm/h)"
+                            f"({growth_diag['growth_rate']:.2f} nm/h, {growth_diag['fit_quality']})"
                         ),
                         customdata=np.column_stack((
                             growth_diag["fit"],
@@ -4875,23 +5022,25 @@ def plot_inversion_result(result):
                         row=row,
                         col=1,
                     )
-                    fig.add_scatter(
-                        x=growth_diag["time"],
-                        y=growth_diag["fit"],
-                        mode="lines",
-                        line=dict(width=2, dash="dash", color=track_color),
-                        name=(
-                            f"Event {growth_diag['event_number']} "
-                            f"{growth_diag['model']} robust fit"
-                        ),
-                        hovertemplate=(
-                            "time=%{x|%Y-%m-%d %H:%M}<br>"
-                            "fitted dp=%{y:.2f} nm<extra></extra>"
-                        ),
-                        row=row,
-                        col=1,
-                    )
+                    if growth_diag["fit_quality"] != "marginal":
+                        fig.add_scatter(
+                            x=growth_diag["time"],
+                            y=growth_diag["fit"],
+                            mode="lines",
+                            line=dict(width=2, dash="dash", color=track_color),
+                            name=(
+                                f"Event {growth_diag['event_number']} "
+                                f"{growth_diag['model']} robust fit"
+                            ),
+                            hovertemplate=(
+                                "time=%{x|%Y-%m-%d %H:%M}<br>"
+                                "fitted dp=%{y:.2f} nm<extra></extra>"
+                            ),
+                            row=row,
+                            col=1,
+                        )
 
+            add_heatmap_selection_layer(fig, tr, row)
             update_log_size_axis(fig, row, tr["y"])
             fig.update_xaxes(title_text="Time", tickformat="%H:%M", row=row, col=1)
 
@@ -6655,9 +6804,9 @@ controls = pn.Column(
 
 plot_tabs = pn.Tabs(
     ("Raw Data", pn.Column(raw_plot)),
-    ("Inversion", pn.Column(inversion_plot)),
+    ("Inversion", pn.Column(pn.Row(roi_selection_tool, roi_feedback), growth_status, inversion_plot)),
     ("Clicked Distribution", pn.Column(modal_fit_status, modal_fit_plot)),
-    ("Saved ROIs", pn.Column(pn.Row(roi_selection_tool, clear_rois_button), roi_status, roi_history, roi_plot)),
+    ("Saved ROIs", pn.Column(clear_rois_button, roi_status, roi_history, roi_plot, roi_growth_plot)),
     ("Aerosol Properties", pn.Column(aerosol_plot)),
     ("Mode Tracking", pn.Column(mode_tracking_plot)),
     ("Quality Dashboard", pn.Column(quality_dashboard_pane)),
