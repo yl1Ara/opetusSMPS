@@ -311,3 +311,10 @@ matrix. The SMPS Timing tab then searches for a best
 *additional* offset; the cross-instrument Comparison tab uses each source's
 configured display offset as well (click **Refresh comparison** there after
 changing an instrument's shift).
+
+The **Zn/Zp for inversion** selector offers configured Zn/Zp, the processed
+paired-polarity scan estimate for Gunn-Woessner, or an explicit experimental
+option applying that estimate to Fuchs too. The per-scan ratio source and
+value are recorded in heatmap-condition exports. A monopolar scan has no
+paired-polarity estimate and falls back to configured Zn/Zp; Wiedensohler's
+fixed charge fractions do not use this control.

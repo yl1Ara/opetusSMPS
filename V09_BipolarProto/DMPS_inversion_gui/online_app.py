@@ -94,6 +94,7 @@ DEFAULT_SETTINGS = {
     "ambient_match_tolerance_min": 30.0,
     "ambient_naive_timezone": "Europe/Helsinki",
     "zratio": 1.60e-4 / 1.35e-4,
+    "zratio_source": "scan_gw",
     "use_zratio_from_settings": False,
     "zratio_convention": "Zn/Zp",
     "positive_ion_mobility_m2_Vs": 1.35e-4,
@@ -168,6 +169,19 @@ SOURCE_EXPORT_DIRECTORIES = {
     "SMEAR III SMPS (CSC)": "smeariii_smps",
 }
 
+ZRATIO_SOURCE_OPTIONS = {
+    "Configured Zn/Zp": "configured",
+    "Processed scan estimate (Gunn–Woessner only)": "scan_gw",
+    "Processed scan estimate (also Fuchs, experimental)": "scan_all",
+}
+
+
+def zratio_source_from_settings(settings):
+    saved = settings.get("zratio_source")
+    if saved in ZRATIO_SOURCE_OPTIONS.values():
+        return saved
+    return "configured" if settings.get("use_zratio_from_settings", False) else "scan_gw"
+
 INVERSION_METHODS = {
     "gunn woessner mod": "Gunn-Woessner modified",
     "wiedensohler": "Wiedensohler",
@@ -191,7 +205,7 @@ CHARGE_MODEL_PROVENANCE = {
         "balance. This corrected Chen-derived port is not yet verified as the "
         "complete Hoppel-Frick (1986) three-body treatment. Like-sign attachment "
         "can truncate to zero below about 20 nm; treat that range as experimental. "
-        "Configured ion mobilities are treated as values at scan conditions, so "
+        "Positive-ion mobility and selected Zn/Zp set the mobilities at scan conditions; "
         "pressure does not independently rescale the charging fractions."
     ),
 }
@@ -322,7 +336,8 @@ def save_settings():
         "ambient_match_tolerance_min": float(ambient_match_tolerance_min.value),
         "ambient_naive_timezone": ambient_naive_timezone.value,
         "zratio": float(zratio_widget.value),
-        "use_zratio_from_settings": bool(use_zratio_checkbox.value),
+        "zratio_source": zratio_source.value,
+        "use_zratio_from_settings": zratio_source.value == "configured",
         "zratio_convention": "Zn/Zp",
         "positive_ion_mobility_m2_Vs": float(positive_ion_mobility.value),
         "positive_ion_mass_amu": float(positive_ion_mass.value),
@@ -660,6 +675,7 @@ def save_data(event=None):
                     "ambient_time": tr.get("ambient_time", pd.NaT),
                     "scan_id": tr.get("scan_id", "unknown"),
                     "zratio_used": tr.get("zratio_used", np.nan),
+                    "zratio_source": tr.get("zratio_source", "unknown"),
                     "cpc_type": tr.get("cpc_type", "unknown"),
                     "cpc_type_mixed": tr.get("cpc_type_mixed", False),
                     "correction_mode": tr.get("correction_mode", "unknown"),
@@ -2291,9 +2307,11 @@ zratio_estimate_offset = pn.widgets.FloatInput(
     )),
     step=0.05,
 )
-use_zratio_checkbox = pn.widgets.Checkbox(
-    name="Use Zn/Zp from settings",
-    value=bool(settings.get("use_zratio_from_settings", DEFAULT_SETTINGS["use_zratio_from_settings"])),
+zratio_source = pn.widgets.Select(
+    name="Zn/Zp for inversion",
+    options=ZRATIO_SOURCE_OPTIONS,
+    value=zratio_source_from_settings(settings),
+    width=380,
 )
 
 smallest_size = pn.widgets.FloatInput(
@@ -2716,6 +2734,23 @@ def charge_model_description(methods, minimum_nm):
         "corrected using the configured `Np/Nn`; those quantities are not "
         "independently identifiable from the polarity signals alone."
     )
+    if zratio_source.value == "scan_all":
+        lines.append(
+            "- **Experimental:** Fuchs will use the processed Gunn–Woessner "
+            "scan estimate when both polarities exist; this is a model-dependent "
+            "input, not an independent ion measurement."
+        )
+    if zratio_source.value != "configured":
+        lines.append(
+            "- Scan estimates require both voltage polarities; scans without a "
+            "valid estimate fall back to the configured Zn/Zp. Wiedensohler "
+            "charge fractions do not use either mobility ratio."
+        )
+    if scan_source_for_root(scan_root.value) == "Monopolar Pi (CSC)":
+        lines.append(
+            "- **Monopolar Pi:** a single voltage polarity cannot yield this "
+            "paired-polarity estimate; configured Zn/Zp will be used."
+        )
     return "\n".join(lines)
 
 
@@ -2760,7 +2795,7 @@ def build_charge_fraction_comparison(
                 name=f"{method_label(method)} q={charge_number:+d}",
             )
     fig.update_layout(
-        title="Bipolar equilibrium charge-fraction comparison",
+        title="Bipolar charge fractions at configured Zn/Zp (not scan-specific)",
         xaxis={"title": "Particle diameter (nm)", "type": "log"},
         yaxis={"title": "Charge fraction", "rangemode": "tozero"},
         margin={"l": 70, "r": 30, "t": 60, "b": 60},
@@ -3309,6 +3344,33 @@ def smooth_ion_ratio_points(ion_points):
     return smoothed_points
 
 
+def valid_scan_zratio(raw, processed):
+    """Only apply a processed estimate backed by an in-bounds scan estimate."""
+    adjusted = raw + float(zratio_estimate_offset.value)
+    lower, upper = sorted((float(zratio_min_widget.value), float(zratio_max_widget.value)))
+    return (
+        np.isfinite(adjusted) and adjusted > 0
+        and lower <= adjusted <= upper
+        and np.isfinite(processed) and processed > 0
+        and lower <= processed <= upper
+    )
+
+
+def zratio_for_inversion(method, processed_ratio):
+    """Select Zn/Zp and record whether this scan actually supplied the value."""
+    configured = float(zratio_widget.value)
+    source = zratio_source.value
+    if method == "wiedensohler":
+        return configured, "not used (Wiedensohler fixed charge fractions)"
+    if source == "configured":
+        return configured, "configured"
+    if method == "fuchs" and source == "scan_gw":
+        return configured, "configured (scan estimate not enabled for Fuchs)"
+    if np.isfinite(processed_ratio) and processed_ratio > 0:
+        return float(processed_ratio), "processed scan estimate"
+    return configured, "configured fallback (no valid paired scan estimate)"
+
+
 def counting_covariance_by_size(d, sizes_nm):
     sizes_nm = np.asarray(sizes_nm, dtype=float)
     if not counting_uncertainty_enabled.value:
@@ -3471,7 +3533,7 @@ def invert_one_scan(
     else:
         p = np.arange(1, 6, 1, dtype=float)
 
-    if zratio is None or not np.isfinite(zratio) or use_zratio_checkbox.value:
+    if zratio is None or not np.isfinite(zratio) or zratio <= 0:
         zratio = float(zratio_widget.value)
 
     zp = float(positive_ion_mobility.value)
@@ -3745,8 +3807,8 @@ def run_inversion_calculation(
             ion_points.append((g_scan["time"].median(), zratio, selected_dp, scan_id))
 
     ion_points = smooth_ion_ratio_points(ion_points)
-    for _, _, smoothed_zratio, _, scan_id in ion_points:
-        if np.isfinite(smoothed_zratio) and smoothed_zratio != 0:
+    for _, raw_zratio, smoothed_zratio, _, scan_id in ion_points:
+        if valid_scan_zratio(raw_zratio, smoothed_zratio):
             zratios[scan_id] = smoothed_zratio
 
     inversion_method_values = selected_inversion_methods()
@@ -3767,6 +3829,7 @@ def run_inversion_calculation(
             heat_ambient_times = []
             heat_scan_ids = []
             heat_zratios_used = []
+            heat_zratio_sources = []
             heat_cpc_types = []
             heat_cpc_type_mixed = []
             heat_dma_lengths = []
@@ -3779,14 +3842,9 @@ def run_inversion_calculation(
 
             for scan_id, g_scan in dd.groupby(group_key):
                 check_inversion_cancelled(cancel_event)
-                zratio = zratios.get(scan_id, np.nan)
-                if (
-                    inversion_method == "fuchs" or use_zratio_checkbox.value
-                    or not np.isfinite(zratio) or zratio <= 0
-                ):
-                    # Fuchs and explicit/fallback settings do not use the
-                    # scan-derived Gunn-Woessner estimate.
-                    zratio = float(zratio_widget.value)
+                zratio, ratio_source = zratio_for_inversion(
+                    inversion_method, zratios.get(scan_id, np.nan),
+                )
                 scan_parts = []
                 scan_std_parts = []
                 scan_failed = False
@@ -4078,6 +4136,7 @@ def run_inversion_calculation(
                 heat_zratios_used.append(
                     float(zratio) if inversion_method != "wiedensohler" else np.nan
                 )
+                heat_zratio_sources.append(ratio_source)
                 heat_cpc_types.append(scan_cpc_type)
                 heat_cpc_type_mixed.append(bool(scan_cpc_type_mixed))
                 scan_dma = get_dma(g_scan)
@@ -4110,6 +4169,7 @@ def run_inversion_calculation(
                     "ambient_time": heat_ambient_times,
                     "scan_id": heat_scan_ids,
                     "zratio_used": heat_zratios_used,
+                    "zratio_source": heat_zratio_sources,
                     "cpc_type": heat_cpc_types,
                     "cpc_type_mixed": heat_cpc_type_mixed,
                     "dma_length_m": heat_dma_lengths,
@@ -6694,6 +6754,22 @@ def run_inversion(event=None, force_recompute=False):
                         status_text += f" {cache_rows['errors']} cache errors."
                     update_inversion_cache_status()
 
+                ratio_sources = [
+                    provenance
+                    for tr in result if tr.get("kind") == "heatmap"
+                    for provenance in tr.get("zratio_source", [])
+                    if provenance != "not used (Wiedensohler fixed charge fractions)"
+                ]
+                if ratio_sources:
+                    applied = ratio_sources.count("processed scan estimate")
+                    fallback = sum(source.startswith("configured fallback") for source in ratio_sources)
+                    status_text += (
+                        f" Zn/Zp: {applied} processed scan estimates, "
+                        f"{fallback} configured fallbacks."
+                    )
+                elif any(tr.get("kind") == "heatmap" for tr in result):
+                    status_text += " Zn/Zp choice has no effect on Wiedensohler charge fractions."
+
                 status.object = status_text
                 set_inversion_controls(False)
                 publish_shared_state(
@@ -6908,7 +6984,7 @@ SETTINGS_WIDGETS = [
     ambient_match_tolerance_min,
     ambient_naive_timezone,
     zratio_widget,
-    use_zratio_checkbox,
+    zratio_source,
     positive_ion_mobility,
     positive_ion_mass,
     negative_ion_mass,
@@ -6988,7 +7064,12 @@ inversion_controls = pn.Column(
     pn.Row(zratio_widget, zratio_min_widget, zratio_max_widget, zratio_smoothing_step),
     pn.Row(positive_ion_mobility, positive_ion_mass, negative_ion_mass),
     pn.Row(positive_ion_concentration, negative_ion_concentration),
-    pn.Row(zratio_min_size_nm, zratio_estimate_offset, use_zratio_checkbox, smallest_size),
+    pn.Row(zratio_min_size_nm, zratio_estimate_offset, zratio_source, smallest_size),
+    pn.pane.Markdown(
+        "Processed scan Zn/Zp needs **both polarities**; otherwise the configured "
+        "ratio is used. Applying it to Fuchs is experimental, and Wiedensohler "
+        "does not use the ion-mobility controls."
+    ),
     pn.Row(scan_inversion_type, smps_settling_time_sec, smps_correction_mode, smps_transport_delay_sec),
     pn.Row(
         smps_response_window_sec, smps_dwell_sec,

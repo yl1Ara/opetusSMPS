@@ -173,6 +173,7 @@ class IndependentSourceComparisonTests(unittest.TestCase):
                 "roi_selection_tool": "lasso",
                 "smear_comparison_time_offset_sec": -130.0,
             })
+            settings.pop("zratio_source", None)  # Legacy checkbox-only profile.
             (sessions / "settings_old.json").write_text(json.dumps(settings))
             with (
                 patch.object(viewer, "SESSION_SETTINGS_DIR", sessions),
@@ -184,10 +185,11 @@ class IndependentSourceComparisonTests(unittest.TestCase):
                 try:
                     self.assertEqual(first.qa_lpm.value, 0.7)
                     self.assertEqual(first.selected_inversion_methods(), ["fuchs"])
-                    self.assertTrue(first.use_zratio_checkbox.value)
+                    self.assertEqual(first.zratio_source.value, "configured")
                     self.assertEqual(first.roi_selection_tool.value, "lasso")
                     self.assertEqual(first.smear_comparison_time_offset_sec.value, -130.0)
                     first.qa_lpm.value = 0.81
+                    first.zratio_source.value = "scan_all"
                     profile = root / "profiles" / "monopolar-pi.json"
                     self.assertEqual(json.loads(profile.read_text())["qa_lpm"], 0.81)
 
@@ -197,7 +199,7 @@ class IndependentSourceComparisonTests(unittest.TestCase):
                     try:
                         self.assertEqual(second.qa_lpm.value, 0.81)
                         self.assertEqual(second.selected_inversion_methods(), ["fuchs"])
-                        self.assertTrue(second.use_zratio_checkbox.value)
+                        self.assertEqual(second.zratio_source.value, "scan_all")
                         self.assertEqual(second.roi_selection_tool.value, "lasso")
                         self.assertEqual(second.smear_comparison_time_offset_sec.value, -130.0)
                         self.assertEqual(second.scan_source.value, "Monopolar Pi (CSC)")

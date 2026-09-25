@@ -1,8 +1,10 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
 
+from DMPS_inversion_gui import online_app
 from inv_funcs.calChargeFracF import calChargeFracF, fuchs_charge_fractions
 from inv_funcs.gunn_woessner_modified import gunn_woessner_modified
 from inv_funcs.intfun import intfun
@@ -82,6 +84,42 @@ class GunnWoessnerConventionTests(unittest.TestCase):
         positive = gunn_woessner_modified(1, *common, 0)[0]
         negative = gunn_woessner_modified(-1, *common, 0)[0]
         self.assertGreater(negative, positive)
+
+
+class ScanRatioSourceTests(unittest.TestCase):
+    def test_processed_ratio_can_be_selected_for_fuchs_explicitly(self):
+        with (
+            patch.object(online_app, "zratio_widget", SimpleNamespace(value=1.2)),
+            patch.object(online_app, "zratio_source", SimpleNamespace(value="scan_gw")) as source,
+        ):
+            self.assertEqual(online_app.zratio_for_inversion("gunn woessner mod", 1.6),
+                             (1.6, "processed scan estimate"))
+            fuchs, label = online_app.zratio_for_inversion("fuchs", 1.6)
+            self.assertEqual(fuchs, 1.2)
+            self.assertIn("not enabled for Fuchs", label)
+
+            source.value = "scan_all"
+            self.assertEqual(online_app.zratio_for_inversion("fuchs", 1.6),
+                             (1.6, "processed scan estimate"))
+            fallback, label = online_app.zratio_for_inversion("fuchs", np.nan)
+            self.assertEqual(fallback, 1.2)
+            self.assertIn("fallback", label)
+
+            source.value = "configured"
+            self.assertEqual(online_app.zratio_for_inversion("gunn woessner mod", 1.6),
+                             (1.2, "configured"))
+            _, label = online_app.zratio_for_inversion("wiedensohler", 1.6)
+            self.assertIn("not used", label)
+
+    def test_processed_estimate_requires_valid_raw_and_bounded_processed_value(self):
+        with (
+            patch.object(online_app, "zratio_estimate_offset", SimpleNamespace(value=0.1)),
+            patch.object(online_app, "zratio_min_widget", SimpleNamespace(value=0.3)),
+            patch.object(online_app, "zratio_max_widget", SimpleNamespace(value=3.0)),
+        ):
+            self.assertTrue(online_app.valid_scan_zratio(1.1, 1.2))
+            self.assertFalse(online_app.valid_scan_zratio(4.0, 1.2))
+            self.assertFalse(online_app.valid_scan_zratio(1.1, 4.0))
 
 
 class InversionChargeMatrixTests(unittest.TestCase):

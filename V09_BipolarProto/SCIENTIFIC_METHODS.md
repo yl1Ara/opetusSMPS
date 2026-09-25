@@ -23,10 +23,15 @@ growth-rate cross-check.
 - The ion-mobility ratio is always `Zn/Zp`: negative-ion mobility divided by
   positive-ion mobility. The nominal default is 1.60/1.35.
 - A scan-derived `Zn/Zp` uses the Gunn-Woessner square-root relation and is
-  corrected by the configured `Np/Nn`. It is not used for the experimental
-  Fuchs-type inversion, which uses the configured ratio. An optional additive
-  operator offset and temporal step limiter are shown separately from the raw
-  estimate; the additive offset defaults to zero for new settings.
+  corrected by the configured `Np/Nn`. The processed estimate applies the
+  optional additive operator offset, candidate bounds, and temporal step
+  limiter; the offset defaults to zero for new settings. The legacy mode uses
+  it for Gunn-Woessner only and uses the configured ratio for Fuchs. An
+  explicit experimental option can also feed that Gunn-Woessner-derived
+  estimate to Fuchs; it is not an independent ion measurement. Scans without
+  a valid estimate (including monopolar scans without both voltage signs)
+  fall back to the configured ratio. Wiedensohler uses fixed charging
+  fractions independent of the selected ion-mobility ratio.
 - The optional polarity-consistency diagnostic pairs positive- and
   negative-voltage columns by scan ID and compares only common measured support,
   defaulting to 20-70 nm. Under the singly charged Gunn-Woessner relation it
@@ -83,9 +88,10 @@ growth-rate cross-check.
   transport, or charged-particle terms. Growth-slope p10-p90 propagation is a
   sensitivity range, not a confidence interval. Marginal growth candidates
   are excluded from the growth-outflux term.
-- The experimental Fuchs-type path treats configured ion mobilities as values
-  at the scan conditions. Pressure is validated and recorded but does not
-  independently rescale the charging fractions.
+- The experimental Fuchs-type path uses configured positive-ion mobility and
+  the selected `Zn/Zp` to set negative-ion mobility at the scan conditions.
+  Pressure is validated and recorded but does not independently rescale the
+  charging fractions.
 - The SMEAR III UFSMPS `.scan` importer currently uses the last of its two
   CPC concentration/count columns (TSI3756), not the first UFCPC channel
   (TSI3750). CPC efficiency for these models is not calibrated in the current
