@@ -24,6 +24,7 @@ _GL_NODES, _GL_WEIGHTS = leggauss(5)
 
 import inv_funcs as inv
 from DMPS_inversion_gui import diagnostics as diag
+from DMPS_inversion_gui import inversion_cache as inversion_cache_store
 from DMPS_inversion_gui.cpc_delay import (
     assign_cpc_samples_to_setpoints,
     build_response_kernel,
@@ -44,6 +45,21 @@ from inv_funcs.ltubefl import ltubefl
 APP_ROOT = Path(__file__).resolve().parents[1]
 SETTINGS_FILE = APP_ROOT / "settings_inversion.json"
 APP_VERSION = (APP_ROOT / "VERSION").read_text().strip()
+INVERSION_CACHE_ROOT = APP_ROOT / ".inversion_cache"
+INVERSION_CACHE = inversion_cache_store.InversionCache(INVERSION_CACHE_ROOT)
+
+
+def inversion_code_fingerprint():
+    paths = [
+        Path(__file__),
+        Path(__file__).with_name("cpc_delay.py"),
+        Path(__file__).with_name("diagnostics.py"),
+    ]
+    paths.extend(sorted((APP_ROOT / "inv_funcs").glob("*.py")))
+    return inversion_cache_store.files_fingerprint(paths, root=APP_ROOT)
+
+
+INVERSION_CODE_FINGERPRINT = inversion_code_fingerprint()
 
 DEFAULT_SETTINGS = {
     "scan_root": "logs/scans",
@@ -58,6 +74,7 @@ DEFAULT_SETTINGS = {
     "auto_interval_min": 30,
     "auto_file_age_sec": 2,
     "daily_overwrite": True,
+    "inversion_cache_enabled": True,
     "dma_L": 0.28,
     "dma_r1": 0.025,
     "dma_r2": 0.033,
@@ -266,6 +283,7 @@ def save_settings():
         "auto_interval_min": int(auto_interval_min.value),
         "auto_file_age_sec": int(auto_file_age_sec.value),
         "daily_overwrite": bool(daily_overwrite_checkbox.value),
+        "inversion_cache_enabled": bool(inversion_cache_enabled.value),
         "dma_L": float(dma_L.value),
         "dma_r1": float(dma_r1.value),
         "dma_r2": float(dma_r2.value),
@@ -2019,11 +2037,23 @@ daily_overwrite_checkbox = pn.widgets.Checkbox(
     name="Daily overwrite files",
     value=bool(settings.get("daily_overwrite", DEFAULT_SETTINGS["daily_overwrite"])),
 )
+inversion_cache_enabled = pn.widgets.Checkbox(
+    name="Reuse cached scan inversions",
+    value=bool(settings.get(
+        "inversion_cache_enabled", DEFAULT_SETTINGS["inversion_cache_enabled"],
+    )),
+)
 
 refresh_button = pn.widgets.Button(name="Refresh scan list", button_type="primary")
 select_last_button = pn.widgets.Button(name="Select last N", button_type="primary")
 plot_button = pn.widgets.Button(name="Plot raw selected scans", button_type="success")
 invert_button = pn.widgets.Button(name="Run inversion", button_type="danger")
+recalculate_inversion_button = pn.widgets.Button(
+    name="Recalculate from raw data", button_type="warning",
+)
+clear_inversion_cache_button = pn.widgets.Button(
+    name="Clear inversion cache", button_type="light",
+)
 stop_inversion_button = pn.widgets.Button(
     name="Stop inversion", button_type="warning", disabled=True,
 )
@@ -2519,6 +2549,7 @@ roi_selection_tool = pn.widgets.Select(
 )
 
 status = pn.pane.Markdown("Status: idle")
+cache_status = pn.pane.Markdown()
 
 raw_plot = pn.pane.Plotly(height=750, width=1300)
 inversion_plot = pn.pane.Plotly(width=1300)
@@ -3427,8 +3458,55 @@ def invert_one_scan(
     return result
 
 
-def run_inversion_calculation(df, cancel_event=None):
+def scan_inversion_cache_key(
+    scan_rows, polarity, zratio, temp, press, inversion_method,
+    cpc_series_override=None, assignment_diagnostics=None, response_kernel=None,
+):
+    parameters = {
+        "app_version": APP_VERSION,
+        "code_fingerprint": INVERSION_CODE_FINGERPRINT,
+        "polarity": polarity,
+        "zratio": zratio,
+        "temperature_k": temp,
+        "pressure_pa": press,
+        "inversion_method": inversion_method,
+        "smallest_size_nm": float(smallest_size.value),
+        "size_bin_decimals": int(inversion_size_bin_decimals.value),
+        "qa_lpm": float(qa_lpm.value),
+        "qs_lpm": float(qs_lpm.value),
+        "dma_fallback": [float(dma_L.value), float(dma_r1.value), float(dma_r2.value)],
+        "positive_ion_mobility": float(positive_ion_mobility.value),
+        "positive_ion_mass": float(positive_ion_mass.value),
+        "negative_ion_mass": float(negative_ion_mass.value),
+        "positive_ion_concentration": float(positive_ion_concentration.value),
+        "negative_ion_concentration": float(negative_ion_concentration.value),
+        "tube_segments": tube_segments.value,
+        "scan_inversion_type": scan_inversion_type.value,
+        "smps_correction_mode": smps_correction_mode.value,
+        "smps_kernel_smoothness": float(smps_kernel_smoothness.value),
+        "smps_size_step_shift": int(smps_size_step_shift.value),
+        "cpc_gap_interpolation_enabled": bool(cpc_gap_interpolation_enabled.value),
+        "cpc_gap_floor_ratio": float(low_value_lift_ratio.value),
+        "counting_uncertainty_enabled": bool(counting_uncertainty_enabled.value),
+        "cpc_sample_flow_lpm": float(cpc_sample_flow_lpm.value),
+        "cpc_counting_interval_sec": float(cpc_counting_interval_sec.value),
+    }
+    return inversion_cache_store.cache_key(
+        parameters,
+        scan_rows,
+        cpc_series_override,
+        assignment_diagnostics,
+        response_kernel,
+    )
+
+
+def run_inversion_calculation(
+    df, cancel_event=None, use_cache=None, force_recompute=False,
+):
     check_inversion_cancelled(cancel_event)
+    if use_cache is None:
+        use_cache = bool(inversion_cache_enabled.value)
+    cache_diagnostics = {"hits": 0, "misses": 0, "writes": 0, "errors": 0}
     existing_completion = list(df.attrs.get("scan_completion_diagnostics", []))
     df, completion_diagnostics = filter_complete_scans(df.copy())
     completion_diagnostics = existing_completion or completion_diagnostics
@@ -3622,18 +3700,45 @@ def run_inversion_calculation(df, cancel_event=None):
                             "polarity": polarity,
                         }
                     try:
-                        invdf = invert_one_scan(
-                            g_range,
-                            polarity=polarity,
-                            zratio=zratio,
-                            temp=temp,
-                            press=press,
-                            inversion_method=inversion_method,
-                            cpc_series_override=cpc_series_override,
-                            assignment_diagnostics=group_assignment_diagnostics,
-                            response_kernel=response_kernel,
-                            cancel_event=cancel_event,
-                        )
+                        cache_key = None
+                        invdf = None
+                        if use_cache:
+                            try:
+                                cache_key = scan_inversion_cache_key(
+                                    g_range, polarity, zratio, temp, press, inversion_method,
+                                    cpc_series_override=cpc_series_override,
+                                    assignment_diagnostics=group_assignment_diagnostics,
+                                    response_kernel=response_kernel,
+                                )
+                                if not force_recompute:
+                                    invdf = INVERSION_CACHE.load(cache_key)
+                                    if invdf is not None:
+                                        cache_diagnostics["hits"] += 1
+                            except Exception as error:
+                                cache_diagnostics["errors"] += 1
+                                print(f"Could not read inversion cache: {error}", flush=True)
+                        if invdf is None:
+                            if use_cache:
+                                cache_diagnostics["misses"] += 1
+                            invdf = invert_one_scan(
+                                g_range,
+                                polarity=polarity,
+                                zratio=zratio,
+                                temp=temp,
+                                press=press,
+                                inversion_method=inversion_method,
+                                cpc_series_override=cpc_series_override,
+                                assignment_diagnostics=group_assignment_diagnostics,
+                                response_kernel=response_kernel,
+                                cancel_event=cancel_event,
+                            )
+                            if use_cache and cache_key is not None:
+                                try:
+                                    INVERSION_CACHE.store(cache_key, invdf)
+                                    cache_diagnostics["writes"] += 1
+                                except Exception as error:
+                                    cache_diagnostics["errors"] += 1
+                                    print(f"Could not write inversion cache: {error}", flush=True)
                     except InversionCancelled:
                         raise
                     except Exception as error:
@@ -3917,6 +4022,12 @@ def run_inversion_calculation(df, cancel_event=None):
     output.append({
         "kind": "kernel_sample_residuals",
         "rows": kernel_sample_residuals,
+    })
+    output.append({
+        "kind": "cache_diagnostics",
+        "enabled": bool(use_cache),
+        "force_recompute": bool(force_recompute),
+        **cache_diagnostics,
     })
     if effective_zratio_diagnostic_enabled.value:
         effective_diagnostic = diag.build_effective_zratio_diagnostics(
@@ -5919,7 +6030,11 @@ def update_smps_timing_plot(event=None):
 
 def set_inversion_controls(running):
     invert_button.disabled = bool(running)
+    recalculate_inversion_button.disabled = bool(running)
+    clear_inversion_cache_button.disabled = bool(running)
     stop_inversion_button.disabled = not bool(running)
+    for widget in INVERSION_INPUT_WIDGETS:
+        widget.disabled = bool(running)
 
 
 def stop_inversion(event=None):
@@ -5941,7 +6056,7 @@ def stop_inversion(event=None):
     publish_shared_state(status_text="Stopping inversion...")
 
 
-def run_inversion(event=None):
+def run_inversion(event=None, force_recompute=False):
     global inversion_running, inversion_future
 
     df = load_selected_scans()
@@ -5956,10 +6071,19 @@ def run_inversion(event=None):
         inversion_running = True
         inversion_cancel_event.clear()
 
-    status.object = "Running inversion..."
+    status.object = (
+        "Recalculating inversion from raw data..."
+        if force_recompute else "Running inversion..."
+    )
     set_inversion_controls(True)
 
-    fut = inversion_executor.submit(run_inversion_calculation, df, inversion_cancel_event)
+    fut = inversion_executor.submit(
+        run_inversion_calculation,
+        df,
+        inversion_cancel_event,
+        bool(inversion_cache_enabled.value),
+        bool(force_recompute),
+    )
     with inversion_lock:
         inversion_future = fut
 
@@ -6063,6 +6187,19 @@ def run_inversion(event=None):
                 if len(coverage):
                     status_text += f" Median inverted-bin coverage {100 * np.median(coverage):.0f}%."
 
+                cache_rows = next(
+                    (item for item in result if item.get("kind") == "cache_diagnostics"),
+                    None,
+                )
+                if cache_rows and cache_rows.get("enabled"):
+                    status_text += (
+                        f" Cache: {cache_rows['hits']} reused, "
+                        f"{cache_rows['writes']} calculated."
+                    )
+                    if cache_rows.get("errors"):
+                        status_text += f" {cache_rows['errors']} cache errors."
+                    update_inversion_cache_status()
+
                 status.object = status_text
                 set_inversion_controls(False)
                 publish_shared_state(
@@ -6111,6 +6248,33 @@ def run_inversion(event=None):
                 inversion_future = None
 
     fut.add_done_callback(done_callback)
+
+
+def recalculate_inversion(event=None):
+    run_inversion(event, force_recompute=True)
+
+
+def update_inversion_cache_status():
+    stats = INVERSION_CACHE.stats()
+    size_mb = stats["bytes"] / (1024 * 1024)
+    cache_status.object = (
+        f"Cache location: `{INVERSION_CACHE_ROOT}`  \n"
+        f"Stored artifacts: **{stats['entries']}** ({size_mb:.1f} MB). "
+        "Changing raw data or inversion settings automatically creates fresh artifacts."
+    )
+
+
+def clear_inversion_cache(event=None):
+    with inversion_lock:
+        if inversion_running:
+            status.object = "Stop the running inversion before clearing its cache."
+            return
+    try:
+        INVERSION_CACHE.clear()
+        update_inversion_cache_status()
+        status.object = "Inversion cache cleared. Raw scan data was not changed."
+    except OSError as error:
+        status.object = f"Could not clear inversion cache: {error}"
 
 
 def auto_refresh_invert_save():
@@ -6209,6 +6373,8 @@ def run_auto_worker():
 
 save_button.on_click(save_data)
 invert_button.on_click(run_inversion)
+recalculate_inversion_button.on_click(recalculate_inversion)
+clear_inversion_cache_button.on_click(clear_inversion_cache)
 stop_inversion_button.on_click(stop_inversion)
 smps_timing_button.on_click(update_smps_timing_plot)
 charge_comparison_button.on_click(update_charge_comparison)
@@ -6218,7 +6384,7 @@ inversion_plot.param.watch(on_inversion_heatmap_click, "click_data")
 inversion_plot.param.watch(on_inversion_heatmap_selection, "selected_data")
 
 
-for w in [
+SETTINGS_WIDGETS = [
     scan_root,
     save_root,
     n_scans_plot,
@@ -6231,6 +6397,7 @@ for w in [
     auto_interval_min,
     auto_file_age_sec,
     daily_overwrite_checkbox,
+    inversion_cache_enabled,
     dma_L,
     dma_r1,
     dma_r2,
@@ -6298,7 +6465,10 @@ for w in [
     low_value_lift_alpha,
     tube_segments,
     inversion_methods,
-]:
+]
+INVERSION_INPUT_WIDGETS = SETTINGS_WIDGETS + [use_zratio_checkbox, scan_files]
+
+for w in SETTINGS_WIDGETS:
     w.param.watch(lambda event: save_settings(), "value")
 
 
@@ -6350,6 +6520,8 @@ diagnostic_controls = pn.Column(
 automation_controls = pn.Column(
     pn.Row(save_root),
     pn.Row(auto_checkbox, daily_overwrite_checkbox, auto_interval_min, auto_file_age_sec),
+    pn.Row(inversion_cache_enabled, clear_inversion_cache_button),
+    cache_status,
 )
 
 controls = pn.Column(
@@ -6361,7 +6533,7 @@ controls = pn.Column(
         dynamic=True,
     ),
     pn.Row(
-        plot_button, invert_button, stop_inversion_button,
+        plot_button, invert_button, recalculate_inversion_button, stop_inversion_button,
         smps_timing_button, save_button, status,
     ),
 )
@@ -6396,6 +6568,7 @@ def start_app():
     global auto_callback, shared_sync_callback
 
     print(f"DMPS inversion GUI {APP_VERSION}: {Path(__file__).resolve()}", flush=True)
+    update_inversion_cache_status()
     refresh_scan_files()
     if auto_callback is None:
         auto_callback = pn.state.add_periodic_callback(
