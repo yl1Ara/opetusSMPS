@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -117,6 +118,64 @@ class InversionDiagnosticTests(unittest.TestCase):
             medians = online_app.build_median_distributions(result)
         self.assertEqual(len(medians), 1)
         self.assertEqual(medians[0]["pairing"], "unpaired")
+
+    def test_comparison_shift_changes_matches_without_mutating_inversion_times(self):
+        recorded = pd.DatetimeIndex(["2026-09-25 12:00:00"])
+        result = [{
+            "kind": "heatmap", "method": "test", "polarity": "positive",
+            "x": recorded, "y": np.array([10.0, 20.0, 40.0]),
+            "Z": np.full((3, 1), 200.0), "flow_rel_rmse": [0.0],
+        }]
+        reference = pd.DataFrame([
+            (pd.Timestamp("2026-09-25 11:57:50"), size, 100.0)
+            for size in (10.0, 20.0, 40.0)
+        ] + [
+            (pd.Timestamp("2026-09-25 12:01:00"), size, 500.0)
+            for size in (10.0, 20.0, 40.0)
+        ], columns=["time", "size_nm", "smear_conc"])
+        with patch.object(online_app, "load_smeariii_sum_range", return_value=reference):
+            with patch.object(
+                online_app, "smear_comparison_time_offset_sec", SimpleNamespace(value=0.0),
+            ):
+                before = online_app.build_median_distributions(result)
+            with patch.object(
+                online_app, "smear_comparison_time_offset_sec", SimpleNamespace(value=-130.0),
+            ):
+                after = online_app.build_median_distributions(result)
+                ratio = online_app.build_scan_smeariii_comparison_heatmaps(result)
+
+        self.assertAlmostEqual(before[1]["median"][1], 500.0)
+        self.assertAlmostEqual(after[1]["median"][1], 100.0)
+        self.assertEqual(after[0]["time_start"], pd.Timestamp("2026-09-25 11:57:50"))
+        self.assertEqual(pd.Timestamp(ratio[("test", "positive")]["x"][0]), after[0]["time_start"])
+        self.assertEqual(result[0]["x"][0], recorded[0])
+
+    def test_timing_score_reports_additional_shift_after_configured_offset(self):
+        times = pd.date_range("2026-09-25 12:00", periods=4, freq="10min")
+        sizes = np.array([10.0, 20.0, 40.0])
+        result = [{
+            "kind": "heatmap", "method": "test", "polarity": "positive",
+            "x": times, "y": sizes,
+            "Z": np.tile([100.0, 150.0, 220.0, 180.0], (3, 1)),
+        }]
+        reference = pd.DataFrame([
+            (time - pd.Timedelta(seconds=130), size, concentration)
+            for time, concentration in zip(times, [100.0, 150.0, 220.0, 180.0])
+            for size in sizes
+        ], columns=["time", "size_nm", "smear_conc"])
+        reference["time"] = reference["time"].astype("datetime64[us]")
+        with (
+            patch.object(online_app, "load_smeariii_sum_range", return_value=reference),
+            patch.object(online_app, "smps_timing_match_tolerance_min", SimpleNamespace(value=0.1)),
+        ):
+            with patch.object(online_app, "smear_comparison_time_offset_sec", SimpleNamespace(value=0.0)):
+                original = online_app.plot_smps_timing_diagnostics(result)
+            with patch.object(online_app, "smear_comparison_time_offset_sec", SimpleNamespace(value=-130.0)):
+                adjusted = online_app.plot_smps_timing_diagnostics(result)
+
+        self.assertIn("best additional -130 s", original.layout.title.text)
+        self.assertIn("configured -130 s, best additional +0 s", adjusted.layout.title.text)
+        self.assertEqual(result[0]["x"][0], times[0])
 
     def test_poisson_concentration_uncertainty_uses_effective_count(self):
         sigma = poisson_concentration_standard_deviation(

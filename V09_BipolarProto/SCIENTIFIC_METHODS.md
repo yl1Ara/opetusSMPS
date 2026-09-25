@@ -67,6 +67,13 @@ growth-rate cross-check.
   onto the inversion's measured diameter bins. Difference Diagnostics applies
   the same matching to the latest three hours; the two periods can still have
   different aerosol populations.
+- The optional **our-to-SMEAR comparison time shift** applies to the Pi's
+  timestamps only in SMEAR comparison plots and nearest-scan matching. Negative
+  values move our comparison clock earlier. It never changes recorded scan
+  times, standalone inversion heatmaps, SMPS settling time, or the transfer
+  model. The SMPS timing diagnostic then reports the *additional* best shift
+  beyond the configured value; a best shift is a matching diagnostic, not an
+  independent clock measurement.
 - Particle formation diagnostics report a three-term apparent budget in
   `cm-3 s-1`:
   accumulation `dN/dt`, growth outflux `GR*N/(d2-d1)`, and neutral Brownian

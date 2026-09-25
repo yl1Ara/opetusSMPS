@@ -70,6 +70,7 @@ DEFAULT_SETTINGS = {
         "/home/ubuntu/university/2026/smps"
         if Path("/home/ubuntu/university/2026/smps").is_dir() else "SMEARIII"
     ),
+    "smear_comparison_time_offset_sec": 0.0,
     "save_root": "~/OneDrive/DMPS_inversions",
     "n_scans_plot": 200,
     "scan_selection_mode": "Newest N",
@@ -297,6 +298,7 @@ def save_settings():
     settings = {
         "scan_root": scan_root.value,
         "smeariii_sum_root": smeariii_sum_root.value,
+        "smear_comparison_time_offset_sec": float(smear_comparison_time_offset_sec.value),
         "save_root": save_root.value,
         "n_scans_plot": int(n_scans_plot.value),
         "scan_selection_mode": scan_selection_mode.value,
@@ -651,6 +653,7 @@ def save_data(event=None):
                     "time": pd.to_datetime(tr["x"]),
                     "scan_source": scan_source_for_root(scan_root.value),
                     "scan_root": scan_root.value,
+                    "smear_comparison_time_offset_sec": float(smear_comparison_time_offset_sec.value),
                     "temperature_k": tr["temperature_k"],
                     "pressure_pa": tr["pressure_pa"],
                     "condition_source": tr.get("condition_source", "unknown"),
@@ -1556,6 +1559,31 @@ def result_time_range(result):
     return times.min(), times.max()
 
 
+def smear_comparison_offset():
+    seconds = float(smear_comparison_time_offset_sec.value)
+    if not np.isfinite(seconds):
+        raise ValueError("Our-to-SMEAR comparison offset must be finite")
+    return pd.Timedelta(seconds=seconds)
+
+
+def smear_comparison_time_label():
+    return f"our timestamps {float(smear_comparison_time_offset_sec.value):+g} s vs SMEAR"
+
+
+def time_for_smear_comparison(times):
+    """Shift our timestamps only when plotting or matching against SMEAR."""
+    return pd.to_datetime(times) + smear_comparison_offset()
+
+
+def result_for_smear_comparison(result):
+    """Give SMEAR diagnostics shifted timestamps without altering inversion data."""
+    return [
+        {**item, "x": time_for_smear_comparison(item["x"])}
+        if item.get("kind") in {"heatmap", "ntot"} and "x" in item else item
+        for item in result
+    ]
+
+
 def three_day_median_window(result):
     t0, t1 = result_time_range(result)
     if t0 is None:
@@ -1567,10 +1595,11 @@ def three_day_median_window(result):
 
 
 def build_median_distributions(result):
-    start, end = three_day_median_window(result)
+    comparison_result = result_for_smear_comparison(result)
+    start, end = three_day_median_window(comparison_result)
     medians = []
 
-    for tr in result:
+    for tr in comparison_result:
         if tr.get("kind") != "heatmap":
             continue
         z = np.asarray(tr["Z"], dtype=float)
@@ -1609,7 +1638,7 @@ def build_median_distributions(result):
     smear = load_smeariii_sum_range(start, end)
     if not smear.empty:
         paired = diag.build_last_hours_smear_difference(
-            result, smear, min_size_nm=float(smallest_size.value),
+            comparison_result, smear, min_size_nm=float(smallest_size.value),
             peak_min_size_nm=float(difference_peak_min_size_nm.value),
             ntot_limit=float(ntot_plot_max.value), hours=72,
         )
@@ -1682,7 +1711,7 @@ def build_scan_smeariii_comparison_heatmaps(result):
     if not heatmaps:
         return {}
 
-    times = pd.to_datetime([t for tr in heatmaps for t in tr["x"]])
+    times = pd.to_datetime([t for tr in heatmaps for t in time_for_smear_comparison(tr["x"])])
     if len(times) == 0:
         return {}
 
@@ -1699,7 +1728,7 @@ def build_scan_smeariii_comparison_heatmaps(result):
         our_rows = []
         sizes = np.asarray(tr["y"], dtype=float)
         z = np.asarray(tr["Z"], dtype=float)
-        for t, col in zip(pd.to_datetime(tr["x"]), z.T):
+        for t, col in zip(time_for_smear_comparison(tr["x"]), z.T):
             for size_nm, conc in zip(sizes, col):
                 if np.isfinite(size_nm) and np.isfinite(conc):
                     our_rows.append((t, size_nm, conc))
@@ -2032,6 +2061,18 @@ smeariii_sum_root = pn.widgets.TextInput(
     name="SMEAR III SMPS .sum reference folder",
     value=settings.get("smeariii_sum_root", DEFAULT_SETTINGS["smeariii_sum_root"]),
     width=700,
+)
+smear_comparison_time_offset_sec = pn.widgets.FloatInput(
+    name="Our → SMEAR comparison time shift (s)",
+    value=float(settings.get(
+        "smear_comparison_time_offset_sec",
+        DEFAULT_SETTINGS["smear_comparison_time_offset_sec"],
+    )),
+    step=10.0,
+    width=260,
+)
+refresh_smear_comparisons_button = pn.widgets.Button(
+    name="Apply time shift to plots", button_type="primary",
 )
 scan_source_note = pn.pane.Markdown(scan_source_description(scan_source.value))
 
@@ -4901,19 +4942,20 @@ def on_inversion_heatmap_click(event):
             event.new, inversion_plot.object, latest_inversion,
             modal_fit_modes.value, modal_fit_min_nm.value, modal_fit_max_nm.value))
 
-def plot_inversion_result(result):
+def plot_inversion_result(result, preserve_interactions=False):
     global latest_growth_diagnostics, latest_growth_settings
     global latest_modal_analysis, latest_formation_diagnostics
     global latest_quality_dashboard, latest_mode_tracks
-    latest_modal_analysis = None
-    saved_roi_analyses.clear()
-    roi_history.object = pd.DataFrame()
-    roi_plot.object = None
-    roi_growth_plot.object = None
-    roi_status.object = "ROI history reset for the new inversion result."
-    roi_feedback.object = "Drag across inverted heatmap cells to analyze an ROI."
-    modal_fit_plot.object = None
-    modal_fit_status.object = "Click an inverted heatmap to inspect and fit that scan's size distribution."
+    if not preserve_interactions:
+        latest_modal_analysis = None
+        saved_roi_analyses.clear()
+        roi_history.object = pd.DataFrame()
+        roi_plot.object = None
+        roi_growth_plot.object = None
+        roi_status.object = "ROI history reset for the new inversion result."
+        roi_feedback.object = "Drag across inverted heatmap cells to analyze an ROI."
+        modal_fit_plot.object = None
+        modal_fit_status.object = "Click an inverted heatmap to inspect and fit that scan's size distribution."
     heatmaps = [tr for tr in result if tr["kind"] == "heatmap"]
     latest_mode_tracks = (
         diag.build_temporal_mode_diagnostics(result)
@@ -4983,7 +5025,9 @@ def plot_inversion_result(result):
     smear_cpc = pd.DataFrame(columns=["time", "SMEARIII_CPC"])
     if result_t0 is not None:
         try:
-            smear_cpc = load_smeariii_cpc_for_times([result_t0, result_t1])
+            smear_cpc = load_smeariii_cpc_for_times(
+                time_for_smear_comparison([result_t0, result_t1]),
+            )
         except Exception as e:
             print(f"Could not load SMEAR III CPC for scatter plots: {e}", flush=True)
 
@@ -4991,7 +5035,9 @@ def plot_inversion_result(result):
         f"{scan_source_for_root(scan_root.value)}: {method_label(method)} {polarity} inverted heatmap"
         for method, polarity in heatmap_keys
     ]
-    subplot_titles.extend(["Ntot", "Estimated Zn/Zp ratio"])
+    subplot_titles.extend([
+        f"Ntot ({smear_comparison_time_label()})", "Estimated Zn/Zp ratio",
+    ])
     if effective_zratio_diagnostic is not None:
         if effective_zratio_diagnostic.get("status") == "ok":
             summary = (
@@ -5021,19 +5067,20 @@ def plot_inversion_result(result):
         subplot_titles.append("NPF concentration, three-term apparent J budget in hover")
     if scan_health:
         subplot_titles.append("Scan health")
-    median_start, median_end = three_day_median_window(result)
+    median_start, median_end = three_day_median_window(result_for_smear_comparison(result))
     paired_median = bool(median_distributions and median_distributions[0].get("pairing") == "paired")
     if paired_median:
         paired_start = min(item["time_start"] for item in median_distributions)
         paired_end = max(item["time_end"] for item in median_distributions)
         median_title = (
             f"Paired median dN/dlog10Dp: actual {paired_start:%Y-%m-%d %H:%M} "
-            f"to {paired_end:%Y-%m-%d %H:%M} (within latest 72 h, ≤15 min match)"
+            f"to {paired_end:%Y-%m-%d %H:%M} (≤15 min match; {smear_comparison_time_label()})"
         )
     elif median_start is not None:
         median_title = (
             "Our median dN/dlog10Dp; no paired SMEAR reference "
-            f"({median_start:%Y-%m-%d %H:%M} to {median_end:%Y-%m-%d %H:%M})"
+            f"({median_start:%Y-%m-%d %H:%M} to {median_end:%Y-%m-%d %H:%M}; "
+            f"{smear_comparison_time_label()})"
         )
     else:
         median_title = "No paired median dN/dlog10Dp"
@@ -5047,7 +5094,8 @@ def plot_inversion_result(result):
         for diff in polarity_differences
     )
     subplot_titles.extend(
-        f"{method_label(method)} {polarity} our / SMEAR III SMPS ratio"
+        f"{method_label(method)} {polarity} our / SMEAR III SMPS ratio "
+        f"({smear_comparison_time_label()})"
         for method, polarity in comparison_keys
     )
 
@@ -5192,7 +5240,7 @@ def plot_inversion_result(result):
                 multiplier=8.0,
             )
             fig.add_scatter(
-                x=tr["x"],
+                x=time_for_smear_comparison(tr["x"]),
                 y=y_ntot,
                 error_y=dict(
                     type="data",
@@ -5205,7 +5253,7 @@ def plot_inversion_result(result):
                 name=f"{method_label(method)} Ntot {tr['polarity']}",
                 hovertemplate=(
                     f"inversion={method_label(method)} {tr['polarity']}<br>"
-                    "time=%{x|%Y-%m-%d %H:%M}<br>"
+                    "SMEAR comparison time=%{x|%Y-%m-%d %H:%M}<br>"
                     "inverted Ntot=%{y:.2f}"
                     + uncertainty_hover
                     + "<extra></extra>"
@@ -5222,7 +5270,7 @@ def plot_inversion_result(result):
                     multiplier=8.0,
                 )
                 fig.add_scatter(
-                    x=tr["x"],
+                    x=time_for_smear_comparison(tr["x"]),
                     y=y_measured,
                     mode="markers",
                     marker_symbol="x",
@@ -5230,7 +5278,7 @@ def plot_inversion_result(result):
                     name=f"Measured Ntot",
                     hovertemplate=(
                         f"source=our CPC Ntot ({method_label(method)} {tr['polarity']} scan times)<br>"
-                        "time=%{x|%Y-%m-%d %H:%M}<br>"
+                        "SMEAR comparison time=%{x|%Y-%m-%d %H:%M}<br>"
                         "our CPC Ntot=%{y:.2f}<extra></extra>"
                     ),
                     row=ntot_row,
@@ -5257,7 +5305,9 @@ def plot_inversion_result(result):
                     smear_cpc_added = True
 
                 if not cpc_scatter_added and "y_measured" in tr and tr["polarity"] == "positive":
-                    matched = match_to_smeariii_cpc(tr["x"], tr["y_measured"], smear_cpc)
+                    matched = match_to_smeariii_cpc(
+                        time_for_smear_comparison(tr["x"]), tr["y_measured"], smear_cpc,
+                    )
                     matched = diag.filter_ntot_matches(matched, float(ntot_plot_max.value))
                     if not matched.empty:
                         scatter_max = max(
@@ -5288,7 +5338,9 @@ def plot_inversion_result(result):
                         )
                         cpc_scatter_added = True
 
-            matched = match_to_smeariii_cpc(tr["x"], tr["y"], smear_cpc)
+            matched = match_to_smeariii_cpc(
+                time_for_smear_comparison(tr["x"]), tr["y"], smear_cpc,
+            )
             matched = diag.filter_ntot_matches(matched, float(ntot_plot_max.value))
             if not matched.empty:
                 inversion_scatter_max = max(
@@ -5930,7 +5982,8 @@ def plot_residual_diagnostics(result):
 def plot_difference_diagnostics(result):
     global latest_difference_diagnostics
 
-    t0, t1 = result_time_range(result)
+    comparison_result = result_for_smear_comparison(result)
+    t0, t1 = result_time_range(comparison_result)
     if t1 is None:
         difference_plot.object = None
         latest_difference_diagnostics = None
@@ -5938,7 +5991,7 @@ def plot_difference_diagnostics(result):
 
     smear = load_smeariii_sum_range(t1 - pd.Timedelta(hours=3, minutes=30), t1 + pd.Timedelta(minutes=15))
     diagnostics = diag.build_last_hours_smear_difference(
-        result,
+        comparison_result,
         smear,
         min_size_nm=float(smallest_size.value),
         peak_min_size_nm=float(difference_peak_min_size_nm.value),
@@ -6055,7 +6108,8 @@ def plot_difference_diagnostics(result):
     fig.update_layout(
         height=1800,
         width=1300,
-        title=f"Last 3 h {scan_source_for_root(scan_root.value)} vs SMEAR III difference diagnostics",
+        title=(f"Last 3 h {scan_source_for_root(scan_root.value)} vs SMEAR III "
+               f"difference diagnostics ({smear_comparison_time_label()})"),
         showlegend=True,
         margin=dict(l=50, r=260, t=70, b=40),
         legend=dict(x=1.02, y=1.0),
@@ -6116,7 +6170,7 @@ def _representative_timing_offsets(offset_min, offset_max):
     return unique
 
 
-def _plot_smps_timing_without_smear(heatmaps, offset_min, offset_max):
+def _plot_smps_timing_without_smear(heatmaps, offset_min, offset_max, configured_seconds=0.0):
     offsets = _representative_timing_offsets(offset_min, offset_max)
     fig = make_subplots(
         rows=3,
@@ -6142,10 +6196,10 @@ def _plot_smps_timing_without_smear(heatmaps, offset_min, offset_max):
             summaries.append(label)
             for offset in offsets:
                 fig.add_scatter(
-                    x=our["time"] + pd.to_timedelta(offset, unit="s"),
+                    x=our["time"] + pd.to_timedelta(configured_seconds + offset, unit="s"),
                     y=our["ntot"],
                     mode="lines+markers",
-                    name=f"{label} Ntot {offset:.0f}s",
+                    name=f"{label} Ntot total shift {configured_seconds + offset:+.0f}s",
                     hovertemplate="shifted time=%{x|%Y-%m-%d %H:%M:%S}<br>Ntot=%{y:.2f}<extra></extra>",
                     row=1,
                     col=1,
@@ -6154,10 +6208,10 @@ def _plot_smps_timing_without_smear(heatmaps, offset_min, offset_max):
         if not modes.empty:
             for offset in offsets:
                 fig.add_scatter(
-                    x=modes["time"] + pd.to_timedelta(offset, unit="s"),
+                    x=modes["time"] + pd.to_timedelta(configured_seconds + offset, unit="s"),
                     y=modes["mode_dp_nm"],
                     mode="lines+markers",
-                    name=f"{label} mode {offset:.0f}s",
+                    name=f"{label} mode total shift {configured_seconds + offset:+.0f}s",
                     customdata=modes["mode_conc"],
                     hovertemplate=(
                         "shifted time=%{x|%Y-%m-%d %H:%M:%S}<br>"
@@ -6200,7 +6254,7 @@ def _plot_smps_timing_without_smear(heatmaps, offset_min, offset_max):
         width=1300,
         title=(
             "SMPS timing diagnostics without SMEAR: external timing score unavailable; "
-            "offsets only shift scan timestamps"
+            f"configured shift {configured_seconds:+g} s plus trial offsets only shift timestamps"
         ),
         showlegend=True,
         margin=dict(l=50, r=260, t=90, b=40),
@@ -6233,9 +6287,14 @@ def _smear_integrated_series(smear, event_sizes):
 
 def _match_smps_timing(our, smear_ntot, offset_sec, tolerance_min):
     shifted = our.copy()
-    shifted["match_time"] = shifted["time"] + pd.to_timedelta(float(offset_sec), unit="s")
+    shifted["match_time"] = (
+        pd.to_datetime(shifted["time"]).astype("datetime64[ns]")
+        + pd.to_timedelta(float(offset_sec), unit="s")
+    )
     smear_for_match = smear_ntot.rename(columns={"time": "smear_time"}).copy()
-    smear_for_match["match_time"] = smear_for_match["smear_time"]
+    smear_for_match["match_time"] = pd.to_datetime(
+        smear_for_match["smear_time"],
+    ).astype("datetime64[ns]")
     matched = pd.merge_asof(
         shifted.sort_values("match_time"),
         smear_for_match.sort_values("match_time"),
@@ -6273,6 +6332,7 @@ def plot_smps_timing_diagnostics(result=None, event=None):
 
     offset_min = float(smps_timing_offset_min_sec.value)
     offset_max = float(smps_timing_offset_max_sec.value)
+    configured_seconds = smear_comparison_offset().total_seconds()
     offset_step = abs(float(smps_timing_offset_step_sec.value))
     tolerance_min = max(0.1, float(smps_timing_match_tolerance_min.value))
     if offset_step <= 0 or not np.isfinite(offset_step):
@@ -6282,11 +6342,11 @@ def plot_smps_timing_diagnostics(result=None, event=None):
 
     offsets = np.arange(offset_min, offset_max + 0.5 * offset_step, offset_step)
     smear = load_smeariii_sum_range(
-        t0 - pd.Timedelta(minutes=tolerance_min) + pd.to_timedelta(offset_min, unit="s"),
-        t1 + pd.Timedelta(minutes=tolerance_min) + pd.to_timedelta(offset_max, unit="s"),
+        t0 - pd.Timedelta(minutes=tolerance_min) + pd.to_timedelta(configured_seconds + offset_min, unit="s"),
+        t1 + pd.Timedelta(minutes=tolerance_min) + pd.to_timedelta(configured_seconds + offset_max, unit="s"),
     )
     if smear.empty:
-        return _plot_smps_timing_without_smear(heatmaps, offset_min, offset_max)
+        return _plot_smps_timing_without_smear(heatmaps, offset_min, offset_max, configured_seconds)
 
     fig = make_subplots(
         rows=4,
@@ -6294,7 +6354,7 @@ def plot_smps_timing_diagnostics(result=None, event=None):
         shared_xaxes=False,
         vertical_spacing=0.07,
         subplot_titles=[
-            "Our inverted Ntot and SMEAR Ntot at best timing offset",
+            "Our inverted Ntot and SMEAR Ntot at configured and best additional shift",
             "Timing fit error vs offset",
             "Timing fit correlation vs offset",
             "Best-offset Ntot scatter",
@@ -6314,7 +6374,9 @@ def plot_smps_timing_diagnostics(result=None, event=None):
         scores = []
         matches_by_offset = {}
         for offset in offsets:
-            matched, rmse, corr = _match_smps_timing(our, smear_ntot, offset, tolerance_min)
+            matched, rmse, corr = _match_smps_timing(
+                our, smear_ntot, configured_seconds + offset, tolerance_min,
+            )
             scores.append((offset, rmse, corr, len(matched)))
             matches_by_offset[float(offset)] = matched
 
@@ -6324,8 +6386,13 @@ def plot_smps_timing_diagnostics(result=None, event=None):
             continue
         best = valid_scores.sort_values(["log_rmse", "offset_sec"]).iloc[0]
         best_offset = float(best["offset_sec"])
+        best_total = configured_seconds + best_offset
         best_matched = matches_by_offset[best_offset]
-        summaries.append(f"{label}: best {best_offset:.0f} s, logRMSE {best['log_rmse']:.3f}, r {best['corr']:.3f}, n {int(best['n'])}")
+        summaries.append(
+            f"{label}: configured {configured_seconds:+.0f} s, best additional "
+            f"{best_offset:+.0f} s (total {best_total:+.0f} s), "
+            f"logRMSE {best['log_rmse']:.3f}, r {best['corr']:.3f}, n {int(best['n'])}"
+        )
 
         fig.add_scatter(
             x=smear_ntot["time"],
@@ -6340,15 +6407,23 @@ def plot_smps_timing_diagnostics(result=None, event=None):
             y=our["ntot"],
             mode="lines+markers",
             line=dict(dash="dot"),
-            name=f"Our raw time {label}",
+            name=f"Our recorded time {label}",
             row=1,
             col=1,
         )
         fig.add_scatter(
-            x=our["time"] + pd.to_timedelta(best_offset, unit="s"),
+            x=our["time"] + pd.to_timedelta(configured_seconds, unit="s"),
             y=our["ntot"],
             mode="lines+markers",
-            name=f"Our best {best_offset:.0f}s {label}",
+            name=f"Our configured {configured_seconds:+.0f}s {label}",
+            row=1,
+            col=1,
+        )
+        fig.add_scatter(
+            x=our["time"] + pd.to_timedelta(best_total, unit="s"),
+            y=our["ntot"],
+            mode="lines+markers",
+            name=f"Our best total {best_total:+.0f}s {label}",
             row=1,
             col=1,
         )
@@ -6367,7 +6442,7 @@ def plot_smps_timing_diagnostics(result=None, event=None):
             y=[best["log_rmse"]],
             mode="markers",
             marker=dict(symbol="diamond", size=12),
-            name=f"Best RMSE {label}",
+            name=f"Best additional {best_offset:+.0f}s {label}",
             row=2,
             col=1,
         )
@@ -6396,14 +6471,14 @@ def plot_smps_timing_diagnostics(result=None, event=None):
             )
 
     if not summaries:
-        return _plot_smps_timing_without_smear(heatmaps, offset_min, offset_max)
+        return _plot_smps_timing_without_smear(heatmaps, offset_min, offset_max, configured_seconds)
 
     fig.update_yaxes(title_text="Ntot", row=1, col=1)
     fig.update_xaxes(title_text="Time", tickformat="%H:%M", row=1, col=1)
     fig.update_yaxes(title_text="log10 ratio RMSE", row=2, col=1)
-    fig.update_xaxes(title_text="Offset applied to our data (s)", row=2, col=1)
+    fig.update_xaxes(title_text=f"Additional shift after configured {configured_seconds:+g} s", row=2, col=1)
     fig.update_yaxes(title_text="log10 N correlation", row=3, col=1)
-    fig.update_xaxes(title_text="Offset applied to our data (s)", row=3, col=1)
+    fig.update_xaxes(title_text=f"Additional shift after configured {configured_seconds:+g} s", row=3, col=1)
     fig.update_xaxes(title_text="Our inverted Ntot", row=4, col=1)
     fig.update_yaxes(title_text="SMEAR integrated Ntot", row=4, col=1)
     fig.update_layout(
@@ -6419,6 +6494,29 @@ def plot_smps_timing_diagnostics(result=None, event=None):
     return fig
 
 
+def refresh_smear_comparison_plots(event=None):
+    """Replot against the shifted SMEAR clock without repeating the inversion."""
+    if latest_inversion is None:
+        status.object = "Run an inversion before applying a SMEAR comparison time shift."
+        return
+    fig = plot_inversion_result(latest_inversion, preserve_interactions=True)
+    difference_fig = plot_difference_diagnostics(latest_inversion)
+    timing_fig = plot_smps_timing_diagnostics(latest_inversion)
+    status_text = f"SMEAR comparisons updated ({smear_comparison_time_label()}); recorded scans unchanged."
+    status.object = status_text
+    publish_shared_state(
+        inversion_fig=fig,
+        growth_signal_fig=growth_signal_plot.object,
+        difference_fig=difference_fig,
+        smps_timing_fig=timing_fig,
+        difference_diagnostics=latest_difference_diagnostics,
+        growth_diagnostics=latest_growth_diagnostics,
+        growth_settings=latest_growth_settings,
+        inversion_result=latest_inversion,
+        status_text=status_text,
+    )
+
+
 def update_smps_timing_plot(event=None):
     return plot_smps_timing_diagnostics()
 
@@ -6427,6 +6525,7 @@ def set_inversion_controls(running):
     invert_button.disabled = bool(running)
     recalculate_inversion_button.disabled = bool(running)
     clear_inversion_cache_button.disabled = bool(running)
+    refresh_smear_comparisons_button.disabled = bool(running)
     stop_inversion_button.disabled = not bool(running)
     for widget in INVERSION_INPUT_WIDGETS:
         widget.disabled = bool(running)
@@ -6774,6 +6873,7 @@ recalculate_inversion_button.on_click(recalculate_inversion)
 clear_inversion_cache_button.on_click(clear_inversion_cache)
 stop_inversion_button.on_click(stop_inversion)
 smps_timing_button.on_click(update_smps_timing_plot)
+refresh_smear_comparisons_button.on_click(refresh_smear_comparison_plots)
 charge_comparison_button.on_click(update_charge_comparison)
 clear_rois_button.on_click(clear_saved_rois)
 roi_selection_tool.param.watch(update_roi_selection_tool, "value")
@@ -6784,6 +6884,7 @@ inversion_plot.param.watch(on_inversion_heatmap_selection, "selected_data")
 SETTINGS_WIDGETS = [
     scan_root,
     smeariii_sum_root,
+    smear_comparison_time_offset_sec,
     save_root,
     n_scans_plot,
     scan_selection_mode,
@@ -6901,7 +7002,11 @@ inversion_controls = pn.Column(
 )
 
 diagnostic_controls = pn.Column(
-    smeariii_sum_root,
+    pn.Row(smeariii_sum_root, smear_comparison_time_offset_sec, refresh_smear_comparisons_button),
+    pn.pane.Markdown(
+        "Negative shifts **our comparison timestamps earlier**; this does not change "
+        "SMPS settling or the recorded scan times."
+    ),
     pn.Row(ntot_plot_max, heatmap_clip, raw_uncertainty),
     pn.Row(growth_models),
     pn.Row(

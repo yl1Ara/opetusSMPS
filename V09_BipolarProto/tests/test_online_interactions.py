@@ -175,6 +175,57 @@ class OnlineInteractionTests(unittest.TestCase):
         self.assertEqual(analysis["selected_cell_count"], 40)
         self.assertEqual(analysis["selected_scan_count"], 2)
 
+    def test_smear_ntot_overlay_shifts_our_plot_but_not_inversion_heatmap(self):
+        times = pd.date_range("2026-09-25 12:00", periods=2, freq="10min")
+        shifted = times - pd.Timedelta(seconds=130)
+        result = [{
+            "kind": "heatmap", "method": "test", "polarity": "positive",
+            "x": times, "y": [10.0, 20.0, 40.0],
+            "Z": np.full((3, 2), 100.0),
+        }, {
+            "kind": "ntot", "method": "test", "polarity": "positive",
+            "x": times, "y": [100.0, 200.0], "y_measured": [110.0, 210.0],
+        }]
+        smear_cpc = pd.DataFrame({
+            "time": shifted, "SMEARIII_CPC": [95.0, 195.0],
+        })
+        with (
+            patch.object(online_app, "smear_comparison_time_offset_sec", SimpleNamespace(value=-130.0)),
+            patch.object(online_app, "load_smeariii_sum_range", return_value=pd.DataFrame()),
+            patch.object(online_app, "load_smeariii_cpc_for_times", return_value=smear_cpc),
+        ):
+            figure = online_app.plot_inversion_result(result)
+
+        heatmap = next(trace for trace in figure.data if trace.type == "heatmap")
+        our_ntot = next(trace for trace in figure.data if trace.name == "test Ntot positive")
+        smear_ntot = next(trace for trace in figure.data if trace.name == "SMEAR III CPC")
+        self.assertEqual(pd.Timestamp(heatmap.x[0]), times[0])
+        self.assertEqual(pd.Timestamp(our_ntot.x[0]), shifted[0])
+        self.assertEqual(pd.Timestamp(smear_ntot.x[0]), shifted[0])
+        self.assertEqual(result[1]["x"][0], times[0])
+
+    def test_apply_comparison_shift_replots_without_reinverting(self):
+        previous = online_app.latest_inversion
+        previous_status = online_app.status.object
+        result, _ = self.heatmap_fixture()
+        online_app.latest_inversion = result
+        try:
+            with (
+                patch.object(online_app, "smear_comparison_time_offset_sec", SimpleNamespace(value=-130.0)),
+                patch.object(online_app, "plot_inversion_result", return_value=go.Figure()) as plot,
+                patch.object(online_app, "plot_difference_diagnostics", return_value=go.Figure()),
+                patch.object(online_app, "plot_smps_timing_diagnostics", return_value=go.Figure()),
+                patch.object(online_app, "publish_shared_state") as publish,
+                patch.object(online_app, "run_inversion_calculation") as invert,
+            ):
+                online_app.refresh_smear_comparison_plots()
+                plot.assert_called_once_with(result, preserve_interactions=True)
+                invert.assert_not_called()
+                self.assertIn("-130", publish.call_args.kwargs["status_text"])
+        finally:
+            online_app.latest_inversion = previous
+            online_app.status.object = previous_status
+
     def test_selected_growth_roi_reports_measured_d50_slope(self):
         sizes = np.geomspace(5.0, 30.0, 80)
         times = pd.date_range("2026-09-25", periods=8, freq="30min")

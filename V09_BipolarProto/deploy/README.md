@@ -300,3 +300,14 @@ moving component peak is marked marginal, since it may reflect broadening.
 The main 72-hour SMEAR median pairs scans within 15 minutes before comparing
 distributions, while Difference Diagnostics uses paired scans from the last
 three hours.
+
+For a consistent clock comparison, set **Our → SMEAR comparison time shift
+(s)** in the instrument tab's Diagnostics controls. For example, `-130`
+places our comparison points 130 seconds earlier. This is separate from
+**SMPS system settling** and does not edit the scan timestamps or the
+standalone inversion heatmap. Click **Apply time shift to plots** to refresh
+the existing inversion's comparison panels without recalculating its transfer
+matrix. The SMPS Timing tab then searches for a best
+*additional* offset; the cross-instrument Comparison tab uses each source's
+configured display offset as well (click **Refresh comparison** there after
+changing an instrument's shift).

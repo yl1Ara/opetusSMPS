@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
+import pandas as pd
 import panel as pn
 
 import online_inversion_viewer as viewer
@@ -56,6 +57,23 @@ class IndependentSourceComparisonTests(unittest.TestCase):
         self.assertEqual(ratios[0], 2.0)
         self.assertTrue(np.isnan(ratios[1]))
 
+    def test_comparison_applies_source_clock_shift_without_changing_scan_data(self):
+        ours = self.heatmap([10, 20, 40], [[100, 200], [100, 200], [100, 200]])
+        reference = self.heatmap([10, 20, 40], [[100, 200], [100, 200], [100, 200]])
+        ours["x"] = ["2026-09-23 12:02:10", "2026-09-23 12:32:10"]
+        original_times = list(ours["x"])
+
+        figure, note = build_comparison_figure(
+            {"Monopolar Pi": [ours], "SMEAR III SMPS": [reference]},
+            "gunn woessner mod", "positive",
+            time_offsets_sec={"Monopolar Pi": -130},
+        )
+
+        self.assertEqual(pd.Timestamp(figure.data[0].x[0]), pd.Timestamp(reference["x"][0]))
+        self.assertEqual(pd.Timestamp(figure.data[1].x[0]), pd.Timestamp(reference["x"][0]))
+        self.assertEqual(ours["x"], original_times)
+        self.assertIn("display shifts", note)
+
     def test_no_overlap_does_not_claim_a_number_comparison(self):
         sources = {
             "UFSMPS": [self.heatmap([2, 3], [[10, 10], [20, 20]])],
@@ -79,10 +97,12 @@ class IndependentSourceComparisonTests(unittest.TestCase):
         modules = {
             "Bipolar Pi (CSC)": SimpleNamespace(
                 shared_state={"lock": threading.Lock(), "latest_inversion": [trace_a]},
+                smear_comparison_time_offset_sec=SimpleNamespace(value=0.0),
                 start_app=lambda: pn.Column(),
             ),
             "SMEAR III SMPS (CSC)": SimpleNamespace(
                 shared_state={"lock": threading.Lock(), "latest_inversion": [trace_b]},
+                smear_comparison_time_offset_sec=SimpleNamespace(value=0.0),
                 start_app=lambda: pn.Column(),
             ),
         }
@@ -151,6 +171,7 @@ class IndependentSourceComparisonTests(unittest.TestCase):
                 "inversion_methods": ["fuchs"],
                 "use_zratio_from_settings": True,
                 "roi_selection_tool": "lasso",
+                "smear_comparison_time_offset_sec": -130.0,
             })
             (sessions / "settings_old.json").write_text(json.dumps(settings))
             with (
@@ -165,6 +186,7 @@ class IndependentSourceComparisonTests(unittest.TestCase):
                     self.assertEqual(first.selected_inversion_methods(), ["fuchs"])
                     self.assertTrue(first.use_zratio_checkbox.value)
                     self.assertEqual(first.roi_selection_tool.value, "lasso")
+                    self.assertEqual(first.smear_comparison_time_offset_sec.value, -130.0)
                     first.qa_lpm.value = 0.81
                     profile = root / "profiles" / "monopolar-pi.json"
                     self.assertEqual(json.loads(profile.read_text())["qa_lpm"], 0.81)
@@ -177,6 +199,7 @@ class IndependentSourceComparisonTests(unittest.TestCase):
                         self.assertEqual(second.selected_inversion_methods(), ["fuchs"])
                         self.assertTrue(second.use_zratio_checkbox.value)
                         self.assertEqual(second.roi_selection_tool.value, "lasso")
+                        self.assertEqual(second.smear_comparison_time_offset_sec.value, -130.0)
                         self.assertEqual(second.scan_source.value, "Monopolar Pi (CSC)")
                     finally:
                         second.inversion_executor.shutdown(wait=False, cancel_futures=True)

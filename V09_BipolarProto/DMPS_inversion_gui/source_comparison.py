@@ -71,6 +71,8 @@ def nearest_number_ratio(times, numbers, reference_times, reference_numbers):
     reference = pd.DataFrame({
         "time": pd.to_datetime(reference_times), "reference_N": reference_numbers,
     })
+    target["time"] = target["time"].astype("datetime64[ns]")
+    reference["time"] = reference["time"].astype("datetime64[ns]")
     valid_reference = reference[
         np.isfinite(reference["reference_N"]) & (reference["reference_N"] > 0)
     ].sort_values("time")
@@ -87,13 +89,23 @@ def nearest_number_ratio(times, numbers, reference_times, reference_numbers):
     ).tolist()
 
 
-def build_comparison_figure(results_by_source, method, polarity, max_concentration=20000):
+def build_comparison_figure(
+    results_by_source, method, polarity, max_concentration=20000,
+    time_offsets_sec=None,
+):
     heatmaps = select_heatmaps(results_by_source, method, polarity)
     if not heatmaps:
         return None, "Run an inversion with this method and polarity in an instrument tab first."
 
+    offsets = dict(time_offsets_sec or {})
+    for source in heatmaps:
+        if not np.isfinite(float(offsets.get(source, 0))):
+            raise ValueError(f"comparison time shift for {source} must be finite")
     bounds = common_diameter_range(heatmaps) if len(heatmaps) >= 2 else None
-    titles = [f"{source} — {method} {polarity}-voltage scan" for source in heatmaps]
+    titles = [
+        f"{source} ({float(offsets.get(source, 0)):+g} s) — {method} {polarity}-voltage scan"
+        for source in heatmaps
+    ]
     if bounds:
         titles.append(f"Measured-range N ({bounds[0]:g}–{bounds[1]:g} nm; no extrapolation)")
         titles.append("N ratio to reference (nearest scan within 15 min)")
@@ -104,17 +116,20 @@ def build_comparison_figure(results_by_source, method, polarity, max_concentrati
     )
     number_series = {}
     for row, (source, trace) in enumerate(heatmaps.items(), start=1):
+        comparison_times = pd.to_datetime(trace["x"]) + pd.to_timedelta(
+            float(offsets.get(source, 0)), unit="s",
+        )
         figure.add_trace(go.Heatmap(
-            x=pd.to_datetime(trace["x"]), y=trace["y"], z=trace["Z"],
+            x=comparison_times, y=trace["y"], z=trace["Z"],
             coloraxis="coloraxis", name=source,
             hovertemplate="time=%{x}<br>Dp=%{y:.2f} nm<br>dN/dlog10Dp=%{z:.1f}<extra>" + source + "</extra>",
         ), row=row, col=1)
         figure.update_yaxes(type="log", title_text="Dp (nm)", row=row, col=1)
         if bounds:
             numbers = number_on_common_support(trace, *bounds)
-            number_series[source] = (trace["x"], numbers)
+            number_series[source] = (comparison_times, numbers)
             figure.add_trace(go.Scatter(
-                x=pd.to_datetime(trace["x"]),
+                x=comparison_times,
                 y=numbers,
                 mode="lines+markers", name=source,
             ), row=len(heatmaps) + 1, col=1)
@@ -137,12 +152,15 @@ def build_comparison_figure(results_by_source, method, polarity, max_concentrati
         figure.update_yaxes(title_text="N ratio", row=ratio_row, col=1)
     figure.update_xaxes(title_text="Time", row=len(titles), col=1)
     figure.update_layout(
-        title="Independent instrument inversions (same color scale)",
+        title="Independent instrument inversions on the SMEAR comparison clock (same color scale)",
         height=max(650, 420 * len(titles)), width=1300,
         coloraxis=dict(colorscale="Viridis", cmin=0, cmax=max(float(max_concentration), 1.0), colorbar=dict(title="dN/dlog10Dp")),
         margin=dict(l=85, r=130, t=85, b=55),
     )
-    note = f"Showing {len(heatmaps)} independently inverted source(s)."
+    note = (
+        f"Showing {len(heatmaps)} independently inverted source(s); per-source "
+        "display shifts do not change recorded scan times or inversion results."
+    )
     if not bounds:
         note += " Run at least two sources with overlapping measured diameters for the common-range N comparison."
     else:

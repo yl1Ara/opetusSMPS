@@ -404,6 +404,7 @@ def start_multi_app():
 
     def refresh_comparison(event=None):
         results = {}
+        time_offsets = {}
         for name, _ in instrument_sources:
             module = source_apps.get(name)
             if module is None:
@@ -412,9 +413,11 @@ def start_multi_app():
                 latest = module.shared_state.get("latest_inversion")
             if latest is not None:
                 results[name] = latest
+                time_offsets[name] = float(module.smear_comparison_time_offset_sec.value)
         figure, message = build_comparison_figure(
             results, comparison_method.value, comparison_polarity.value,
             comparison_clip.value,
+            time_offsets_sec=time_offsets,
         )
         comparison_plot.object = figure
         comparison_status.object = message
