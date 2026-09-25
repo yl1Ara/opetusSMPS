@@ -116,7 +116,9 @@ update_app() {
         fi
     fi
 
-    sudo -v
+    # Some hosts allow passwordless commands but still require a password for
+    # sudo -v (which has no command for a NOPASSWD rule to match).
+    sudo -n true || sudo -v
     if [[ -n "$(git -C "${repo_root}" status --porcelain --untracked-files=normal)" ]]; then
         printf 'Refusing update: repository changed during confirmation.\n' >&2
         return 1
