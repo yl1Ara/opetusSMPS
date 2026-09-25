@@ -7,6 +7,7 @@ import sys
 import time
 import traceback
 import threading
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from concurrent.futures import CancelledError, ThreadPoolExecutor
@@ -43,7 +44,9 @@ from inv_funcs.ltubefl import ltubefl
 # ---------------------------------------------------------------------
 
 APP_ROOT = Path(__file__).resolve().parents[1]
-SETTINGS_FILE = APP_ROOT / "settings_inversion.json"
+# The multi-tab viewer can supply a persistent per-instrument file before
+# importing this module. The global viewer keeps its existing settings file.
+SETTINGS_FILE = Path(globals().get("SETTINGS_FILE", APP_ROOT / "settings_inversion.json"))
 APP_VERSION = (APP_ROOT / "VERSION").read_text().strip()
 INVERSION_CACHE_ROOT = APP_ROOT / ".inversion_cache"
 INVERSION_CACHE = inversion_cache_store.InversionCache(INVERSION_CACHE_ROOT)
@@ -90,6 +93,7 @@ DEFAULT_SETTINGS = {
     "ambient_match_tolerance_min": 30.0,
     "ambient_naive_timezone": "Europe/Helsinki",
     "zratio": 1.60e-4 / 1.35e-4,
+    "use_zratio_from_settings": False,
     "zratio_convention": "Zn/Zp",
     "positive_ion_mobility_m2_Vs": 1.35e-4,
     "positive_ion_mass_amu": 140.0,
@@ -146,6 +150,7 @@ DEFAULT_SETTINGS = {
     "low_value_lift_ratio": 0.85,
     "low_value_lift_alpha": 1.0,
     "inversion_methods": ["gunn woessner mod"],
+    "roi_selection_tool": "select",
     "tube_segments": "tubediameter,tubelength,aflow,angle\n0,1.93,qa,0\n0,2.80,8,0\n0,5.21,1.3,0",
 }
 
@@ -313,6 +318,7 @@ def save_settings():
         "ambient_match_tolerance_min": float(ambient_match_tolerance_min.value),
         "ambient_naive_timezone": ambient_naive_timezone.value,
         "zratio": float(zratio_widget.value),
+        "use_zratio_from_settings": bool(use_zratio_checkbox.value),
         "zratio_convention": "Zn/Zp",
         "positive_ion_mobility_m2_Vs": float(positive_ion_mobility.value),
         "positive_ion_mass_amu": float(positive_ion_mass.value),
@@ -369,9 +375,16 @@ def save_settings():
         "low_value_lift_ratio": float(low_value_lift_ratio.value),
         "low_value_lift_alpha": float(low_value_lift_alpha.value),
         "inversion_methods": selected_inversion_methods(),
+        "roi_selection_tool": roi_selection_tool.value,
         "tube_segments": tube_segments.value,
     }
-    SETTINGS_FILE.write_text(json.dumps(settings, indent=2))
+    temporary = SETTINGS_FILE.with_name(f".{SETTINGS_FILE.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(json.dumps(settings, indent=2))
+        temporary.chmod(0o600)
+        temporary.replace(SETTINGS_FILE)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _json_safe(value):
@@ -2234,7 +2247,10 @@ zratio_estimate_offset = pn.widgets.FloatInput(
     )),
     step=0.05,
 )
-use_zratio_checkbox = pn.widgets.Checkbox(name="Use Zn/Zp from settings", value=False)
+use_zratio_checkbox = pn.widgets.Checkbox(
+    name="Use Zn/Zp from settings",
+    value=bool(settings.get("use_zratio_from_settings", DEFAULT_SETTINGS["use_zratio_from_settings"])),
+)
 
 smallest_size = pn.widgets.FloatInput(
     name="Smallest size (nm)",
@@ -2607,7 +2623,8 @@ inversion_methods = pn.widgets.MultiChoice(
 roi_selection_tool = pn.widgets.Select(
     name="Heatmap ROI tool",
     options={"Rectangle": "select", "Freehand": "lasso"},
-    value="select",
+    value=settings.get("roi_selection_tool", "select")
+    if settings.get("roi_selection_tool") in {"select", "lasso"} else "select",
 )
 
 status = pn.pane.Markdown("Status: idle")
@@ -6503,6 +6520,7 @@ SETTINGS_WIDGETS = [
     ambient_match_tolerance_min,
     ambient_naive_timezone,
     zratio_widget,
+    use_zratio_checkbox,
     positive_ion_mobility,
     positive_ion_mass,
     negative_ion_mass,
@@ -6560,10 +6578,11 @@ SETTINGS_WIDGETS = [
     tube_segments,
     inversion_methods,
 ]
-INVERSION_INPUT_WIDGETS = SETTINGS_WIDGETS + [use_zratio_checkbox, scan_files, scan_source]
+INVERSION_INPUT_WIDGETS = SETTINGS_WIDGETS + [scan_files, scan_source]
 
 for w in SETTINGS_WIDGETS:
     w.param.watch(lambda event: save_settings(), "value")
+roi_selection_tool.param.watch(lambda event: save_settings(), "value")
 
 
 selection_controls = pn.Column(

@@ -1,5 +1,7 @@
 import copy
 import importlib.util
+import json
+import shutil
 import sys
 import threading
 import uuid
@@ -13,15 +15,78 @@ from DMPS_inversion_gui.source_comparison import build_comparison_figure
 
 APP_PATH = Path(__file__).resolve().parent / "DMPS_inversion_gui" / "online_app.py"
 SESSION_SETTINGS_DIR = Path(__file__).resolve().parent / ".session_inversion_settings"
+PROFILE_SETTINGS_DIR = Path.home() / ".local/share/opetusSMPS/inversion-settings"
+SOURCE_PROFILE_KEYS = {
+    "Bipolar Pi (CSC)": "bipolar-pi",
+    "Monopolar Pi (CSC)": "monopolar-pi",
+    "SMEAR III UFSMPS (CSC)": "smeariii-ufsmps",
+    "SMEAR III SMPS (CSC)": "smeariii-smps",
+}
 
 
-def _load_session_app(initial_scan_source=None):
+def _profile_settings_file(profile_key, source_label=None):
+    if profile_key not in {*SOURCE_PROFILE_KEYS.values(), "explorer"}:
+        raise ValueError(f"Unknown inversion settings profile: {profile_key}")
+    PROFILE_SETTINGS_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    profile = PROFILE_SETTINGS_DIR / f"{profile_key}.json"
+    if profile.exists():
+        return profile
+
+    # Migrate the most recently edited tab from the previous session-only
+    # scheme. Keep the old file as an additional backup.
+    if source_label is not None and SESSION_SETTINGS_DIR.exists():
+        sessions = sorted(
+            SESSION_SETTINGS_DIR.glob("settings_*.json"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for session in sessions:
+            try:
+                settings = json.loads(session.read_text())
+            except (OSError, ValueError):
+                continue
+            if global_app.scan_source_for_root(settings.get("scan_root", "")) == source_label:
+                shutil.copyfile(session, profile)
+                break
+
+    if not profile.exists():
+        if global_app.SETTINGS_FILE.exists():
+            shutil.copyfile(global_app.SETTINGS_FILE, profile)
+        else:
+            profile.write_text(json.dumps(global_app.DEFAULT_SETTINGS, indent=2))
+    profile.chmod(0o600)
+    return profile
+
+
+def _comparison_settings_file():
+    PROFILE_SETTINGS_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return PROFILE_SETTINGS_DIR / "comparison.json"
+
+
+def _save_comparison_settings(path, method, polarity, maximum):
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(json.dumps({
+            "method": method, "polarity": polarity, "max_concentration": maximum,
+        }, indent=2))
+        temporary.chmod(0o600)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _load_session_app(initial_scan_source=None, profile_key="explorer"):
     session_id = uuid.uuid4().hex
     module_name = f"DMPS_inversion_gui.online_app_session_{session_id}"
     spec = importlib.util.spec_from_file_location(module_name, APP_PATH)
     module = importlib.util.module_from_spec(spec)
+    module.SETTINGS_FILE = _profile_settings_file(profile_key, initial_scan_source)
     sys.modules[module_name] = module
-    spec.loader.exec_module(module)
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
 
     module.SHARED_STATE_KEY = f"online_inversion_viewer_session_state_{session_id}"
     module.shared_state = pn.state.cache.setdefault(
@@ -45,14 +110,9 @@ def _load_session_app(initial_scan_source=None):
     )
     module.local_shared_version = 0
 
-    SESSION_SETTINGS_DIR.mkdir(exist_ok=True)
-    module.SETTINGS_FILE = SESSION_SETTINGS_DIR / f"settings_{session_id}.json"
-    if initial_scan_source is not None:
+    if initial_scan_source is not None and module.scan_source.value != initial_scan_source:
         module.scan_source.value = initial_scan_source
-    try:
-        module.save_settings()
-    except Exception:
-        pass
+    module.save_settings()
 
     def cleanup_session(session_context):
         for callback_name in ("auto_callback", "shared_sync_callback"):
@@ -62,7 +122,6 @@ def _load_session_app(initial_scan_source=None):
         module.inversion_executor.shutdown(wait=False, cancel_futures=True)
         pn.state.cache.pop(module.SHARED_STATE_KEY, None)
         sys.modules.pop(module_name, None)
-        module.SETTINGS_FILE.unlink(missing_ok=True)
 
     pn.state.on_session_destroyed(cleanup_session)
     return module
@@ -229,7 +288,10 @@ def start_multi_app():
             if name in source_apps:
                 return
             container.objects = [pn.pane.Markdown(f"Loading **{name}**...")]
-            module = _load_session_app(initial_scan_source=source_label)
+            module = _load_session_app(
+                initial_scan_source=source_label,
+                profile_key=SOURCE_PROFILE_KEYS[source_label],
+            )
             source_apps[name] = module
             container.objects = [module.start_app()]
 
@@ -241,16 +303,41 @@ def start_multi_app():
         "Each instrument retains its own settings and result."
     )
     comparison_plot = pn.pane.Plotly(width=1300)
+    comparison_settings_file = _comparison_settings_file()
+    try:
+        comparison_settings = json.loads(comparison_settings_file.read_text())
+    except (OSError, ValueError):
+        comparison_settings = {}
+    saved_method = comparison_settings.get("method")
+    saved_polarity = comparison_settings.get("polarity")
+    saved_maximum = comparison_settings.get("max_concentration")
+    valid_maximum = (
+        isinstance(saved_maximum, (int, float))
+        and not isinstance(saved_maximum, bool)
+        and 0 < saved_maximum < float("inf")
+    )
     comparison_method = pn.widgets.Select(
         name="Charging model", options={label: method for method, label in global_app.INVERSION_METHODS.items()},
-        value="gunn woessner mod",
+        value=saved_method if saved_method in global_app.INVERSION_METHODS else "gunn woessner mod",
     )
     comparison_polarity = pn.widgets.Select(
-        name="DMA voltage sign", options=["positive", "negative"], value="positive",
+        name="DMA voltage sign", options=["positive", "negative"],
+        value=saved_polarity if saved_polarity in {"positive", "negative"} else "positive",
     )
     comparison_clip = pn.widgets.FloatInput(
-        name="Common color maximum (dN/dlog10Dp)", value=20000.0, step=1000.0,
+        name="Common color maximum (dN/dlog10Dp)",
+        value=float(saved_maximum) if valid_maximum else 20000.0,
+        step=1000.0,
     )
+
+    def save_comparison(event=None):
+        _save_comparison_settings(
+            comparison_settings_file, comparison_method.value,
+            comparison_polarity.value, comparison_clip.value,
+        )
+
+    for widget in (comparison_method, comparison_polarity, comparison_clip):
+        widget.param.watch(save_comparison, "value")
     refresh_comparison_button = pn.widgets.Button(
         name="Refresh comparison", button_type="primary",
     )

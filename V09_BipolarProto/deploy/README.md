@@ -265,6 +265,14 @@ The online viewer loads independent **Bipolar Pi**, **Monopolar Pi**,
 tab has its own inversion controls and result. The **Comparison** tab plots
 their independently inverted heatmaps on the same color scale and compares
 measured-range N only over their common diameter interval (when one exists).
+Each instrument tab and **My Explorer** saves its settings under
+`~/.local/share/opetusSMPS/inversion-settings/` on the analysis host. The
+global tab continues to use `settings_inversion.json`. These files survive
+viewer restarts and `inversion update`; the first load of an instrument tab
+imports its latest legacy per-session settings if available. Keep the settings
+directory when replacing the Git checkout. The **Comparison** tab also saves
+its model, polarity, and color-scale maximum in this directory.
+
 Use **Refresh comparison** after new inversions finish; tabs and results are
 personal to that browser session. The **Scan source** selector within each
 tab also supports a custom folder. Select a small number of days before

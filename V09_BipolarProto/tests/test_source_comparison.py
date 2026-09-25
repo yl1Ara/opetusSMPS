@@ -1,5 +1,9 @@
+import json
+import sys
 import threading
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -83,13 +87,16 @@ class IndependentSourceComparisonTests(unittest.TestCase):
             ),
         }
         previous_started = pn.state.cache.get("online_inversion_viewer_global_started")
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
         try:
             with (
                 patch.object(viewer.global_app, "start_app"),
                 patch.object(viewer, "_global_live_tab", return_value=pn.Column()),
+                patch.object(viewer, "PROFILE_SETTINGS_DIR", Path(temporary.name)),
                 patch.object(
                     viewer, "_load_session_app",
-                    side_effect=lambda initial_scan_source: modules[initial_scan_source],
+                    side_effect=lambda initial_scan_source, profile_key: modules[initial_scan_source],
                 ) as load_app,
             ):
                 tabs = viewer.start_multi_app()
@@ -106,6 +113,77 @@ class IndependentSourceComparisonTests(unittest.TestCase):
                 pn.state.cache.pop("online_inversion_viewer_global_started", None)
             else:
                 pn.state.cache["online_inversion_viewer_global_started"] = previous_started
+
+    def test_comparison_controls_survive_reopening_the_viewer(self):
+        previous_started = pn.state.cache.get("online_inversion_viewer_global_started")
+        try:
+            with (
+                TemporaryDirectory() as directory,
+                patch.object(viewer, "PROFILE_SETTINGS_DIR", Path(directory)),
+                patch.object(viewer.global_app, "start_app"),
+                patch.object(viewer, "_global_live_tab", return_value=pn.Column()),
+            ):
+                first = viewer.start_multi_app()
+                method, polarity, clip = first.objects[5].objects[1].objects[:3]
+                method.value = "fuchs"
+                polarity.value = "negative"
+                clip.value = 500.0
+                profile = json.loads((Path(directory) / "comparison.json").read_text())
+                self.assertEqual(profile["max_concentration"], 500.0)
+
+                second = viewer.start_multi_app()
+                reloaded = second.objects[5].objects[1].objects[:3]
+                self.assertEqual([widget.value for widget in reloaded], ["fuchs", "negative", 500.0])
+        finally:
+            if previous_started is None:
+                pn.state.cache.pop("online_inversion_viewer_global_started", None)
+            else:
+                pn.state.cache["online_inversion_viewer_global_started"] = previous_started
+
+    def test_instrument_settings_migrate_and_survive_reloading_the_tab(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            sessions = root / "session-settings"
+            sessions.mkdir()
+            settings = dict(viewer.global_app.DEFAULT_SETTINGS)
+            settings.update({
+                "scan_root": "~/mps/logs/scans", "qa_lpm": 0.7,
+                "inversion_methods": ["fuchs"],
+                "use_zratio_from_settings": True,
+                "roi_selection_tool": "lasso",
+            })
+            (sessions / "settings_old.json").write_text(json.dumps(settings))
+            with (
+                patch.object(viewer, "SESSION_SETTINGS_DIR", sessions),
+                patch.object(viewer, "PROFILE_SETTINGS_DIR", root / "profiles"),
+            ):
+                first = viewer._load_session_app(
+                    initial_scan_source="Monopolar Pi (CSC)", profile_key="monopolar-pi",
+                )
+                try:
+                    self.assertEqual(first.qa_lpm.value, 0.7)
+                    self.assertEqual(first.selected_inversion_methods(), ["fuchs"])
+                    self.assertTrue(first.use_zratio_checkbox.value)
+                    self.assertEqual(first.roi_selection_tool.value, "lasso")
+                    first.qa_lpm.value = 0.81
+                    profile = root / "profiles" / "monopolar-pi.json"
+                    self.assertEqual(json.loads(profile.read_text())["qa_lpm"], 0.81)
+
+                    second = viewer._load_session_app(
+                        initial_scan_source="Monopolar Pi (CSC)", profile_key="monopolar-pi",
+                    )
+                    try:
+                        self.assertEqual(second.qa_lpm.value, 0.81)
+                        self.assertEqual(second.selected_inversion_methods(), ["fuchs"])
+                        self.assertTrue(second.use_zratio_checkbox.value)
+                        self.assertEqual(second.roi_selection_tool.value, "lasso")
+                        self.assertEqual(second.scan_source.value, "Monopolar Pi (CSC)")
+                    finally:
+                        second.inversion_executor.shutdown(wait=False, cancel_futures=True)
+                        sys.modules.pop(second.__name__, None)
+                finally:
+                    first.inversion_executor.shutdown(wait=False, cancel_futures=True)
+                    sys.modules.pop(first.__name__, None)
 
 
 if __name__ == "__main__":
