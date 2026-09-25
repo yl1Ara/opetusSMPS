@@ -2,6 +2,7 @@ import unittest
 import json
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -140,6 +141,39 @@ class OnlineInteractionTests(unittest.TestCase):
         )
         self.assertEqual(click["status"], "ok")
         self.assertAlmostEqual(click["components"][0]["mode_diameter_nm"], 40.0, delta=0.5)
+
+    def test_csc_selection_without_customdata_uses_cell_coordinates(self):
+        result, _ = self.heatmap_fixture()
+        times = pd.DatetimeIndex([
+            "2026-08-01T00:00:00.123456Z", "2026-08-01T00:30:00.123456Z",
+        ])
+        result[0]["x"] = times
+        figure = make_subplots(rows=1, cols=1)
+        figure.add_heatmap(
+            x=times, y=result[0]["y"], z=result[0]["Z"],
+            meta={"kind": "inversion_heatmap", "method": "test", "polarity": "positive"},
+            row=1, col=1,
+        )
+        online_app.add_heatmap_selection_layer(figure, result[0], row=1)
+        layer = figure.data[1]
+        # A real Panel event on CSC had customdata=None. Its Plotly trace held
+        # a serialized mapping, so indexing it by pointNumber raised KeyError.
+        serialized = SimpleNamespace(meta=layer.meta, customdata={"bdata": "encoded"})
+        browser_figure = SimpleNamespace(data=[figure.data[0], serialized])
+        points = [
+            {
+                "curveNumber": 1, "pointNumber": index, "customdata": None,
+                "x": pd.Timestamp(layer.x[index]).strftime("%Y-%m-%d %H:%M:%S.%f")[:-2],
+                "y": float(layer.y[index]),
+            }
+            for index, (size_index, _, _) in enumerate(layer.customdata)
+            if 35 <= size_index < 55
+        ]
+        analysis = online_app.analyze_heatmap_roi(
+            {"points": points}, browser_figure, result, "1",
+        )
+        self.assertEqual(analysis["selected_cell_count"], 40)
+        self.assertEqual(analysis["selected_scan_count"], 2)
 
     def test_selected_growth_roi_reports_measured_d50_slope(self):
         sizes = np.geomspace(5.0, 30.0, 80)

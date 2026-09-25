@@ -4419,11 +4419,11 @@ def plot_aerosol_property_diagnostics(result):
     return fig
 
 
-def selected_heatmap_cell(point, figure):
+def selected_heatmap_cell(point, figure, index_cache=None):
     """Resolve a Plotly point to (heatmap trace, size bin, scan column).
 
-    Panel omits array-valued heatmap pointNumber from browser events. Scatter
-    selection points carry their two grid indices in customdata instead.
+    Panel can omit array-valued heatmap pointNumber and scatter customdata
+    from browser events. The event's x/y coordinates remain available.
     """
     if figure is None:
         return None
@@ -4442,9 +4442,11 @@ def selected_heatmap_cell(point, figure):
         if grid_index is None:
             point_index = point.get("pointNumber", point.get("pointIndex"))
             try:
-                grid_index = selected_trace.customdata[int(point_index)]
-            except (TypeError, ValueError, IndexError):
-                return None
+                customdata = selected_trace.customdata
+                if isinstance(customdata, (list, tuple, np.ndarray)):
+                    grid_index = customdata[int(point_index)]
+            except (TypeError, ValueError, IndexError, KeyError):
+                grid_index = None
         curve_number = next((index for index, trace in enumerate(figure.data)
                              if isinstance(trace.meta, dict)
                              and trace.meta.get("kind") == "inversion_heatmap"
@@ -4454,31 +4456,39 @@ def selected_heatmap_cell(point, figure):
             return None
     elif metadata.get("kind") == "inversion_heatmap":
         grid_index = point.get("pointNumber", point.get("pointIndex"))
-        if not isinstance(grid_index, (list, tuple, np.ndarray)) or len(grid_index) != 2:
-            trace = figure.data[curve_number]
-            try:
-                clicked_time = pd.Timestamp(point["x"])
-                clicked_size = float(point["y"])
-                times = pd.DatetimeIndex(pd.to_datetime(trace.x, errors="coerce"))
-                sizes = np.asarray(trace.y, dtype=float)
-                if pd.isna(clicked_time) or not np.isfinite(clicked_size) or times.isna().all():
-                    return None
-                if times.tz is not None and clicked_time.tz is None:
-                    clicked_time = clicked_time.tz_localize(times.tz)
-                elif times.tz is None and clicked_time.tz is not None:
-                    clicked_time = clicked_time.tz_localize(None)
-                grid_index = (
-                    int(np.nanargmin(abs(sizes - clicked_size))),
-                    int(np.nanargmin(abs((times - clicked_time).total_seconds()))),
-                )
-            except (KeyError, TypeError, ValueError):
-                return None
     else:
         return None
 
+    if not isinstance(grid_index, (list, tuple, np.ndarray)) or len(grid_index) < 2:
+        try:
+            clicked_time = pd.Timestamp(point["x"])
+            clicked_size = float(point["y"])
+            if pd.isna(clicked_time) or not np.isfinite(clicked_size):
+                return None
+            cache = {} if index_cache is None else index_cache
+            if curve_number not in cache:
+                heatmap = figure.data[curve_number]
+                cache[curve_number] = (
+                    pd.DatetimeIndex(pd.to_datetime(heatmap.x, errors="coerce")),
+                    np.asarray(heatmap.y, dtype=float),
+                )
+            times, sizes = cache[curve_number]
+            if times.isna().all() or not np.any(np.isfinite(sizes)):
+                return None
+            if times.tz is not None and clicked_time.tz is None:
+                clicked_time = clicked_time.tz_localize(times.tz)
+            elif times.tz is None and clicked_time.tz is not None:
+                clicked_time = clicked_time.tz_localize(None)
+            grid_index = (
+                int(np.nanargmin(abs(sizes - clicked_size))),
+                int(np.nanargmin(abs((times - clicked_time).total_seconds()))),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+
     try:
         size_index, time_index = (int(grid_index[0]), int(grid_index[1]))
-    except (TypeError, ValueError, IndexError):
+    except (TypeError, ValueError, IndexError, KeyError):
         return None
     z = np.asarray(figure.data[curve_number].z)
     if z.ndim != 2 or not (0 <= size_index < z.shape[0] and 0 <= time_index < z.shape[1]):
@@ -4595,8 +4605,9 @@ def analyze_heatmap_roi(selection_data, figure, result, mode_setting):
     if not selection_data or figure is None or not selection_data.get("points"):
         return None
     selected_by_curve = {}
+    index_cache = {}
     for point in selection_data["points"]:
-        cell = selected_heatmap_cell(point, figure)
+        cell = selected_heatmap_cell(point, figure, index_cache)
         if cell is None:
             continue
         curve_number, size_index, time_index = cell
