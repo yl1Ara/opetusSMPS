@@ -1,8 +1,10 @@
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
 
+from DMPS_inversion_gui import online_app
 from DMPS_inversion_gui.diagnostics import (
     brownian_coagulation_kernel,
     brownian_coagulation_sink,
@@ -10,6 +12,7 @@ from DMPS_inversion_gui.diagnostics import (
     build_mcc_growth_cross_checks,
     build_formation_rate_diagnostics,
     build_growth_rate_diagnostics,
+    build_last_hours_smear_difference,
     build_quality_dashboard,
     build_temporal_mode_diagnostics,
     distribution_bin_coverage,
@@ -30,6 +33,46 @@ from inv_funcs.cpc_loss import cpc_loss1
 
 
 class InversionDiagnosticTests(unittest.TestCase):
+    def test_median_and_paired_difference_use_latest_scans(self):
+        times = pd.to_datetime([
+            "2026-09-01 12:00", "2026-09-25 11:00", "2026-09-25 12:00",
+        ])
+        sizes = np.array([20.0, 30.0, 40.0])
+        # The older inversion is below SMEAR; the latest two are above it.
+        trace = {
+            "kind": "heatmap", "method": "gunn woessner mod", "polarity": "positive",
+            "x": times, "y": sizes,
+            "Z": np.tile([50.0, 150.0, 150.0], (len(sizes), 1)),
+            "flow_rel_rmse": [0.0, 0.0, 0.0],
+        }
+        smear = pd.DataFrame([
+            (time, size, 100.0) for time in times for size in sizes
+        ], columns=["time", "size_nm", "smear_conc"])
+
+        def reference_in_window(start, end):
+            return smear[smear["time"].between(start, end)]
+
+        with patch.object(online_app, "load_smeariii_sum_range", side_effect=reference_in_window):
+            medians = online_app.build_median_distributions([trace])
+        start, end = online_app.three_day_median_window([trace])
+        self.assertGreater(start, times[0])
+        self.assertGreater(end, times[-1])
+        self.assertAlmostEqual(medians[0]["median"][1], 150.0)
+        self.assertEqual(medians[0]["n_scans"], 2)
+        self.assertEqual(medians[1]["n_scans"], 2)
+
+        difference = build_last_hours_smear_difference(
+            [trace], reference_in_window(times[-1] - pd.Timedelta(hours=3), times[-1]),
+            min_size_nm=10, peak_min_size_nm=20, ntot_limit=10000,
+        )
+        self.assertEqual(difference["shapes"][0]["n_matches"], 2)
+        self.assertAlmostEqual(difference["shapes"][0]["our_median"][1], 150.0)
+        self.assertAlmostEqual(difference["shapes"][0]["smear_median"][1], 100.0)
+        with patch.object(online_app, "load_smeariii_sum_range", side_effect=reference_in_window):
+            figure = online_app.plot_difference_diagnostics([trace])
+        self.assertIn("2026-09-25 09:00 to 2026-09-25 12:00", figure.layout.annotations[3].text)
+        self.assertIn("2 matched", figure.data[1].name)
+
     def test_poisson_concentration_uncertainty_uses_effective_count(self):
         sigma = poisson_concentration_standard_deviation(
             [60.0], sample_flow_lpm=1.0, sample_duration_sec=1.0,

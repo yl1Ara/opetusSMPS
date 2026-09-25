@@ -1543,9 +1543,10 @@ def three_day_median_window(result):
     t0, t1 = result_time_range(result)
     if t0 is None:
         return None, None
-    start = t0.normalize()
-    end = start + pd.Timedelta(days=3)
-    return start, end
+    # Use the latest available scans, matching the right-hand end of the
+    # shorter paired window in the difference diagnostics.
+    end = t1 + pd.Timedelta(microseconds=1)
+    return end - pd.Timedelta(days=3), end
 
 
 def build_median_distributions(result):
@@ -4712,8 +4713,14 @@ def plot_inversion_result(result):
         subplot_titles.append("NPF concentration, three-term apparent J budget in hover")
     if scan_health:
         subplot_titles.append("Scan health")
+    median_start, median_end = three_day_median_window(result)
+    median_title = (
+        f"Last 72 h unpaired median dN/dlog10Dp "
+        f"({median_start:%Y-%m-%d %H:%M} to {median_end:%Y-%m-%d %H:%M})"
+        if median_start is not None else "Last 72 h unpaired median dN/dlog10Dp"
+    )
     subplot_titles.extend([
-        "Three-day median dN/dlog10Dp",
+        median_title,
         "Our CPC Ntot vs SMEAR III CPC",
         "Inverted Ntot vs SMEAR III CPC",
     ])
@@ -5281,7 +5288,7 @@ def plot_inversion_result(result):
             x=median["dp"],
             y=median["median"],
             mode="lines+markers",
-            name=f"Median {median['label']}",
+            name=f"Unpaired 72 h median {median['label']} ({median['n_scans']} scans)",
             error_y=error_y,
             customdata=customdata,
             hovertemplate=(
@@ -5637,15 +5644,16 @@ def plot_difference_diagnostics(result):
         hours=3,
     )
     latest_difference_diagnostics = diagnostics
+    paired_start = t1 - pd.Timedelta(hours=3)
     fig = make_subplots(
         rows=4,
         cols=1,
         vertical_spacing=0.06,
         subplot_titles=[
-            "Last 3 h median our / SMEAR III distribution ratio",
+            "Last 3 h paired-scan median our / SMEAR III ratio (within 15 min)",
             "Integrated concentration match",
             f"Peak diameter shift over time (dp >= {float(difference_peak_min_size_nm.value):.1f} nm)",
-            "Last 3 h median peak shape compared with SMEAR III",
+            f"Paired-scan median dN/dlog10Dp ({paired_start:%Y-%m-%d %H:%M} to {t1:%Y-%m-%d %H:%M})",
         ],
     )
 
@@ -5668,7 +5676,7 @@ def plot_difference_diagnostics(result):
             x=item["size_nm"],
             y=item["our_median"],
             mode="lines+markers",
-            name=f"{label} shape",
+            name=f"{label} paired median ({item['n_matches']} matched)",
             hovertemplate="dp=%{x:.2f} nm<br>our median=%{y:.2f}<extra></extra>",
             row=4,
             col=1,
@@ -5679,7 +5687,7 @@ def plot_difference_diagnostics(result):
                 y=item["smear_median"],
                 mode="lines+markers",
                 line=dict(color="black", dash="dash"),
-                name="SMEAR III shape",
+                name=f"SMEAR III paired median ({item['n_matches']} matched)",
                 hovertemplate="dp=%{x:.2f} nm<br>SMEAR median=%{y:.2f}<extra></extra>",
                 row=4,
                 col=1,
@@ -5745,7 +5753,7 @@ def plot_difference_diagnostics(result):
     fig.update_layout(
         height=1800,
         width=1300,
-        title="Last 3 h DMPS vs SMEAR III difference diagnostics",
+        title=f"Last 3 h {scan_source_for_root(scan_root.value)} vs SMEAR III difference diagnostics",
         showlegend=True,
         margin=dict(l=50, r=260, t=70, b=40),
         legend=dict(x=1.02, y=1.0),
