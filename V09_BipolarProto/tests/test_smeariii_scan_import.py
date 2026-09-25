@@ -12,6 +12,33 @@ from DMPS_inversion_gui import online_app
 
 
 class SmearIIIScanImportTests(unittest.TestCase):
+    def test_smps_gw_inversion_renders_with_microsecond_cpc_times(self):
+        root = Path(__file__).resolve().parents[1] / "SMEARIII"
+        scan = online_app.parse_smeariii_scan_file(root / "DMPS007_20260629.scan")
+        one_scan = scan[scan["scan_id"] == scan["scan_id"].iloc[0]].copy()
+
+        def fake_smear_cpc(times):
+            matched_times = pd.to_datetime(times).astype("datetime64[us]")
+            return pd.DataFrame({
+                "time": matched_times,
+                "SMEARIII_CPC": np.full(len(matched_times), 100.0),
+            })
+
+        with (
+            patch.object(online_app, "scan_inversion_type", SimpleNamespace(value="SMPS")),
+            patch.object(online_app, "smps_correction_mode", SimpleNamespace(value="None")),
+            patch.object(online_app, "inversion_methods", SimpleNamespace(value=["Gunn-Woessner modified"])),
+            patch.object(online_app, "smeariii_sum_root", SimpleNamespace(value=str(root))),
+            patch.object(online_app, "load_smeariii_cpc_for_times", side_effect=fake_smear_cpc),
+        ):
+            result = online_app.run_inversion_calculation(one_scan, use_cache=False)
+            figure = online_app.plot_inversion_result(result)
+            timing = online_app.plot_smps_timing_diagnostics(result)
+
+        self.assertTrue(any(row["kind"] == "heatmap" for row in result))
+        self.assertIsNotNone(figure)
+        self.assertIsNotNone(timing)
+
     def test_synced_folders_offer_scans_and_reference_sum_separately(self):
         fixture = Path(__file__).resolve().parents[1] / "SMEARIII"
         with TemporaryDirectory() as directory:

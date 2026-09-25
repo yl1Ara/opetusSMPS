@@ -1698,15 +1698,17 @@ def load_smeariii_cpc_for_times(times):
 
 def match_to_smeariii_cpc(times, values, smear_cpc):
     df = pd.DataFrame({
-        "time": pd.to_datetime(times),
+        "time": pd.to_datetime(times).astype("datetime64[ns]"),
         "value": pd.to_numeric(values, errors="coerce"),
     }).dropna(subset=["time", "value"])
     if df.empty or smear_cpc.empty:
         return pd.DataFrame(columns=["time", "value", "SMEARIII_CPC"])
 
+    reference = smear_cpc[["time", "SMEARIII_CPC"]].dropna().copy()
+    reference["time"] = pd.to_datetime(reference["time"]).astype("datetime64[ns]")
     matched = pd.merge_asof(
         df.sort_values("time"),
-        smear_cpc[["time", "SMEARIII_CPC"]].dropna().sort_values("time"),
+        reference.sort_values("time"),
         on="time",
         direction="nearest",
         tolerance=pd.Timedelta(minutes=15),
@@ -6598,6 +6600,10 @@ def stop_inversion(event=None):
         running = inversion_running
         future = inversion_future
     if not running:
+        if "failed" in str(status.object).lower():
+            # A queued Stop click must not hide the plotting error that just
+            # finished the job and re-enabled the controls.
+            return
         status.object = "No inversion is running."
         return
 
@@ -6644,12 +6650,39 @@ def run_inversion(event=None, force_recompute=False):
     doc = pn.state.curdoc
     def done_callback(future):
         global inversion_running, inversion_future, latest_inversion, auto_pending_signature
+
+        def complete_on_document(action):
+            def guarded_completion():
+                global inversion_running, inversion_future, auto_pending_signature
+                try:
+                    action()
+                except InversionCancelled:
+                    auto_pending_signature = None
+                    status.object = "Inversion stopped. Previous results were kept."
+                    publish_shared_state(status_text=status.object)
+                except Exception as error:
+                    auto_pending_signature = None
+                    traceback.print_exc()
+                    status.object = f"Inversion computed, but plotting failed: {error}"
+                    publish_shared_state(status_text=status.object)
+                finally:
+                    set_inversion_controls(False)
+                    with inversion_lock:
+                        inversion_running = False
+                        inversion_future = None
+
+            if doc is not None:
+                doc.add_next_tick_callback(guarded_completion)
+            else:
+                guarded_completion()
+
         try:
             result = future.result()
             check_inversion_cancelled(inversion_cancel_event)
             latest_inversion = result
             def finish_success():
                 global auto_pending_signature
+                check_inversion_cancelled(inversion_cancel_event)
 
                 fig = plot_inversion_result(result)
                 residual_fig = plot_residual_diagnostics(result)
@@ -6771,7 +6804,6 @@ def run_inversion(event=None, force_recompute=False):
                     status_text += " Zn/Zp choice has no effect on Wiedensohler charge fractions."
 
                 status.object = status_text
-                set_inversion_controls(False)
                 publish_shared_state(
                     inversion_fig=fig,
                     growth_signal_fig=growth_signal_plot.object,
@@ -6787,36 +6819,21 @@ def run_inversion(event=None, force_recompute=False):
                     status_text=status_text,
                 )
 
-            if doc is not None:
-                doc.add_next_tick_callback(finish_success)
-            else:
-                finish_success()
+            complete_on_document(finish_success)
         except (CancelledError, InversionCancelled):
             auto_pending_signature = None
 
             def finish_stopped():
                 status.object = "Inversion stopped. Previous results were kept."
-                set_inversion_controls(False)
                 publish_shared_state(status_text=status.object)
 
-            if doc is not None:
-                doc.add_next_tick_callback(finish_stopped)
-            else:
-                finish_stopped()
+            complete_on_document(finish_stopped)
         except Exception:
             auto_pending_signature = None
             traceback.print_exc()
             def finish_failed():
                 status.object = "Inversion failed. Check terminal."
-                set_inversion_controls(False)
-            if doc is not None:
-                doc.add_next_tick_callback(finish_failed)
-            else:
-                finish_failed()
-        finally:
-            with inversion_lock:
-                inversion_running = False
-                inversion_future = None
+            complete_on_document(finish_failed)
 
     fut.add_done_callback(done_callback)
 

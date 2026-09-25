@@ -1,6 +1,8 @@
 import unittest
 import json
 import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -203,6 +205,46 @@ class OnlineInteractionTests(unittest.TestCase):
         self.assertEqual(pd.Timestamp(our_ntot.x[0]), shifted[0])
         self.assertEqual(pd.Timestamp(smear_ntot.x[0]), shifted[0])
         self.assertEqual(result[1]["x"][0], times[0])
+
+    def test_smear_cpc_match_accepts_mixed_timestamp_precision(self):
+        our_times = pd.date_range("2026-09-25 10:00", periods=2, freq="5min")
+        smear_cpc = pd.DataFrame({
+            "time": our_times.astype("datetime64[us]"),
+            "SMEARIII_CPC": [100.0, 200.0],
+        })
+        matched = online_app.match_to_smeariii_cpc(
+            our_times.astype("datetime64[ns]"), [110.0, 210.0], smear_cpc,
+        )
+        self.assertEqual(len(matched), 2)
+        self.assertEqual(matched["SMEARIII_CPC"].tolist(), [100.0, 200.0])
+
+    def test_plot_failure_clears_running_state_and_reenables_controls(self):
+        previous_result = online_app.latest_inversion
+        previous_status = online_app.status.object
+        try:
+            with (
+                ThreadPoolExecutor(max_workers=1) as executor,
+                patch.object(online_app, "inversion_executor", executor),
+                patch.object(online_app, "load_selected_scans", return_value=pd.DataFrame({"ready": [1]})),
+                patch.object(online_app, "run_inversion_calculation", return_value=[{"kind": "heatmap"}]),
+                patch.object(online_app, "plot_inversion_result", side_effect=ValueError("plot failed")),
+                patch.object(online_app, "publish_shared_state"),
+                patch.object(online_app.traceback, "print_exc"),
+            ):
+                online_app.run_inversion()
+                for _ in range(100):
+                    if not online_app.inversion_running:
+                        break
+                    time.sleep(0.01)
+                self.assertFalse(online_app.inversion_running)
+                self.assertIsNone(online_app.inversion_future)
+                self.assertFalse(online_app.invert_button.disabled)
+                self.assertIn("plotting failed", online_app.status.object)
+                online_app.stop_inversion()
+                self.assertIn("plotting failed", online_app.status.object)
+        finally:
+            online_app.latest_inversion = previous_result
+            online_app.status.object = previous_status
 
     def test_apply_comparison_shift_replots_without_reinverting(self):
         previous = online_app.latest_inversion
