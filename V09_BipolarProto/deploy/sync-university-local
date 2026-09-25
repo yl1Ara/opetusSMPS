@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Run as the desktop user with the University of Helsinki SMB share mounted in GVfs.
+# Only the university server's route should use eduVPN (Split-tunnel profile).
+stage="${UNIVERSITY_STAGE_DIR:-${HOME}/.local/share/opetusSMPS/university/2026}"
+share="/run/user/$(id -u)/gvfs/smb-share:server=group5.ad.helsinki.fi,share=h527"
+remote="csc:/home/ubuntu/university/2026"
+dry_run=false
+case "${1:-}" in
+    "") ;;
+    --dry-run) dry_run=true ;;
+    *) printf 'Usage: sync-university-local [--dry-run]\n' >&2; exit 2 ;;
+esac
+
+rsync_options=(-a --stats --delay-updates --partial-dir=.rsync-partial)
+if [[ "${dry_run}" == true ]]; then
+    rsync_options+=(--dry-run)
+fi
+
+mkdir -p "${stage}/ufsmps" "${stage}/smps"
+
+stage_failed=false
+university_ip="$(getent ahostsv4 group5.ad.helsinki.fi | { read -r ip _ || true; printf '%s' "${ip:-}"; } || true)"
+route="$(ip -4 route get "${university_ip}" 2>/dev/null || true)"
+if [[ -z "${university_ip}" || " ${route} " != *" dev eduVPN "* ]]; then
+    printf 'Skipping SMB pull: university server is not routed through eduVPN.\n' >&2
+    stage_failed=true
+elif ! mountpoint -q "/run/user/$(id -u)/gvfs" || [[ ! -d "${share}" ]] || \
+    ! timeout 15s stat "${share}/smear/helsinki/particle/smps/rawdata/2026" >/dev/null; then
+    printf 'Skipping SMB pull: h527 is not mounted or is unreachable.\n' >&2
+    stage_failed=true
+else
+    uf_source="${share}/smear/helsinki/particle/ufsmps/rawdata/2026/"
+    smps_source="${share}/smear/helsinki/particle/smps/rawdata/2026/"
+    if ! timeout 45m rsync "${rsync_options[@]}" \
+        --include='*.scan' --exclude='*' \
+        "${uf_source}" "${stage}/ufsmps/"; then
+        printf 'UFSMPS staging failed; completed files remain available for retry.\n' >&2
+        stage_failed=true
+    fi
+    if ! timeout 45m rsync "${rsync_options[@]}" \
+        --include='*20260[6-9]*.scan' --include='*20260[6-9]*.sum' \
+        --include='*20261[0-2]*.scan' --include='*20261[0-2]*.sum' \
+        --exclude='*' "${smps_source}" "${stage}/smps/"; then
+        printf 'SMPS staging failed; completed files remain available for retry.\n' >&2
+        stage_failed=true
+    fi
+fi
+
+# Push completed local files even when eduVPN or the SMB mount is down.
+ssh -o BatchMode=yes -o ConnectTimeout=10 csc \
+    'mkdir -p /home/ubuntu/university/2026/ufsmps /home/ubuntu/university/2026/smps'
+for instrument in ufsmps smps; do
+    rsync "${rsync_options[@]}" --timeout=120 --exclude='/.rsync-partial/' \
+        -e 'ssh -o BatchMode=yes -o ConnectTimeout=10' \
+        "${stage}/${instrument}/" "${remote}/${instrument}/"
+done
+
+if [[ "${stage_failed}" == true ]]; then
+    exit 1
+fi

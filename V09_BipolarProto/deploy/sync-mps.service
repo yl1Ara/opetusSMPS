@@ -1,0 +1,9 @@
+[Unit]
+Description=Sync SMEAR III MPS data from Raspberry Pi
+After=network-online.target tailscaled.service
+Wants=network-online.target tailscaled.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+ExecStart=/usr/local/bin/sync-mps

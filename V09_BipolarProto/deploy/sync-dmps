@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# CSC pulls the instrument's state directory; never remove files already on CSC.
+source_dir="pi@varjo-dmps:/home/pi/Desktop/TDMPS/logs/"
+destination_dir="/home/ubuntu/dmps/logs/"
+ssh_command="ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes -o HostKeyAlias=raspberrypi -o IdentitiesOnly=yes -i /home/ubuntu/.ssh/raspberrypi_sync"
+
+rsync_args=(-a --stats --timeout=120 --delay-updates --partial-dir=.rsync-partial)
+case "${1:-}" in
+    "") ;;
+    --dry-run) rsync_args+=(--dry-run) ;;
+    *) printf 'Usage: sync-dmps [--dry-run]\n' >&2; exit 2 ;;
+esac
+
+mkdir -p "${destination_dir}"
+exec rsync "${rsync_args[@]}" -e "${ssh_command}" "${source_dir}" "${destination_dir}"

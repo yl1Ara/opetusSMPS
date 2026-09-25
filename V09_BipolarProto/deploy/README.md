@@ -182,3 +182,78 @@ Do not automate this command. It stops the viewer before changing source or
 dependencies. A failed validation leaves it stopped; correct the problem,
 rerun `inversion update`, then use `inversion start`. The Pi-specific
 measurement-idle check does not protect online inversion work.
+
+### CSC instrument data pull
+
+The CSC `sync-dmps.timer` runs `/usr/local/bin/sync-dmps` as `ubuntu` every
+30 minutes. The tracked script pulls `/home/pi/Desktop/TDMPS/logs/` from
+`pi@varjo-dmps` into `/home/ubuntu/dmps/logs/` without deleting CSC files.
+It uses `/home/ubuntu/.ssh/raspberrypi_sync` and the Pi's already-verified
+`raspberrypi` SSH host-key entry (via `HostKeyAlias`). To install and check it
+on CSC:
+
+```bash
+cd ~/opetusSMPS/V09_BipolarProto
+sudo install -o root -g root -m 0755 deploy/sync-dmps /usr/local/bin/sync-dmps
+sync-dmps --dry-run
+sudo systemctl start sync-dmps.service
+systemctl status sync-dmps.service --no-pager
+systemctl list-timers sync-dmps.timer --no-pager
+```
+
+The first successful run may copy a backlog of scans. `journalctl -u
+sync-dmps.service` shows the transfer summary or an SSH/rsync error.
+
+The separate SMEAR III monopolar Pi (`pi@mps`) writes to
+`/home/pi/opetusSMPS/V09_BipolarProto/logs/`. Its data belongs under
+`/home/ubuntu/mps/logs/` on CSC, not in the bipolar `dmps` tree. Once CSC
+can SSH to `pi@mps` without an interactive Tailscale check, install and
+enable the independent MPS job:
+
+```bash
+cd ~/opetusSMPS/V09_BipolarProto
+sudo install -o root -g root -m 0755 deploy/sync-mps /usr/local/bin/sync-mps
+sudo install -o root -g root -m 0644 deploy/sync-mps.service /etc/systemd/system/sync-mps.service
+sudo install -o root -g root -m 0644 deploy/sync-mps.timer /etc/systemd/system/sync-mps.timer
+sync-mps --dry-run
+sudo systemctl daemon-reload
+sudo systemctl enable --now sync-mps.timer
+sudo systemctl start sync-mps.service
+systemctl status sync-mps.service --no-pager
+```
+
+If CSC gets a Tailscale SSH web-approval prompt, arrange noninteractive
+access for this host in the tailnet policy before enabling the timer; an
+interactive approval alone will not make unattended sync reliable.
+
+### University SMB data through the desktop
+
+The university SMB share is mounted on the local desktop using eduVPN's
+**Split-tunnel** profile. CSC does not need eduVPN: a local user timer stages
+only `*.scan` from UFSMPS 2026 and `*.scan`/`*.sum` from SMPS dated June 2026
+onward, then pushes completed files to CSC over the existing SSH connection.
+The local stage is `~/.local/share/opetusSMPS/university/2026/{ufsmps,smps}`;
+CSC receives `/home/ubuntu/university/2026/{ufsmps,smps}`. No SMB login or
+VPN configuration is copied to CSC, and no source or CSC files are deleted.
+
+On the desktop, while logged in with eduVPN connected and `h527` mounted in
+the file manager:
+
+```bash
+cd ~/Desktop/Projects/opetusSMPS/V09_BipolarProto
+install -m 0755 deploy/sync-university-local ~/.local/bin/sync-university-local
+install -m 0644 deploy/sync-university-local.service ~/.config/systemd/user/
+install -m 0644 deploy/sync-university-local.timer ~/.config/systemd/user/
+sync-university-local --dry-run
+systemctl --user daemon-reload
+systemctl --user enable --now sync-university-local.timer
+systemctl --user start --no-block sync-university-local.service
+```
+
+The first run stages several gigabytes and may take a while. The timer retries
+every 30 minutes while the desktop's user session is running; when eduVPN or
+the SMB mount is unavailable it skips SMB and still sends previously staged
+files to CSC. Check `systemctl --user status sync-university-local.service`
+and `journalctl --user -u sync-university-local.service` for the outcome.
+The script checks that the university server's route uses `eduVPN`; it does
+not change the default route or connect/disconnect any VPN.

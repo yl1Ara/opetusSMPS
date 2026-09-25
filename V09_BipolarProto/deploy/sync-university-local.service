@@ -1,0 +1,6 @@
+[Unit]
+Description=Stage Helsinki university SMPS scans and send them to CSC
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/sync-university-local
