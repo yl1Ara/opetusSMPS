@@ -257,3 +257,23 @@ files to CSC. Check `systemctl --user status sync-university-local.service`
 and `journalctl --user -u sync-university-local.service` for the outcome.
 The script checks that the university server's route uses `eduVPN`; it does
 not change the default route or connect/disconnect any VPN.
+
+### Inverting the synced scans on CSC
+
+The online viewer loads independent **Bipolar Pi**, **Monopolar Pi**,
+**SMEAR III UFSMPS**, and **SMEAR III SMPS** instrument tabs on demand. Each
+tab has its own inversion controls and result. The **Comparison** tab plots
+their independently inverted heatmaps on the same color scale and compares
+measured-range N only over their common diameter interval (when one exists).
+Use **Refresh comparison** after new inversions finish; tabs and results are
+personal to that browser session. The **Scan source** selector within each
+tab also supports a custom folder. Select a small number of days before
+running inversion (university `.scan` files contain many scans per day); the
+university tabs start at one day. The SMEAR III SMPS `.sum`
+reference folder defaults to `/home/ubuntu/university/2026/smps` on CSC;
+it can be edited in the diagnostics controls for the median and ratio plots.
+Only `.scan` files enter the inversion; `.sum` files are comparison data.
+Exports from UFSMPS, SMPS, and the monopolar Pi are kept in separate
+subdirectories under the configured save folder. Check each instrument's
+flows, CPC, size cutoff, timing correction, and inlet/tube-loss settings
+before interpreting or comparing inverted distributions.

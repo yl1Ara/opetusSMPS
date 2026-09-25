@@ -61,6 +61,12 @@ growth-rate cross-check.
 - The experimental Fuchs-type path treats configured ion mobilities as values
   at the scan conditions. Pressure is validated and recorded but does not
   independently rescale the charging fractions.
+- The SMEAR III UFSMPS `.scan` importer currently uses the last of its two
+  CPC concentration/count columns (TSI3756), not the first UFCPC channel
+  (TSI3750). CPC efficiency for these models is not calibrated in the current
+  loss function. UFSMPS measured aerosol flow can be about 0.05 L/min, while
+  the inversion uses the selected run's configured flow and tube losses;
+  setting the source folder alone does not validate those inputs.
 
 ## References
 

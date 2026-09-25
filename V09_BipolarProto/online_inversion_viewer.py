@@ -8,13 +8,14 @@ from pathlib import Path
 import panel as pn
 
 from DMPS_inversion_gui import online_app as global_app
+from DMPS_inversion_gui.source_comparison import build_comparison_figure
 
 
 APP_PATH = Path(__file__).resolve().parent / "DMPS_inversion_gui" / "online_app.py"
 SESSION_SETTINGS_DIR = Path(__file__).resolve().parent / ".session_inversion_settings"
 
 
-def _load_session_app():
+def _load_session_app(initial_scan_source=None):
     session_id = uuid.uuid4().hex
     module_name = f"DMPS_inversion_gui.online_app_session_{session_id}"
     spec = importlib.util.spec_from_file_location(module_name, APP_PATH)
@@ -46,6 +47,8 @@ def _load_session_app():
 
     SESSION_SETTINGS_DIR.mkdir(exist_ok=True)
     module.SETTINGS_FILE = SESSION_SETTINGS_DIR / f"settings_{session_id}.json"
+    if initial_scan_source is not None:
+        module.scan_source.value = initial_scan_source
     try:
         module.save_settings()
     except Exception:
@@ -207,17 +210,93 @@ def start_multi_app():
 
     load_explorer_button.on_click(load_explorer)
 
+    instrument_sources = (
+        ("Bipolar Pi", "Bipolar Pi (CSC)"),
+        ("Monopolar Pi", "Monopolar Pi (CSC)"),
+        ("SMEAR III UFSMPS", "SMEAR III UFSMPS (CSC)"),
+        ("SMEAR III SMPS", "SMEAR III SMPS (CSC)"),
+    )
+    source_apps = {}
+    source_tabs = []
+    source_loaders = {}
+    for name, source_label in instrument_sources:
+        container = pn.Column(
+            pn.pane.Markdown(f"Load the **{name}** inversion controls on demand."),
+            width=1400,
+        )
+
+        def load_source(event=None, name=name, source_label=source_label, container=container):
+            if name in source_apps:
+                return
+            container.objects = [pn.pane.Markdown(f"Loading **{name}**...")]
+            module = _load_session_app(initial_scan_source=source_label)
+            source_apps[name] = module
+            container.objects = [module.start_app()]
+
+        source_loaders[name] = load_source
+        source_tabs.append((name, container))
+
+    comparison_status = pn.pane.Markdown(
+        "Invert scans in instrument tabs, then refresh this comparison. "
+        "Each instrument retains its own settings and result."
+    )
+    comparison_plot = pn.pane.Plotly(width=1300)
+    comparison_method = pn.widgets.Select(
+        name="Charging model", options={label: method for method, label in global_app.INVERSION_METHODS.items()},
+        value="gunn woessner mod",
+    )
+    comparison_polarity = pn.widgets.Select(
+        name="DMA voltage sign", options=["positive", "negative"], value="positive",
+    )
+    comparison_clip = pn.widgets.FloatInput(
+        name="Common color maximum (dN/dlog10Dp)", value=20000.0, step=1000.0,
+    )
+    refresh_comparison_button = pn.widgets.Button(
+        name="Refresh comparison", button_type="primary",
+    )
+
+    def refresh_comparison(event=None):
+        results = {}
+        for name, _ in instrument_sources:
+            module = source_apps.get(name)
+            if module is None:
+                continue
+            with module.shared_state["lock"]:
+                latest = module.shared_state.get("latest_inversion")
+            if latest is not None:
+                results[name] = latest
+        figure, message = build_comparison_figure(
+            results, comparison_method.value, comparison_polarity.value,
+            comparison_clip.value,
+        )
+        comparison_plot.object = figure
+        comparison_status.object = message
+
+    refresh_comparison_button.on_click(refresh_comparison)
+    comparison_tab = pn.Column(
+        "# Cross-instrument comparison",
+        pn.Row(comparison_method, comparison_polarity, comparison_clip, refresh_comparison_button),
+        comparison_status, comparison_plot, width=1400,
+    )
+
     tabs = pn.Tabs(
         ("Global Live", global_live),
+        *source_tabs,
+        ("Comparison", comparison_tab),
         ("My Explorer", explorer_container),
         dynamic=True,
     )
 
-    def load_explorer_on_tab(event):
-        if event.new == 1:
+    def load_active_tab(event):
+        index = event.new
+        if 1 <= index <= len(instrument_sources):
+            source_loaders[instrument_sources[index - 1][0]]()
+        elif index == len(instrument_sources) + 1:
+            refresh_comparison()
+        elif index == len(instrument_sources) + 2:
             load_explorer()
 
-    tabs.param.watch(load_explorer_on_tab, "active")
+    tabs.param.watch(load_active_tab, "active")
     return tabs
 
 

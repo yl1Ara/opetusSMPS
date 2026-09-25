@@ -63,6 +63,10 @@ INVERSION_CODE_FINGERPRINT = inversion_code_fingerprint()
 
 DEFAULT_SETTINGS = {
     "scan_root": "logs/scans",
+    "smeariii_sum_root": (
+        "/home/ubuntu/university/2026/smps"
+        if Path("/home/ubuntu/university/2026/smps").is_dir() else "SMEARIII"
+    ),
     "save_root": "~/OneDrive/DMPS_inversions",
     "n_scans_plot": 200,
     "scan_selection_mode": "Newest N",
@@ -143,6 +147,19 @@ DEFAULT_SETTINGS = {
     "low_value_lift_alpha": 1.0,
     "inversion_methods": ["gunn woessner mod"],
     "tube_segments": "tubediameter,tubelength,aflow,angle\n0,1.93,qa,0\n0,2.80,8,0\n0,5.21,1.3,0",
+}
+
+SCAN_SOURCE_ROOTS = {
+    "Custom folder": None,
+    "Bipolar Pi (CSC)": "~/dmps/logs/scans",
+    "Monopolar Pi (CSC)": "~/mps/logs/scans",
+    "SMEAR III UFSMPS (CSC)": "~/university/2026/ufsmps",
+    "SMEAR III SMPS (CSC)": "~/university/2026/smps",
+}
+SOURCE_EXPORT_DIRECTORIES = {
+    "Monopolar Pi (CSC)": "mps",
+    "SMEAR III UFSMPS (CSC)": "smeariii_ufsmps",
+    "SMEAR III SMPS (CSC)": "smeariii_smps",
 }
 
 INVERSION_METHODS = {
@@ -272,6 +289,7 @@ def load_settings():
 def save_settings():
     settings = {
         "scan_root": scan_root.value,
+        "smeariii_sum_root": smeariii_sum_root.value,
         "save_root": save_root.value,
         "n_scans_plot": int(n_scans_plot.value),
         "scan_selection_mode": scan_selection_mode.value,
@@ -424,6 +442,31 @@ def app_path(value):
     return APP_ROOT / path
 
 
+def scan_source_for_root(value):
+    path = app_path(value).resolve()
+    for label, folder in SCAN_SOURCE_ROOTS.items():
+        if folder is not None and app_path(folder).resolve() == path:
+            return label
+    return "Custom folder"
+
+
+def scan_source_description(label):
+    if label == "SMEAR III UFSMPS (CSC)":
+        return (
+            "UFSMPS files contain two CPC channels; the importer currently uses "
+            "the **last** pair (TSI3756). Check its sample flow and efficiency, "
+            "the ~0.05 L/min aerosol flow, tube losses, and the sub-20 nm charge "
+            "model before interpreting the inversion. Start with one day."
+        )
+    if label.startswith("SMEAR III"):
+        return (
+            "Daily university `.scan` files contain many scans. DMA geometry is "
+            "read from each scan; check flow, CPC, timing, tube-loss, and size-cutoff "
+            "controls for this instrument before comparing inversion results."
+        )
+    return "Select one instrument at a time; use the scan folder field for other sources."
+
+
 def load_timestamped_ambient_conditions(
     times, csv_path, fallback_temperature_k, fallback_pressure_pa,
     tolerance_minutes=30.0, naive_timezone="Europe/Helsinki",
@@ -538,6 +581,9 @@ def save_data(event=None):
         status.object = "No inversion data to save yet."
         return
     outdir = app_path(save_root.value)
+    source_directory = SOURCE_EXPORT_DIRECTORIES.get(scan_source_for_root(scan_root.value))
+    if source_directory:
+        outdir /= source_directory
     outdir.mkdir(parents=True, exist_ok=True)
     if daily_overwrite_checkbox.value:
         stamp = pd.Timestamp.now().strftime("%Y%m%d")
@@ -586,6 +632,8 @@ def save_data(event=None):
             if "temperature_k" in tr and "pressure_pa" in tr:
                 pd.DataFrame({
                     "time": pd.to_datetime(tr["x"]),
+                    "scan_source": scan_source_for_root(scan_root.value),
+                    "scan_root": scan_root.value,
                     "temperature_k": tr["temperature_k"],
                     "pressure_pa": tr["pressure_pa"],
                     "condition_source": tr.get("condition_source", "unknown"),
@@ -1322,7 +1370,7 @@ def load_smeariii_sum_file(path):
 def load_smeariii_sum_range(start, end):
     start = pd.to_datetime(start)
     end = pd.to_datetime(end)
-    root = APP_ROOT / "SMEARIII"
+    root = app_path(smeariii_sum_root.value)
     tables = []
 
     source_start = start - SMEARIII_TO_RPI_TIME_OFFSET
@@ -1956,6 +2004,19 @@ scan_root = pn.widgets.TextInput(
     value=settings.get("scan_root", DEFAULT_SETTINGS["scan_root"]),
     width=700,
 )
+
+scan_source = pn.widgets.Select(
+    name="Scan source",
+    options=list(SCAN_SOURCE_ROOTS),
+    value=scan_source_for_root(scan_root.value),
+    width=230,
+)
+smeariii_sum_root = pn.widgets.TextInput(
+    name="SMEAR III SMPS .sum reference folder",
+    value=settings.get("smeariii_sum_root", DEFAULT_SETTINGS["smeariii_sum_root"]),
+    width=700,
+)
+scan_source_note = pn.pane.Markdown(scan_source_description(scan_source.value))
 
 save_root = pn.widgets.TextInput(
     name="Save folder",
@@ -2766,7 +2827,7 @@ def refresh_scan_files(event=None):
     else:
         scan_files.value = []
 
-    status.object = f"Found **{len(all_files)}** scan CSV files; selected **{len(files)}** by `{scan_selection_mode.value}`."
+    status.object = f"Found **{len(all_files)}** scan files; selected **{len(files)}** by `{scan_selection_mode.value}`."
 
 
 def select_last_n(event=None):
@@ -2785,6 +2846,30 @@ refresh_button.on_click(refresh_scan_files)
 select_last_button.on_click(select_last_n)
 for w in [scan_selection_mode, scan_start_date, scan_start_time, scan_end_date, scan_end_time, n_scans_plot]:
     w.param.watch(apply_scan_selection, "value")
+
+
+def select_scan_source(event):
+    scan_source_note.object = scan_source_description(event.new)
+    folder = SCAN_SOURCE_ROOTS[event.new]
+    if folder is None:
+        return
+    if scan_root.value != folder:
+        scan_root.value = folder
+    if event.new.startswith("SMEAR III"):
+        # University daily files can contain many hundreds of scans each.
+        n_scans_plot.value = 1
+        scan_selection_mode.value = "Newest N"
+    refresh_scan_files()
+
+
+def recognize_scan_root(event):
+    label = scan_source_for_root(event.new)
+    if scan_source.value != label:
+        scan_source.value = label
+
+
+scan_source.param.watch(select_scan_source, "value")
+scan_root.param.watch(recognize_scan_root, "value")
 
 
 # ---------------------------------------------------------------------
@@ -4594,7 +4679,7 @@ def plot_inversion_result(result):
             print(f"Could not load SMEAR III CPC for scatter plots: {e}", flush=True)
 
     subplot_titles = [
-        f"{method_label(method)} {polarity} inverted heatmap"
+        f"{scan_source_for_root(scan_root.value)}: {method_label(method)} {polarity} inverted heatmap"
         for method, polarity in heatmap_keys
     ]
     subplot_titles.extend(["Ntot", "Estimated Zn/Zp ratio"])
@@ -5326,7 +5411,7 @@ def plot_inversion_result(result):
     fig.update_layout(
         height=max(1200, 520 * rows),
         width=1300,
-        title="Online inversion result",
+        title=f"Online inversion result — {scan_source_for_root(scan_root.value)}",
         dragmode=roi_selection_tool.value,
         showlegend=True,
         margin=dict(l=50, r=260, t=60, b=30),
@@ -6386,6 +6471,7 @@ inversion_plot.param.watch(on_inversion_heatmap_selection, "selected_data")
 
 SETTINGS_WIDGETS = [
     scan_root,
+    smeariii_sum_root,
     save_root,
     n_scans_plot,
     scan_selection_mode,
@@ -6466,17 +6552,18 @@ SETTINGS_WIDGETS = [
     tube_segments,
     inversion_methods,
 ]
-INVERSION_INPUT_WIDGETS = SETTINGS_WIDGETS + [use_zratio_checkbox, scan_files]
+INVERSION_INPUT_WIDGETS = SETTINGS_WIDGETS + [use_zratio_checkbox, scan_files, scan_source]
 
 for w in SETTINGS_WIDGETS:
     w.param.watch(lambda event: save_settings(), "value")
 
 
 selection_controls = pn.Column(
-    pn.Row(scan_root, refresh_button, select_last_button, n_scans_plot),
+    pn.Row(scan_source, scan_root, refresh_button, select_last_button, n_scans_plot),
+    scan_source_note,
     pn.Row(scan_selection_mode, scan_start_date, scan_start_time, scan_end_date, scan_end_time),
     loaded_time_window_min,
-    pn.Accordion(("Selected scan CSVs", scan_files), active=[]),
+    pn.Accordion(("Selected scan files", scan_files), active=[]),
 )
 
 inversion_controls = pn.Column(
@@ -6500,6 +6587,7 @@ inversion_controls = pn.Column(
 )
 
 diagnostic_controls = pn.Column(
+    smeariii_sum_root,
     pn.Row(ntot_plot_max, heatmap_clip, raw_uncertainty),
     pn.Row(growth_models),
     pn.Row(
