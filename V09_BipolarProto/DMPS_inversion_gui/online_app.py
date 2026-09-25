@@ -3847,7 +3847,13 @@ def run_inversion_calculation(
             ntot_measured = []
             residual_rows = []
 
-            for scan_id, g_scan in dd.groupby(group_key):
+            # SMEAR III SCAN numbers are not zero-padded and may reset, so
+            # lexicographic scan_id order is not chronological. Keep every
+            # heatmap column and Ntot point aligned on the same time axis.
+            scan_groups = dd.groupby(group_key, sort=False)
+            chronological_ids = scan_groups["time"].median().sort_values(kind="stable").index
+            for scan_id in chronological_ids:
+                g_scan = scan_groups.get_group(scan_id)
                 check_inversion_cancelled(cancel_event)
                 zratio, ratio_source = zratio_for_inversion(
                     inversion_method, zratios.get(scan_id, np.nan),
@@ -5089,6 +5095,11 @@ def plot_inversion_result(result, preserve_interactions=False):
     )
     quality_dashboard_pane.object = pd.DataFrame(latest_quality_dashboard)
     result_t0, result_t1 = result_time_range(result)
+    time_tickformat = (
+        "%b %d %H:%M"
+        if result_t0 is not None and result_t1 - result_t0 >= pd.Timedelta(days=1)
+        else "%H:%M"
+    )
     smear_cpc = pd.DataFrame(columns=["time", "SMEARIII_CPC"])
     if result_t0 is not None:
         try:
@@ -5293,7 +5304,7 @@ def plot_inversion_result(result, preserve_interactions=False):
                     )
             add_heatmap_selection_layer(fig, tr, row)
             update_log_size_axis(fig, row, tr["y"])
-            fig.update_xaxes(title_text="Time", tickformat="%H:%M", row=row, col=1)
+            fig.update_xaxes(title_text="Time", tickformat=time_tickformat, row=row, col=1)
 
         elif tr["kind"] == "ntot":
             method = tr.get("method", "gunn woessner mod")
@@ -5748,12 +5759,12 @@ def plot_inversion_result(result, preserve_interactions=False):
         )
 
     fig.update_yaxes(title_text="Ntot", row=ntot_row, col=1)
-    fig.update_xaxes(title_text="Time", tickformat="%H:%M", row=ntot_row, col=1)
+    fig.update_xaxes(title_text="Time", tickformat=time_tickformat, row=ntot_row, col=1)
     fig.update_yaxes(title_text="Zn/Zp", row=ion_ratio_row, col=1)
-    fig.update_xaxes(title_text="Time", tickformat="%H:%M", row=ion_ratio_row, col=1)
+    fig.update_xaxes(title_text="Time", tickformat=time_tickformat, row=ion_ratio_row, col=1)
     if effective_zratio_row is not None:
         fig.update_yaxes(title_text="Effective Zn/Zp", row=effective_zratio_row, col=1)
-        fig.update_xaxes(title_text="Paired scan time", tickformat="%H:%M", row=effective_zratio_row, col=1)
+        fig.update_xaxes(title_text="Paired scan time", tickformat=time_tickformat, row=effective_zratio_row, col=1)
         fig.update_yaxes(title_text="Median |log(+/-)|", row=effective_zratio_objective_row, col=1)
         fig.update_xaxes(title_text="Candidate effective Zn/Zp", type="log", row=effective_zratio_objective_row, col=1)
     if growth_row is not None:
@@ -5764,10 +5775,10 @@ def plot_inversion_result(result, preserve_interactions=False):
         fig.update_xaxes(title_text="Banana-track model", row=growth_row, col=1)
     if formation_row is not None:
         fig.update_yaxes(title_text="N in event range (dN/dt is apparent accumulation)", row=formation_row, col=1)
-        fig.update_xaxes(title_text="Time", tickformat="%H:%M", row=formation_row, col=1)
+        fig.update_xaxes(title_text="Time", tickformat=time_tickformat, row=formation_row, col=1)
     if scan_health_row is not None:
         fig.update_yaxes(title_text="NaN % / flow RMSE", row=scan_health_row, col=1)
-        fig.update_xaxes(title_text="Time", tickformat="%H:%M", row=scan_health_row, col=1)
+        fig.update_xaxes(title_text="Time", tickformat=time_tickformat, row=scan_health_row, col=1)
     median_sizes = np.concatenate([
         np.asarray(median["dp"], dtype=float)
         for median in median_distributions
@@ -5802,7 +5813,7 @@ def plot_inversion_result(result, preserve_interactions=False):
             row=row,
             col=1,
         )
-        fig.update_xaxes(title_text="Time", tickformat="%H:%M", row=row, col=1)
+        fig.update_xaxes(title_text="Time", tickformat=time_tickformat, row=row, col=1)
         update_log_size_axis(fig, row, diff["y"])
 
     for key, row in comparison_rows.items():
@@ -5830,7 +5841,7 @@ def plot_inversion_result(result, preserve_interactions=False):
                 row=row,
                 col=1,
             )
-        fig.update_xaxes(title_text="Time", tickformat="%H:%M", row=row, col=1)
+        fig.update_xaxes(title_text="Time", tickformat=time_tickformat, row=row, col=1)
         if comparison is not None:
             update_log_size_axis(fig, row, comparison["y"])
         else:

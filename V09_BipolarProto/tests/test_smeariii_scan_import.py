@@ -39,6 +39,41 @@ class SmearIIIScanImportTests(unittest.TestCase):
         self.assertIsNotNone(figure)
         self.assertIsNotNone(timing)
 
+    def test_smps_heatmap_and_ntot_use_time_not_scan_id_order(self):
+        path = Path(__file__).resolve().parents[1] / "SMEARIII" / "DMPS007_20260629.scan"
+        data = online_app.parse_smeariii_scan_file(path)
+        first, second = data["scan_id"].drop_duplicates().iloc[:2]
+        selected = data[data["scan_id"].isin([first, second])].copy()
+        # Lexical order puts scan-10 before scan-2 even though it was later.
+        selected.loc[selected["scan_id"] == first, "scan_id"] = "scan-2"
+        selected.loc[selected["scan_id"] == second, "scan_id"] = "scan-10"
+
+        with (
+            patch.object(online_app, "scan_inversion_type", SimpleNamespace(value="SMPS")),
+            patch.object(online_app, "smps_correction_mode", SimpleNamespace(value="None")),
+            patch.object(online_app, "inversion_methods", SimpleNamespace(value=["Gunn-Woessner modified"])),
+        ):
+            result = online_app.run_inversion_calculation(selected, use_cache=False)
+
+        heatmap = next(row for row in result if row["kind"] == "heatmap")
+        ntot = next(row for row in result if row["kind"] == "ntot")
+        self.assertEqual(heatmap["scan_id"], ["scan-2", "scan-10"])
+        self.assertEqual(heatmap["x"], ntot["x"])
+        self.assertLess(heatmap["x"][0], heatmap["x"][1])
+
+        # Multi-day selections need dates on the time axis, not repeating
+        # hour-only labels that hide gaps between scan days.
+        next_day = [{**item, "x": [
+            pd.Timestamp(time) + pd.Timedelta(days=index)
+            for index, time in enumerate(item["x"])
+        ]} if item["kind"] in {"heatmap", "ntot"} else item for item in result]
+        with (
+            patch.object(online_app, "load_smeariii_sum_range", return_value=pd.DataFrame()),
+            patch.object(online_app, "load_smeariii_cpc_for_times", return_value=pd.DataFrame()),
+        ):
+            figure = online_app.plot_inversion_result(next_day)
+        self.assertEqual(figure.layout.xaxis.tickformat, "%b %d %H:%M")
+
     def test_synced_folders_offer_scans_and_reference_sum_separately(self):
         fixture = Path(__file__).resolve().parents[1] / "SMEARIII"
         with TemporaryDirectory() as directory:
