@@ -174,6 +174,48 @@ class OnlineInteractionTests(unittest.TestCase):
         self.assertIn("apparent D50 slope", status.object)
         self.assertEqual(len(growth_plot.object.data), 2)
 
+    def test_growth_signal_separates_stationary_raw_peak_from_enhancement(self):
+        sizes = np.geomspace(5.0, 40.0, 100)
+        stationary = 500 * np.exp(-0.5 * ((sizes - 25.0) / 2.0) ** 2)
+        times = pd.date_range("2026-09-25", periods=10, freq="30min")
+        z = np.column_stack([
+            stationary + 10 + (
+                200 * np.exp(-0.5 * ((sizes - (8 + index)) / 1.5) ** 2)
+                if index >= 3 else 0
+            ) for index in range(len(times))
+        ])
+        trace = {
+            "kind": "heatmap", "method": "test", "polarity": "positive",
+            "x": times, "y": sizes, "Z": z,
+        }
+        self.assertAlmostEqual(sizes[np.argmax(z[:, -1])], 25.0, delta=1.0)
+
+        figure = online_app.plot_growth_signal([trace], [])
+        enhancement = np.asarray(figure.data[0].z, dtype=float)
+        signal_sizes = np.asarray(figure.data[0].y, dtype=float)
+        self.assertLess(abs(signal_sizes[np.argmax(enhancement[:, -1])] - 17), 2.0)
+        self.assertLess(enhancement[np.argmin(abs(signal_sizes - 25)), -1], 1.0)
+
+        candidate_times = times[3:]
+        centers = np.arange(11.0, 18.0)
+        track = {
+            "source_method": "test", "polarity": "positive", "model": "Center D50",
+            "event_id": "test:positive:event-1", "event_number": 1,
+            "time": candidate_times, "dp": centers, "fit": centers,
+            "growth_rate": 2.0, "fit_quality": "acceptable",
+            "component_support": [
+                {"time": timestamp, "min_nm": center - 2, "max_nm": center + 2}
+                for timestamp, center in zip(candidate_times, centers)
+            ],
+        }
+        figure = online_app.plot_growth_signal([trace], [track])
+        self.assertEqual([item.type for item in figure.data], [
+            "heatmap", "heatmap", "scatter", "scatter",
+        ])
+        component = np.asarray(figure.data[1].z, dtype=float)
+        self.assertTrue(np.isnan(component[np.argmin(abs(signal_sizes - 25))]).all())
+        self.assertTrue(np.isfinite(component[np.argmin(abs(signal_sizes - 17)), -1]))
+
     def test_heatmap_roi_does_not_fit_across_unselected_size_gap(self):
         result, figure = self.heatmap_fixture()
         points = [

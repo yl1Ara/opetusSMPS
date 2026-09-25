@@ -102,6 +102,7 @@ def _load_session_app(initial_scan_source=None, profile_key="explorer"):
             "difference_fig": None,
             "difference_diagnostics": None,
             "growth_diagnostics": [],
+            "growth_signal_fig": None,
             "growth_settings": {},
             "aerosol_properties": [],
             "latest_inversion": None,
@@ -133,6 +134,7 @@ def _global_live_tab():
     settings_json = pn.pane.JSON({}, depth=2, sizing_mode="stretch_width")
     raw_plot = pn.pane.Plotly(height=750, width=1300)
     inversion_plot = pn.pane.Plotly(width=1300)
+    growth_signal_plot = pn.pane.Plotly(width=1300)
     growth_status = pn.pane.Markdown()
     roi_feedback = pn.pane.Markdown("Drag across heatmap cells to inspect an ROI.")
     roi_tool = pn.widgets.Select(
@@ -171,6 +173,7 @@ def _global_live_tab():
             if version != local["version"]:
                 raw_fig = copy.deepcopy(global_app.shared_state.get("raw_fig"))
                 inversion_fig = copy.deepcopy(global_app.shared_state.get("inversion_fig"))
+                growth_signal_fig = copy.deepcopy(global_app.shared_state.get("growth_signal_fig"))
                 residual_fig = copy.deepcopy(global_app.shared_state.get("residual_fig"))
                 smps_timing_fig = copy.deepcopy(global_app.shared_state.get("smps_timing_fig"))
                 aerosol_fig = copy.deepcopy(global_app.shared_state.get("aerosol_fig"))
@@ -194,14 +197,18 @@ def _global_live_tab():
         if inversion_result is None:
             growth_status.object = "Run an inversion to evaluate growth tracks."
         elif growth_diagnostics:
+            stationary = sum(bool(item.get("track_caveat")) for item in growth_diagnostics)
             growth_status.object = (
                 f"Automatic growth tracks: **{len(growth_diagnostics)}**. "
-                "Marginal candidates are shown as points only."
+                f"{stationary} D50 candidate(s) have a stationary component peak "
+                "(possible broadening). The Growth Signal tab shows full "
+                "enhancement and the component the tracker selected."
             )
         else:
             growth_status.object = "No automatic growth track accepted for the current result."
         raw_plot.object = raw_fig
         inversion_plot.object = inversion_fig
+        growth_signal_plot.object = growth_signal_fig
         residual_plot.object = residual_fig
         smps_timing_plot.object = smps_timing_fig
         aerosol_plot.object = aerosol_fig
@@ -275,6 +282,7 @@ def _global_live_tab():
         ("Global Controls", controls_container),
         ("Settings", pn.Column(settings_json)),
         ("Selected ROI", pn.Column(roi_status, roi_plot, roi_growth_plot)),
+        ("Growth Signal", pn.Column(growth_status, growth_signal_plot)),
         dynamic=True,
     )
 

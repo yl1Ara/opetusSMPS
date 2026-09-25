@@ -977,6 +977,7 @@ def build_formation_rate_diagnostics(
             if growth.get("source_method") == tr.get("method", "gunn woessner mod")
             and growth.get("polarity") == tr.get("polarity")
             and growth.get("model") != "MCC cross-check"
+            and growth.get("fit_quality") != "marginal"
             and np.isfinite(growth.get("growth_rate", np.nan))
         ]
         model_priority = {"Center D50": 0, "Ridge peak": 1, "Lower edge D25": 2,
@@ -1688,6 +1689,7 @@ def build_growth_rate_diagnostics(
             previous_ridge = None
             previous_time = None
             ridge_history = []
+            chosen_components = {}
             for time_index in segment:
                 col = enhancement[:, time_index]
                 finite = np.isfinite(col) & (col > 0)
@@ -1746,6 +1748,13 @@ def build_growth_rate_diagnostics(
                 previous_ridge = ridge
                 previous_time = times[time_index]
                 ridge_history.append((previous_time, previous_ridge))
+                chosen_components[previous_time] = {
+                    "time": previous_time,
+                    "min_nm": float(event_sizes[left]),
+                    "max_nm": float(event_sizes[right]),
+                    "peak_nm": float(event_sizes[peak_index]),
+                    "peak_enhancement": float(col[peak_index]),
+                }
                 active_sizes = event_sizes[left:right + 1]
                 active_concentration = col[left:right + 1]
                 if left > 0 and right < len(event_sizes) - 1:
@@ -1777,6 +1786,10 @@ def build_growth_rate_diagnostics(
                         "event_end": times[segment[-1]],
                         "event_threshold_snr": detection_threshold_snr,
                         "background_method": "per-size 20th percentile",
+                        "component_support": [
+                            chosen_components[time] for time in diagnostic["time"]
+                            if time in chosen_components
+                        ],
                         "diameter_resolution_nm": diameter_resolution,
                         "minimum_component_bins": minimum_component_bins,
                         "background_scan_fraction": float(np.mean(background_scans)),
@@ -1787,6 +1800,19 @@ def build_growth_rate_diagnostics(
                     })
                     if diagnostic["background_quality"] == "limited":
                         diagnostic["fit_quality"] = "marginal"
+                    peaks = [
+                        chosen_components[time]["peak_nm"]
+                        for time in diagnostic["time"] if time in chosen_components
+                    ]
+                    if model in {"Lower edge D25", "Center D50", "Upper edge D75"} and len(peaks) >= minimum_scans:
+                        peak_span = float(max(peaks) - min(peaks))
+                        diagnostic["selected_peak_span_nm"] = peak_span
+                        if peak_span < diameter_resolution * 0.75:
+                            diagnostic["fit_quality"] = "marginal"
+                            diagnostic["track_caveat"] = (
+                                "selected component peak stayed in the same size bin; "
+                                "D50 movement may be shape broadening rather than particle growth"
+                            )
                     diagnostics.append(diagnostic)
 
             if "Appearance time" in selected_models:
@@ -2138,7 +2164,9 @@ def build_last_hours_smear_difference(result, smear, *, min_size_nm, peak_min_si
                 where=smear_interp > 0,
             )
             ratio_cols.append(ratio)
-            our_cols.append(our)
+            # Shape comparisons only have meaning where the reference has
+            # measured support; don't leave our unpaired tails visible.
+            our_cols.append(np.where(np.isfinite(smear_interp), our, np.nan))
             smear_cols.append(smear_interp)
             ratio_times.append(t)
 
@@ -2179,12 +2207,20 @@ def build_last_hours_smear_difference(result, smear, *, min_size_nm, peak_min_si
                 ratio_median[valid_rows] = np.nanmedian(ratio_arr[:, valid_rows], axis=0)
             our_median = np.full(len(event_sizes), np.nan)
             smear_median = np.full(len(event_sizes), np.nan)
+            our_p10 = np.full(len(event_sizes), np.nan)
+            our_p90 = np.full(len(event_sizes), np.nan)
+            smear_p10 = np.full(len(event_sizes), np.nan)
+            smear_p90 = np.full(len(event_sizes), np.nan)
             valid_our = np.any(np.isfinite(our_arr), axis=0)
             valid_smear = np.any(np.isfinite(smear_arr), axis=0)
             if np.any(valid_our):
                 our_median[valid_our] = np.nanmedian(our_arr[:, valid_our], axis=0)
+                our_p10[valid_our] = np.nanpercentile(our_arr[:, valid_our], 10, axis=0)
+                our_p90[valid_our] = np.nanpercentile(our_arr[:, valid_our], 90, axis=0)
             if np.any(valid_smear):
                 smear_median[valid_smear] = np.nanmedian(smear_arr[:, valid_smear], axis=0)
+                smear_p10[valid_smear] = np.nanpercentile(smear_arr[:, valid_smear], 10, axis=0)
+                smear_p90[valid_smear] = np.nanpercentile(smear_arr[:, valid_smear], 90, axis=0)
             ratios.append({
                 "method": method,
                 "polarity": polarity,
@@ -2198,7 +2234,13 @@ def build_last_hours_smear_difference(result, smear, *, min_size_nm, peak_min_si
                 "size_nm": event_sizes,
                 "our_median": our_median,
                 "smear_median": smear_median,
+                "our_p10": our_p10,
+                "our_p90": our_p90,
+                "smear_p10": smear_p10,
+                "smear_p90": smear_p90,
                 "n_matches": len(ratio_times),
+                "match_start": min(ratio_times),
+                "match_end": max(ratio_times),
             })
 
     matches = pd.DataFrame(matches)

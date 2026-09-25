@@ -73,6 +73,51 @@ class InversionDiagnosticTests(unittest.TestCase):
         self.assertIn("2026-09-25 09:00 to 2026-09-25 12:00", figure.layout.annotations[3].text)
         self.assertIn("2 matched", figure.data[1].name)
 
+    def test_main_median_excludes_unmatched_smear_scans(self):
+        times = pd.to_datetime(["2026-09-24 22:00", "2026-09-25 10:00"])
+        sizes = np.array([10.0, 20.0, 40.0])
+        result = [{
+            "kind": "heatmap", "method": "test", "polarity": "positive",
+            "x": times, "y": sizes, "Z": np.full((3, 2), 200.0),
+            "flow_rel_rmse": [0.0, 0.0],
+        }]
+        # Many unmatched, high-concentration SMEAR scans should not pull the
+        # main median above ours while the paired difference says ours is higher.
+        reference_times = times.tolist() + list(pd.date_range(
+            "2026-09-23 00:00", periods=10, freq="1h",
+        ))
+        smear = pd.DataFrame([
+            (stamp, size, 100.0 if stamp in times else 1000.0)
+            for stamp in reference_times for size in sizes
+        ], columns=["time", "size_nm", "smear_conc"])
+        with patch.object(online_app, "load_smeariii_sum_range", return_value=smear):
+            medians = online_app.build_median_distributions(result)
+
+        self.assertEqual(len(medians), 2)
+        self.assertTrue(all(item["pairing"] == "paired" for item in medians))
+        self.assertEqual([item["n_scans"] for item in medians], [2, 2])
+        self.assertEqual(medians[0]["time_start"], times[0])
+        self.assertEqual(medians[0]["time_end"], times[-1])
+        self.assertAlmostEqual(medians[0]["median"][1], 200.0)
+        self.assertAlmostEqual(medians[1]["median"][1], 100.0)
+        self.assertAlmostEqual(medians[0]["median"][1] / medians[1]["median"][1], 2.0)
+
+    def test_main_median_does_not_show_unpaired_smear_reference(self):
+        result = [{
+            "kind": "heatmap", "method": "test", "polarity": "positive",
+            "x": pd.to_datetime(["2026-09-25 10:00"]),
+            "y": np.array([10.0, 20.0, 40.0]),
+            "Z": np.full((3, 1), 200.0), "flow_rel_rmse": [0.0],
+        }]
+        smear = pd.DataFrame([
+            (pd.Timestamp("2026-09-25 07:00"), size, 1000.0)
+            for size in (10.0, 20.0, 40.0)
+        ], columns=["time", "size_nm", "smear_conc"])
+        with patch.object(online_app, "load_smeariii_sum_range", return_value=smear):
+            medians = online_app.build_median_distributions(result)
+        self.assertEqual(len(medians), 1)
+        self.assertEqual(medians[0]["pairing"], "unpaired")
+
     def test_poisson_concentration_uncertainty_uses_effective_count(self):
         sigma = poisson_concentration_standard_deviation(
             [60.0], sample_flow_lpm=1.0, sample_duration_sec=1.0,
@@ -868,6 +913,14 @@ class InversionDiagnosticTests(unittest.TestCase):
             method_label=lambda value: value,
         )[0]
         self.assertTrue(np.all(np.isnan(without_growth["formation_rate"])))
+
+        marginal_growth = [dict(growth[0], fit_quality="marginal")]
+        with_marginal = build_formation_rate_diagnostics(
+            result, growth_min_size_nm=3.0, growth_max_size_nm=10.0,
+            ntot_limit=1e6, method_label=lambda value: value,
+            growth_diagnostics=marginal_growth,
+        )[0]
+        self.assertFalse(np.any(with_marginal["three_term_budget_available"]))
 
     def test_formation_interval_can_use_interpolated_boundaries_with_one_center(self):
         sizes = np.array([2.0, 5.0, 20.0])

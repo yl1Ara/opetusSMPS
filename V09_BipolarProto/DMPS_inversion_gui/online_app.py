@@ -230,6 +230,7 @@ shared_state = pn.state.cache.setdefault(
         "difference_fig": None,
         "difference_diagnostics": None,
         "growth_diagnostics": [],
+        "growth_signal_fig": None,
         "growth_settings": {},
         "aerosol_properties": [],
         "latest_inversion": None,
@@ -240,6 +241,7 @@ shared_state.setdefault("residual_fig", None)
 shared_state.setdefault("smps_timing_fig", None)
 shared_state.setdefault("aerosol_fig", None)
 shared_state.setdefault("growth_diagnostics", [])
+shared_state.setdefault("growth_signal_fig", None)
 shared_state.setdefault("growth_settings", {})
 shared_state.setdefault("aerosol_properties", [])
 with shared_state["lock"]:
@@ -606,6 +608,8 @@ def save_data(event=None):
         raw_plot.object.write_html(outdir / f"raw_plot_{stamp}.html")
     if inversion_plot.object is not None:
         inversion_plot.object.write_html(outdir / f"inversion_plot_{stamp}.html")
+    if growth_signal_plot.object is not None:
+        growth_signal_plot.object.write_html(outdir / f"growth_signal_{stamp}.html")
     if residual_plot.object is not None:
         residual_plot.object.write_html(outdir / f"residual_diagnostics_{stamp}.html")
     if difference_plot.object is not None:
@@ -1596,6 +1600,7 @@ def build_median_distributions(result):
             "flow_error": flow_error,
             "flow_rel_rmse": median_flow_rel_rmse,
             "n_scans": int(z.shape[1]),
+            "pairing": "unpaired",
         })
 
     if start is None:
@@ -1603,32 +1608,30 @@ def build_median_distributions(result):
 
     smear = load_smeariii_sum_range(start, end)
     if not smear.empty:
-        scan_sizes = []
-        scan_concs = []
-        for _, smear_scan in smear.groupby("time"):
-            smear_scan = smear_scan.sort_values("size_nm")
-            size_nm = smear_scan["size_nm"].to_numpy(dtype=float)
-            conc = smear_scan["smear_conc"].to_numpy(dtype=float)
-            if len(size_nm) > 0:
-                scan_sizes.append(size_nm)
-                scan_concs.append(conc)
-
-        if scan_concs:
-            channel_count = max(set(map(len, scan_concs)), key=list(map(len, scan_concs)).count)
-            scan_sizes = [size_nm for size_nm in scan_sizes if len(size_nm) == channel_count]
-            scan_concs = [conc for conc in scan_concs if len(conc) == channel_count]
-            if scan_concs:
-                smear_stats = diag.nan_stats_by_row(np.vstack(scan_concs).T)
-                medians.append({
-                    "label": "SMEAR III SMPS",
-                    "dp": np.nanmedian(np.vstack(scan_sizes), axis=0),
-                    "median": smear_stats["median"],
-                    "p10": smear_stats["p10"],
-                    "p90": smear_stats["p90"],
-                    "flow_error": np.full(len(smear_stats["median"]), np.nan),
-                    "flow_rel_rmse": np.nan,
-                    "n_scans": int(len(scan_concs)),
-                })
+        paired = diag.build_last_hours_smear_difference(
+            result, smear, min_size_nm=float(smallest_size.value),
+            peak_min_size_nm=float(difference_peak_min_size_nm.value),
+            ntot_limit=float(ntot_plot_max.value), hours=72,
+        )
+        if paired.get("shapes"):
+            medians = []
+            for shape in paired["shapes"]:
+                label = f"{method_label(shape['method'])} {shape['polarity']}"
+                for name, prefix in ((f"Our {label}", "our"),
+                                     (f"SMEAR III matched to {label}", "smear")):
+                    medians.append({
+                        "label": name,
+                        "dp": shape["size_nm"],
+                        "median": shape[f"{prefix}_median"],
+                        "p10": shape[f"{prefix}_p10"],
+                        "p90": shape[f"{prefix}_p90"],
+                        "flow_error": np.full(len(shape["size_nm"]), np.nan),
+                        "flow_rel_rmse": np.nan,
+                        "n_scans": shape["n_matches"],
+                        "pairing": "paired",
+                        "time_start": shape["match_start"],
+                        "time_end": shape["match_end"],
+                    })
 
     return medians
 
@@ -2637,6 +2640,7 @@ difference_plot = pn.pane.Plotly(width=1300)
 smps_timing_plot = pn.pane.Plotly(width=1300, height=1100)
 aerosol_plot = pn.pane.Plotly(width=1300, height=2000)
 mode_tracking_plot = pn.pane.Plotly(width=1100, height=700)
+growth_signal_plot = pn.pane.Plotly(width=1300)
 quality_dashboard_pane = pn.pane.DataFrame(pd.DataFrame(), width=1200, height=500)
 modal_fit_plot = pn.pane.Plotly(width=1000, height=650)
 modal_fit_status = pn.pane.Markdown(
@@ -2751,6 +2755,7 @@ def publish_shared_state(
     difference_fig=None,
     difference_diagnostics=None,
     growth_diagnostics=None,
+    growth_signal_fig=_UNSET,
     growth_settings=None,
     aerosol_properties=None,
     inversion_result=None,
@@ -2773,6 +2778,8 @@ def publish_shared_state(
             shared_state["difference_diagnostics"] = difference_diagnostics
         if growth_diagnostics is not None:
             shared_state["growth_diagnostics"] = copy.deepcopy(growth_diagnostics)
+        if growth_signal_fig is not _UNSET:
+            shared_state["growth_signal_fig"] = growth_signal_fig
         if growth_settings is not None:
             shared_state["growth_settings"] = copy.deepcopy(growth_settings)
         if aerosol_properties is not None:
@@ -2801,6 +2808,7 @@ def sync_shared_state():
         difference_fig = shared_state["difference_fig"]
         difference_diagnostics = shared_state["difference_diagnostics"]
         growth_diagnostics = copy.deepcopy(shared_state["growth_diagnostics"])
+        growth_signal_fig = shared_state["growth_signal_fig"]
         growth_settings = copy.deepcopy(shared_state["growth_settings"])
         aerosol_properties = copy.deepcopy(shared_state["aerosol_properties"])
         inversion_result = shared_state["latest_inversion"]
@@ -2817,6 +2825,7 @@ def sync_shared_state():
     aerosol_plot.object = copy.deepcopy(aerosol_fig)
     if difference_fig is not None:
         difference_plot.object = copy.deepcopy(difference_fig)
+    growth_signal_plot.object = copy.deepcopy(growth_signal_fig)
     if difference_diagnostics is not None:
         latest_difference_diagnostics = difference_diagnostics
     latest_growth_diagnostics = growth_diagnostics
@@ -4189,11 +4198,15 @@ def update_growth_status(growth_diagnostics):
         growth_status.object = "Automatic growth tracking is off: select a model in Diagnostics."
     elif growth_diagnostics:
         marginal = sum(item["fit_quality"] == "marginal" for item in growth_diagnostics)
+        stationary_peak = sum(bool(item.get("track_caveat")) for item in growth_diagnostics)
         growth_status.object = (
             f"**Growth tracks:** {len(growth_diagnostics)} candidate(s) in "
             f"{growth_min_size_nm.value:g}–{growth_max_size_nm.value:g} nm; "
-            f"{marginal} marginal candidate(s) shown as points without a fitted line. "
-            "These are heuristic tracks, not independently measured growth rates."
+            f"{marginal} marginal candidate(s), including {stationary_peak} with "
+            "a stationary component peak (possible broadening, not confirmed growth). "
+            "Raw heatmaps show candidate "
+            "positions only; non-marginal fits appear on the background-subtracted "
+            "Growth Signal, not on the raw peak."
         )
     else:
         growth_status.object = (
@@ -4202,6 +4215,126 @@ def update_growth_status(growth_diagnostics):
             f"{growth_min_event_scans.value} scans with coherent enhancement, "
             f"positive growth ≤{growth_max_rate_nm_h.value:g} nm/h and a consistent fit."
         )
+
+
+def plot_growth_signal(result, tracks):
+    """Show full enhancement and the components actually chosen by the tracker."""
+    entries = []
+    lower, upper = sorted((float(growth_min_size_nm.value), float(growth_max_size_nm.value)))
+    for trace in result:
+        if trace.get("kind") != "heatmap":
+            continue
+        sizes = np.asarray(trace["y"], dtype=float)
+        z = np.asarray(trace["Z"], dtype=float)
+        if z.ndim != 2 or z.shape[0] != len(sizes):
+            continue
+        measured = (
+            np.isfinite(sizes) & (sizes >= lower) & (sizes <= upper)
+            & np.any(np.isfinite(z), axis=1)
+        )
+        if np.count_nonzero(measured) < 2:
+            continue
+        event_sizes = sizes[measured]
+        event_z = z[measured]
+        baseline = np.nanpercentile(event_z, 20, axis=1)
+        enhancement = np.maximum(event_z - baseline[:, None], 0.0)
+        entries.append(("full", trace, event_sizes, enhancement, []))
+        chosen_events = {}
+        for track in tracks:
+            if (track["source_method"] == trace.get("method", "gunn woessner mod")
+                    and track["polarity"] == trace["polarity"]
+                    and track.get("component_support")):
+                chosen_events.setdefault(track["event_id"], []).append(track)
+        scan_times = pd.DatetimeIndex(pd.to_datetime(trace["x"]))
+        for event_id, event_tracks in chosen_events.items():
+            component = np.full(enhancement.shape, np.nan)
+            for support in event_tracks[0]["component_support"]:
+                if not len(scan_times):
+                    continue
+                time_index = int(np.argmin(abs(scan_times - support["time"])))
+                selected = (event_sizes >= support["min_nm"]) & (event_sizes <= support["max_nm"])
+                component[selected, time_index] = enhancement[selected, time_index]
+            if np.any(np.isfinite(component)):
+                entries.append((event_id, trace, event_sizes, component, event_tracks))
+
+    if not entries:
+        growth_signal_plot.object = None
+        return None
+
+    titles = [
+        (f"{method_label(tr.get('method', 'gunn woessner mod'))} "
+         f"{scan_polarity_label(tr['polarity'])} full enhancement")
+        if kind == "full" else
+        (f"{method_label(tr.get('method', 'gunn woessner mod'))} "
+         f"{scan_polarity_label(tr['polarity'])} {kind}: selected component only")
+        for kind, tr, _, _, _ in entries
+    ]
+    fig = make_subplots(
+        rows=len(entries), cols=1,
+        vertical_spacing=min(0.09, 0.18 / max(1, len(entries) - 1)),
+        subplot_titles=titles,
+    )
+    color_max = 1.0
+    for row, (kind, trace, event_sizes, enhancement, event_tracks) in enumerate(entries, start=1):
+        finite = enhancement[np.isfinite(enhancement)]
+        if kind == "full" and len(finite):
+            color_max = max(color_max, float(np.percentile(finite, 99)))
+        method = trace.get("method", "gunn woessner mod")
+        colors = (
+            {"coloraxis": "coloraxis"} if kind == "full" else
+            {"colorscale": "Viridis", "zmin": 0,
+             "zmax": max(1.0, float(np.percentile(finite, 99))),
+             "colorbar": dict(title="component", x=1.12, len=0.2,
+                              y=1 - (row - 0.5) / len(entries))}
+        )
+        fig.add_heatmap(
+            x=trace["x"], y=event_sizes, z=enhancement,
+            **colors,
+            name=(f"{method_label(method)} {trace['polarity']} "
+                  f"{'full enhancement' if kind == 'full' else 'selected component'}"),
+            hovertemplate=(
+                "time=%{x|%Y-%m-%d %H:%M}<br>dp=%{y:.2f} nm<br>"
+                "background-subtracted dN/dlog10Dp=%{z:.1f}<extra></extra>"
+            ),
+            row=row, col=1,
+        )
+        for track in event_tracks:
+            color = GROWTH_MODEL_COLORS[track["model"]]
+            fit_is_reliable = track["fit_quality"] not in {"marginal", "cross-check"}
+            fig.add_scatter(
+                x=track["time"], y=track["dp"],
+                mode="lines+markers" if fit_is_reliable else "markers",
+                line=dict(color=color, width=2), marker=dict(color=color, size=7),
+                name=(f"Event {track['event_number']} {track['model']} "
+                      f"({track['growth_rate']:.2f} nm/h; {track['fit_quality']})"),
+                hovertemplate=(
+                    "time=%{x|%Y-%m-%d %H:%M}<br>selected-component Dp=%{y:.2f} nm<br>"
+                    f"apparent D50 slope={track['growth_rate']:.2f} nm/h<br>"
+                    f"{track.get('track_caveat', 'enhancement-derived heuristic track')}"
+                    "<extra></extra>"
+                ),
+                row=row, col=1,
+            )
+            if fit_is_reliable:
+                fig.add_scatter(
+                    x=track["time"], y=track["fit"], mode="lines",
+                    line=dict(color=color, dash="dash"),
+                    name=f"Event {track['event_number']} {track['model']} fit",
+                    row=row, col=1,
+                )
+        fig.update_yaxes(type="log", title_text="Dp (nm)", row=row, col=1)
+        fig.update_xaxes(title_text="Time", row=row, col=1)
+
+    fig.update_layout(
+        title=("Growth signal: full enhancement and selected components "
+               "(inversion minus per-size 20th-percentile background)"),
+        height=max(600, 480 * len(entries)), width=1300,
+        coloraxis=dict(colorscale="Viridis", cmin=0, cmax=color_max,
+                       colorbar=dict(title="enhancement")),
+        margin=dict(l=80, r=220, t=75, b=55), legend=dict(x=1.02, y=1),
+    )
+    growth_signal_plot.object = fig
+    return fig
 
 
 def plot_aerosol_property_diagnostics(result):
@@ -4800,6 +4933,7 @@ def plot_inversion_result(result):
         ))
     latest_growth_diagnostics = growth_diagnostics
     update_growth_status(growth_diagnostics)
+    plot_growth_signal(result, growth_diagnostics)
     latest_growth_settings = {
         "models": list(growth_models.value),
         "min_size_nm": float(growth_min_size_nm.value),
@@ -4877,11 +5011,21 @@ def plot_inversion_result(result):
     if scan_health:
         subplot_titles.append("Scan health")
     median_start, median_end = three_day_median_window(result)
-    median_title = (
-        f"Last 72 h unpaired median dN/dlog10Dp "
-        f"({median_start:%Y-%m-%d %H:%M} to {median_end:%Y-%m-%d %H:%M})"
-        if median_start is not None else "Last 72 h unpaired median dN/dlog10Dp"
-    )
+    paired_median = bool(median_distributions and median_distributions[0].get("pairing") == "paired")
+    if paired_median:
+        paired_start = min(item["time_start"] for item in median_distributions)
+        paired_end = max(item["time_end"] for item in median_distributions)
+        median_title = (
+            f"Paired median dN/dlog10Dp: actual {paired_start:%Y-%m-%d %H:%M} "
+            f"to {paired_end:%Y-%m-%d %H:%M} (within latest 72 h, ≤15 min match)"
+        )
+    elif median_start is not None:
+        median_title = (
+            "Our median dN/dlog10Dp; no paired SMEAR reference "
+            f"({median_start:%Y-%m-%d %H:%M} to {median_end:%Y-%m-%d %H:%M})"
+        )
+    else:
+        median_title = "No paired median dN/dlog10Dp"
     subplot_titles.extend([
         median_title,
         "Our CPC Ntot vs SMEAR III CPC",
@@ -4999,14 +5143,11 @@ def plot_inversion_result(result):
                     fig.add_scatter(
                         x=growth_diag["time"],
                         y=growth_diag["dp"],
-                        mode=("markers" if growth_diag["fit_quality"] == "marginal"
-                              else "lines+markers"),
-                        marker=dict(size=5, color=track_color),
-                        line=dict(width=2, color=track_color),
+                        mode="markers",
+                        marker=dict(size=7, symbol="x", color=track_color),
                         name=(
                             f"Event {growth_diag['event_number']} {growth_diag['model']} "
-                            f"{tr['polarity']} "
-                            f"({growth_diag['growth_rate']:.2f} nm/h, {growth_diag['fit_quality']})"
+                            "enhancement candidate — see Growth Signal"
                         ),
                         customdata=np.column_stack((
                             growth_diag["fit"],
@@ -5017,29 +5158,13 @@ def plot_inversion_result(result):
                             "track dp=%{y:.2f} nm<br>fit dp=%{customdata[0]:.2f} nm<br>"
                             f"model={growth_diag['model']}<br>"
                             f"GR={growth_diag['growth_rate']:.2f} nm/h<br>"
+                            "background-subtracted D50, not the brightest raw bin<br>"
+                            f"{growth_diag.get('track_caveat', 'enhancement-derived heuristic track')}<br>"
                             "R2=%{customdata[1]:.3f}<extra></extra>"
                         ),
                         row=row,
                         col=1,
                     )
-                    if growth_diag["fit_quality"] != "marginal":
-                        fig.add_scatter(
-                            x=growth_diag["time"],
-                            y=growth_diag["fit"],
-                            mode="lines",
-                            line=dict(width=2, dash="dash", color=track_color),
-                            name=(
-                                f"Event {growth_diag['event_number']} "
-                                f"{growth_diag['model']} robust fit"
-                            ),
-                            hovertemplate=(
-                                "time=%{x|%Y-%m-%d %H:%M}<br>"
-                                "fitted dp=%{y:.2f} nm<extra></extra>"
-                            ),
-                            row=row,
-                            col=1,
-                        )
-
             add_heatmap_selection_layer(fig, tr, row)
             update_log_size_axis(fig, row, tr["y"])
             fig.update_xaxes(title_text="Time", tickformat="%H:%M", row=row, col=1)
@@ -5454,7 +5579,7 @@ def plot_inversion_result(result):
             x=median["dp"],
             y=median["median"],
             mode="lines+markers",
-            name=f"Unpaired 72 h median {median['label']} ({median['n_scans']} scans)",
+            name=f"{median['label']} ({median['n_scans']} {'pairs' if paired_median else 'scans'})",
             error_y=error_y,
             customdata=customdata,
             hovertemplate=(
@@ -6463,6 +6588,7 @@ def run_inversion(event=None, force_recompute=False):
                 set_inversion_controls(False)
                 publish_shared_state(
                     inversion_fig=fig,
+                    growth_signal_fig=growth_signal_plot.object,
                     residual_fig=residual_fig,
                     smps_timing_fig=smps_timing_fig,
                     aerosol_fig=aerosol_fig,
@@ -6609,6 +6735,7 @@ def run_auto_worker():
                 save_auto_state({"last_saved_signature": signature})
                 publish_shared_state(
                     inversion_fig=fig,
+                    growth_signal_fig=growth_signal_plot.object,
                     residual_fig=residual_fig,
                     smps_timing_fig=smps_timing_fig,
                     aerosol_fig=aerosol_fig,
@@ -6805,6 +6932,7 @@ controls = pn.Column(
 plot_tabs = pn.Tabs(
     ("Raw Data", pn.Column(raw_plot)),
     ("Inversion", pn.Column(pn.Row(roi_selection_tool, roi_feedback), growth_status, inversion_plot)),
+    ("Growth Signal", pn.Column(growth_status, growth_signal_plot)),
     ("Clicked Distribution", pn.Column(modal_fit_status, modal_fit_plot)),
     ("Saved ROIs", pn.Column(clear_rois_button, roi_status, roi_history, roi_plot, roi_growth_plot)),
     ("Aerosol Properties", pn.Column(aerosol_plot)),

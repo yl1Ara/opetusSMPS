@@ -292,4 +292,11 @@ selected distributions and, for at least four scans spanning 15 minutes, a
 descriptive D50-vs-time slope. On **Global Live**, selection appears in its
 **Selected ROI** tab instead. The growth status above each inversion heatmap
 explains when automatic tracks were rejected; marginal tracks show points
-without a fitted line.
+without a fitted line. The **Growth Signal** tab plots full per-size
+background-subtracted enhancement and a separate view of the component the
+tracker selected. Its color scales are independent; positions on the raw
+inversion heatmap are markers, not a raw-peak fit. A moving D50 without a
+moving component peak is marked marginal, since it may reflect broadening.
+The main 72-hour SMEAR median pairs scans within 15 minutes before comparing
+distributions, while Difference Diagnostics uses paired scans from the last
+three hours.

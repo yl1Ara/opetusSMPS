@@ -53,9 +53,20 @@ growth-rate cross-check.
 - Automatic growth tracks are heuristic and depend on measured diameter
   coverage, coherent enhancement, temporal continuity, and fit quality. Sparse
   diameter grids use a two-bin coherence requirement; marginal tracks appear
-  as observed points without a fitted overlay. A user-selected heatmap ROI
-  also reports a descriptive D50 slope from its selected cells when at least
+  as observed points without a fitted overlay. A moving D50 with a stationary
+  peak in its selected component is classified as marginal (possible
+  broadening rather than particle growth). Growth tracks follow a
+  background-subtracted signal and need not coincide with the brightest bin
+  of the raw inversion. The raw heatmap marks candidate positions; the
+  separate Growth Signal plot shows full enhancement and the subset of bins
+  selected for the track, with independent color scales. A user-selected
+  heatmap ROI also reports a descriptive D50 slope when at least
   four scans span 15 minutes; it is not an independent growth measurement.
+- The main SMEAR III distribution comparison uses only scans paired within
+  15 minutes during the latest 72 hours, with the SMEAR distribution interpolated
+  onto the inversion's measured diameter bins. Difference Diagnostics applies
+  the same matching to the latest three hours; the two periods can still have
+  different aerosol populations.
 - Particle formation diagnostics report a three-term apparent budget in
   `cm-3 s-1`:
   accumulation `dN/dt`, growth outflux `GR*N/(d2-d1)`, and neutral Brownian
@@ -63,7 +74,8 @@ growth-rate cross-check.
   smaller-collector interactions and coagulation-product gains. Apparent `J` is reported only
   where all three terms are finite; it does not include dilution, deposition,
   transport, or charged-particle terms. Growth-slope p10-p90 propagation is a
-  sensitivity range, not a confidence interval.
+  sensitivity range, not a confidence interval. Marginal growth candidates
+  are excluded from the growth-outflux term.
 - The experimental Fuchs-type path treats configured ion mobilities as values
   at the scan conditions. Pressure is validated and recorded but does not
   independently rescale the charging fractions.
